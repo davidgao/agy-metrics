@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AGY Metrics</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="card header">
+      <div class="header-top">
+        <div class="brand">
+          <span>AGY Metrics</span>
+          <span class="pill" id="modelPill">—</span>
+        </div>
+        <div class="status-row">
+          <span class="pill" id="ssePill" style="display:none;cursor:pointer" title="Connection interrupted — click to reconnect now"><span class="dot" id="sseDot"></span><span id="sseLabel">Connecting</span></span>
+          <span class="pill" id="genPill"><span class="dot" id="genDot"></span><span id="genLabel">Idle</span></span>
+          <button type="button" class="pill theme-btn" id="themeBtn" title="Cycle theme: Auto / Dark / Light"><svg class="theme-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 2.5a5.5 5.5 0 0 1 0 11Z" fill="currentColor"/></svg><span>Auto</span></button>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="mode-toggle" role="group" aria-label="View Scope">
+          <button id="modeConvBtn" type="button" class="mode-btn active" aria-pressed="true">Conversation</button>
+          <button id="modeAllBtn" type="button" class="mode-btn" aria-pressed="false">All</button>
+        </div>
+        <div class="conv-controls" id="convControls">
+          <select id="convSelect" aria-label="Conversation"></select>
+          <label class="follow"><input type="checkbox" id="followToggle" checked /> Follow active</label>
+        </div>
+        <div class="all-controls hidden" id="allControls">
+          <button type="button" class="filter-pill" data-window="5h">5h</button>
+          <button type="button" class="filter-pill" data-window="24h">24h</button>
+          <button type="button" class="filter-pill" data-window="7d">7d</button>
+          <button type="button" class="filter-pill" data-window="30d">30d</button>
+          <button type="button" class="filter-pill active" data-window="all">All time</button>
+          <span class="muted mono" id="allScopeSummary"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="ctxCard">
+      <div class="section-head">
+        <span class="section-title">Active Context Window</span>
+        <div class="status-row" id="contextBadges"></div>
+      </div>
+      <div class="section-head">
+        <span class="big-num mono" id="ctxTotal">0 tok</span>
+        <span class="muted mono" id="ctxHitText">0% cached</span>
+      </div>
+      <div class="bar-track" id="ctxBar"></div>
+      <div class="legend" id="ctxLegend"></div>
+      <div class="chips" id="topToolsChips"></div>
+    </div>
+
+    <div class="card">
+      <div class="section-head">
+        <span class="section-title">Per-Model Token &amp; Timing</span>
+        <span class="muted" id="byModelScope">Click a row to filter</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th title="Model or Orchestrator role attribution">Model</th>
+              <th title="Total recorded LLM steps (including system compaction calls)">Steps</th>
+              <th title="Gross input tokens (Uncached + Cached) and KV-cache hit percentage — hover cells for exact uncached / cached split">Input (Hit%)</th>
+              <th title="Total output tokens and estimated thinking tokens">Output (~Think)</th>
+              <th title="Total model wait time (completed inference + retry/failed wait) and cumulative estimated delay (warm serving/prefill variance + retry/failed wait; system compaction calls excluded)">Time (~Delay)</th>
+              <th title="Inferred uncongested nominal decode throughput ceiling (P95 speed roofline, tok/s)">~Nom. TPS</th>
+              <th title="Inferred uncongested warm Time to First Token and average (mean) per-step excess delay beyond the roofline — hover cells for P50 median">~TTFT (+Delay)</th>
+            </tr>
+          </thead>
+          <tbody id="byModelTbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card scatter-card" id="latencyFitCard">
+      <div class="section-head">
+        <span class="section-title" id="scatterTitle">Output vs. Time</span>
+        <div class="status-row">
+          <button type="button" class="filter-pill" id="coldToggleBtn" style="display:none"></button>
+          <button type="button" class="filter-pill" id="scatterCloseBtn" title="Clear model filter and hide latency fit chart">✕ All models</button>
+        </div>
+      </div>
+      <div class="scatter-kpis" id="scatterStatsRow"></div>
+      <div class="chart-box">
+        <svg id="scatterSvg" class="scatter-chart" viewBox="0 0 600 184"></svg>
+      </div>
+      <div class="section-head" style="margin-top:6px;margin-bottom:0">
+        <div class="legend" id="scatterLegend" style="margin-top:0"></div>
+        <span class="muted mono" id="scatterHover">Hover a point to inspect</span>
+      </div>
+    </div>
+
+    <div class="card" id="valuationCard">
+      <div class="section-head">
+        <div class="status-row">
+          <span class="section-title" id="valCardTitle">Paygo &amp; AI Credits</span>
+          <span class="muted" id="valCardSub"></span>
+        </div>
+        <div class="status-row">
+          <div class="mode-toggle val-pool-toggle" id="valPoolToggle" role="group" aria-label="Quota Pool">
+            <button type="button" class="mode-btn active" data-pool="all" aria-pressed="true">All</button>
+            <button type="button" class="mode-btn" data-pool="gemini" aria-pressed="false">Google</button>
+            <button type="button" class="mode-btn" data-pool="partner" aria-pressed="false">3rd-Party</button>
+          </div>
+          <button type="button" class="filter-pill val-model-pill" id="valModelOverridePill" style="display:none" title="Overriding pool filter — click to clear model filter"></button>
+          <button type="button" class="pill warn" id="valUnpricedBtn" style="display:none"></button>
+          <span class="pill info" id="valCustomBadge" style="display:none" title="Local pricing overrides active in $PLUGIN_DATA/pricing.json">Custom rate</span>
+          <span class="pill" id="valCreditsRateBadge" style="display:none"></span>
+          <button type="button" class="filter-pill" id="ratesToggleBtn" title="View or override local model pricing ($PLUGIN_DATA/pricing.json)">⚙ Rates</button>
+        </div>
+      </div>
+
+      <div class="val-grid" id="valGrid" data-count="1"></div>
+
+      <div class="val-callouts" id="valCallouts"></div>
+
+      <div class="rates-drawer" id="ratesDrawer">
+        <div class="rates-bar">
+          <span class="section-title">Local Pricing ($ / 1M tokens)</span>
+          <div class="rates-group">
+            <label class="muted" for="cfgCreditsInput">Credits / $1</label>
+            <input type="number" step="any" min="0.0001" class="rate-input" id="cfgCreditsInput" />
+            <button type="button" class="filter-pill btn-sm" id="cfgCreditsSaveBtn">Save</button>
+            <button type="button" class="filter-pill btn-sm" id="cfgResetAllBtn" style="display:none">Reset all</button>
+          </div>
+        </div>
+        <div id="ratesFeedback" class="rate-err" style="display:none"></div>
+        <div id="ratesDrawerBody"></div>
+        <div class="muted" style="margin-top:8px">100% offline · Overrides saved locally to $PLUGIN_DATA/pricing.json</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="section-title" id="kpiInTitle">Input Tokens</div>
+        <div class="big-num mono" id="totGrossIn">0</div>
+        <div class="kv-line"><span class="muted">Uncached</span><span class="mono" id="totIn">0</span></div>
+        <div class="kv-line"><span class="muted">Cached Read</span><span class="mono" id="totCache">0</span></div>
+        <div class="kv-line"><span class="muted">Cache Hit</span><span class="mono" id="totHitPct">0%</span></div>
+      </div>
+
+      <div class="card">
+        <div class="section-title" id="kpiOutTitle">Output Tokens</div>
+        <div class="big-num mono" id="totOut">0</div>
+        <div class="kv-line"><span class="muted">~Thinking (est.)</span><span class="mono" id="totThink">0</span></div>
+        <div class="kv-line"><span class="muted">~Visible + Tools</span><span class="mono" id="totVis">0</span></div>
+      </div>
+
+      <div class="card">
+        <div class="section-title" id="kpiLastTitle">Latest Step</div>
+        <div class="big-num mono" id="lastDur">—</div>
+        <div class="kv-line"><span class="muted">~Est. Delay</span><span class="mono" id="lastDelay">—</span></div>
+        <div class="kv-line"><span class="muted">Step Output</span><span class="mono" id="lastOut">—</span></div>
+      </div>
+
+      <div class="card">
+        <div class="section-title" id="kpiTimingTitle">Session Timing</div>
+        <div class="big-num mono" id="sumModelTime">0.0s</div>
+        <div class="kv-line"><span class="muted">~Est. Total Delay</span><span class="mono" id="sumEstDelay">—</span></div>
+        <div class="kv-line" id="sumWastedRow" style="display:none"><span class="muted">↳ Retry / Failed</span><span class="mono" id="sumWastedTime">0.0s</span></div>
+        <div class="kv-line"><span class="muted">Tool Execution</span><span class="mono" id="sumToolTime">0.0s</span></div>
+        <div class="kv-line"><span class="muted" id="stepCountLbl">Planner Steps</span><span class="mono" id="stepCount">0</span></div>
+      </div>
+    </div>
+
+    <div class="card subagent-strip" id="subagentCard">
+      <div class="section-head">
+        <span class="section-title">Subagent Rollup</span>
+        <span class="mono muted" id="subSummary"></span>
+      </div>
+      <div class="kv-line">
+        <span class="muted">Grand Total (Main + Subagents)</span>
+        <span class="mono" id="grandTotalTok">0</span>
+      </div>
+      <div class="chips" id="subChips"></div>
+    </div>
+
+    <div class="card" id="historyCard">
+      <div class="section-head">
+        <span class="section-title">Context &amp; Cache History</span>
+        <span class="muted mono" id="chartHover">No steps yet</span>
+      </div>
+      <div class="chart-box">
+        <svg id="historySvg" class="chart" viewBox="0 0 600 156"></svg>
+      </div>
+      <div class="legend" id="chartLegend">
+        <span class="legend-item"><span class="swatch c-cached"></span>Cached Read</span>
+        <span class="legend-item"><span class="swatch c-uncached"></span>Uncached Prefill</span>
+      </div>
+    </div>
+
+    <div class="card" id="stepsCard">
+      <div class="section-head">
+        <span class="section-title">Per-Step Telemetry</span>
+        <div class="status-row">
+          <span class="muted" id="stepsMeta">Click row for details</span>
+          <button type="button" class="filter-pill" id="stepsToggleBtn" style="display:none"></button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th title="Step ordinal and flags (❄ Cold Prefill, ⇄ Compaction/Compacted, ↻ Retried)">#</th>
+              <th title="Attributed model or Orchestrator phase (↱ Model Switch)">Model</th>
+              <th title="Total context window size (Uncached + Cached) and KV-cache hit percentage">Context (Cache%)</th>
+              <th title="Total output tokens and estimated thinking tokens">Out (~Think)</th>
+              <th title="Model inference wall time (excluded on internal system compaction calls)">Time</th>
+              <th title="Effective post-step throughput (Output tokens / Model inference time)">tok/s</th>
+              <th title="Tool calls invoked in this step, reply, or compaction call">Tools</th>
+            </tr>
+          </thead>
+          <tbody id="stepsTbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,946 @@
+// Main dashboard coordinator: DOM updates, SSE live subscription, and UI events.
+
+import {
+  renderByModel,
+  renderChart,
+  renderLatencyScatter,
+  renderValuationCard
+} from './charts.js';
+import {
+  esc,
+  fmtApproxDuration,
+  fmtColdTimeNote,
+  fmtCompact,
+  fmtCredits,
+  fmtDuration,
+  fmtExactSecNote,
+  fmtInt,
+  fmtUsd,
+  fmtWastedSummary,
+  fmtWastedTimeNote,
+  getModelColorMap,
+  shortModelName,
+  srcLabel
+} from './format.js';
+import { initPricingModal } from './pricing-modal.js';
+import {
+  ALL_CONVERSATIONS_ID,
+  RECENT_STEPS_LIMIT,
+  buildUrl,
+  currentRequestedConvId,
+  sidecarFetch,
+  state,
+  syncGeneratingTimer,
+  syncModeControls
+} from './state.js';
+import { initThemeControls } from './theme.js';
+
+const SSE_WATCHDOG_MS = 35000;
+
+function renderConversations(convsData) {
+  if (!convsData) return;
+  state.activeConvId = convsData.active_conversation_id || null;
+  const sel = document.getElementById('convSelect');
+  const list = convsData.conversations || [];
+  const currentVal = state.followActive ? state.activeConvId : state.selectedConvId;
+  sel.innerHTML = '';
+  if (list.length === 0) {
+    const emptyOpt = document.createElement('option');
+    emptyOpt.value = '';
+    emptyOpt.textContent = 'No conversations found';
+    sel.appendChild(emptyOpt);
+    return;
+  }
+  list.forEach(function (c) {
+    const opt = document.createElement('option');
+    opt.value = c.conversation_id;
+    const prefix = c.is_subagent ? '↳ ' : '';
+    const activeMark = c.conversation_id === state.activeConvId ? '★ ' : '';
+    opt.textContent = activeMark + prefix + (c.title || c.conversation_id.slice(0, 8)) + ' (' + fmtCompact(c.current_tokens) + ')';
+    if (c.conversation_id === currentVal) {
+      opt.selected = true;
+    }
+    sel.appendChild(opt);
+  });
+}
+
+function toggleModelFilter(modelName) {
+  state.modelFilter = (state.modelFilter === modelName) ? null : modelName;
+  if (state.lastPayload) renderMetrics(state.lastPayload);
+}
+
+function clearModelFilter() {
+  state.modelFilter = null;
+  state.lastScatterKey = null;
+  if (state.lastPayload) renderMetrics(state.lastPayload);
+}
+
+function renderMetrics(m) {
+  if (!m) return;
+  const isAllMode = (m.mode === 'all');
+  const viewKey = isAllMode
+    ? (ALL_CONVERSATIONS_ID + ':' + (m.window || state.timeWindow || 'all'))
+    : (m.conversation_id || '');
+  if (viewKey && viewKey !== state.renderedViewKey) {
+    const prevWasAll = state.renderedViewKey && state.renderedViewKey.indexOf(ALL_CONVERSATIONS_ID + ':') === 0;
+    state.renderedViewKey = viewKey;
+    state.renderedConvId = m.conversation_id || null;
+    state.showColdPrefills = false;
+    state.lastScatterKey = null;
+    state.lastHistoryKey = null;
+    if (state.pendingJump && !isAllMode && state.pendingJump.convId === m.conversation_id) {
+      state.expandedStep = state.pendingJump.stepIndex;
+      state.showAllSteps = true;
+      state.modelFilter = state.pendingJump.modelName || null;
+      state.pendingJump = null;
+    } else {
+      state.showAllSteps = false;
+      state.expandedStep = null;
+      if (!(isAllMode && prevWasAll)) {
+        state.modelFilter = null;
+      }
+    }
+  } else if (state.pendingJump && !isAllMode && state.pendingJump.convId === m.conversation_id) {
+    state.expandedStep = state.pendingJump.stepIndex;
+    state.showAllSteps = true;
+    state.modelFilter = state.pendingJump.modelName || state.modelFilter;
+    state.pendingJump = null;
+  }
+  syncModeControls();
+
+  const ctxCard = document.getElementById('ctxCard');
+  const histCard = document.getElementById('historyCard');
+  const stepsCard = document.getElementById('stepsCard');
+  if (ctxCard) ctxCard.style.display = isAllMode ? 'none' : '';
+  const subCardTop = document.getElementById('subagentCard');
+  if (subCardTop) subCardTop.style.display = isAllMode ? 'none' : '';
+  if (histCard) histCard.style.display = isAllMode ? 'none' : '';
+  if (stepsCard) stepsCard.style.display = isAllMode ? 'none' : '';
+
+  const allScopeSummary = document.getElementById('allScopeSummary');
+  if (allScopeSummary) {
+    if (isAllMode) {
+      const nConv = m.conversations_count || 0;
+      const nSub = m.subagents_count || 0;
+      allScopeSummary.textContent = nConv + ' conv' + (nConv === 1 ? '' : 's') +
+        (nSub ? (' · ' + nSub + ' subagent' + (nSub === 1 ? '' : 's')) : '');
+    } else {
+      allScopeSummary.textContent = '';
+    }
+  }
+  state.status = m.status || 'idle';
+  state.generatingSinceMs = m.generating_since_ms || null;
+  syncGeneratingTimer();
+
+  const byModel = m.by_model || [];
+  if (state.modelFilter && !byModel.some(function (bm) { return bm.model_name === state.modelFilter; })) {
+    state.modelFilter = null;
+  }
+  const colorMap = getModelColorMap(byModel);
+
+  const modelPill = document.getElementById('modelPill');
+  modelPill.textContent = m.model_name || 'unknown';
+  modelPill.title = m.model_name || 'unknown';
+
+  if (!isAllMode) {
+    const ctx = m.context || {};
+    const brk = ctx.breakdown || {};
+    const cur = ctx.current_tokens || 0;
+    document.getElementById('ctxTotal').textContent = fmtCompact(cur) + ' tok';
+    document.getElementById('ctxHitText').textContent = (ctx.cache_hit_pct || 0) + '% cached (' + fmtCompact(ctx.cache_read_tokens) + ' / ' + fmtCompact(cur) + ')';
+
+    const badgesEl = document.getElementById('contextBadges');
+    badgesEl.innerHTML = '';
+    if (ctx.cold_cache_spike) {
+      const b1 = document.createElement('span');
+      b1.className = 'pill warn';
+      b1.textContent = ctx.model_switched ? 'Model Switch Prefill' : 'Cold Prefill';
+      b1.title = ctx.model_switched
+        ? 'Expected cold KV-cache prefill caused by switching models on this step'
+        : 'Cold KV-cache prefill (>=25k uncached tokens with <20% cache hit)';
+      badgesEl.appendChild(b1);
+    }
+    if (ctx.compacted) {
+      const b2 = document.createElement('span');
+      b2.className = 'pill compact';
+      b2.textContent = 'Compacted';
+      b2.title = 'Active context includes a compacted summary (<CONTEXT_SUMMARY>)';
+      badgesEl.appendChild(b2);
+    }
+
+    const showSummarySeg = (brk.summary_tokens || 0) > 0 || ((m.totals && m.totals.compacted_count) || 0) > 0;
+    const segs = [
+      { cls: 'c-sys', label: 'System & Tools', val: brk.system_tokens || 0, hidden: false },
+      { cls: 'c-summary', label: 'Compacted Summary', val: brk.summary_tokens || 0, hidden: !showSummarySeg },
+      { cls: 'c-tool', label: 'Tool Outputs', val: brk.tool_tokens || 0, hidden: false },
+      { cls: 'c-model', label: 'Model', val: brk.model_tokens || 0, hidden: false },
+      { cls: 'c-user', label: 'User', val: brk.user_tokens || 0, hidden: false }
+    ];
+    const bar = document.getElementById('ctxBar');
+    const leg = document.getElementById('ctxLegend');
+    bar.innerHTML = '';
+    leg.innerHTML = '';
+    segs.forEach(function (s) {
+      if (s.hidden && s.val === 0) return;
+      const pct = cur > 0 ? (s.val / cur) * 100 : 0;
+      if (s.val > 0) {
+        const segDiv = document.createElement('div');
+        segDiv.className = 'seg ' + s.cls;
+        segDiv.style.width = pct.toFixed(2) + '%';
+        segDiv.title = s.label + ': ' + fmtInt(s.val) + ' tok (' + pct.toFixed(1) + '%)';
+        bar.appendChild(segDiv);
+      }
+
+      const lItem = document.createElement('span');
+      lItem.className = 'legend-item';
+      lItem.title = s.label + ': ' + fmtInt(s.val) + ' tok (' + pct.toFixed(1) + '%)';
+      lItem.innerHTML = '<span class="swatch ' + s.cls + '"></span><span>' + esc(s.label) + ': <span class="mono">' + esc(fmtCompact(s.val)) + '</span></span>';
+      leg.appendChild(lItem);
+    });
+
+    const chipsEl = document.getElementById('topToolsChips');
+    chipsEl.innerHTML = '';
+    (ctx.top_tools || []).forEach(function (t) {
+      const ch = document.createElement('span');
+      ch.className = 'chip mono';
+      ch.textContent = t.name + ' ' + fmtCompact(t.tokens) + ' (' + t.pct + '%)';
+      ch.title = t.name + ': ~' + fmtInt(t.tokens) + ' tokens (' + t.pct + '% of active context)';
+      chipsEl.appendChild(ch);
+    });
+  }
+
+  const globalTotals = m.totals || {};
+  renderByModel(byModel, globalTotals, colorMap, {
+    onToggleModel: toggleModelFilter,
+    onClearFilter: clearModelFilter
+  });
+
+  const selectedModelEntry = state.modelFilter
+    ? byModel.find(function (bm) { return bm.model_name === state.modelFilter; })
+    : null;
+  const allSteps = m.steps || [];
+  renderLatencyScatter(selectedModelEntry, allSteps, colorMap, {
+    onRerender: function () {
+      if (state.lastPayload) renderMetrics(state.lastPayload);
+    },
+    onSwitchTarget: function (cid) {
+      switchTarget(cid);
+    }
+  });
+  renderValuationCard(m, selectedModelEntry, isAllMode);
+
+  const scopedTot = selectedModelEntry || globalTotals;
+  const scopedLast = selectedModelEntry ? selectedModelEntry.latest_step : m.latest_step;
+  const scopedStepsCount = selectedModelEntry ? selectedModelEntry.steps_count : (m.planner_steps_count || 0);
+  const scopeTag = selectedModelEntry ? (' · ' + shortModelName(selectedModelEntry.model_name)) : '';
+
+  const stepTag = scopedLast ? (' #' + scopedLast.ordinal) : '';
+  const lastConvNote = (isAllMode && scopedLast && scopedLast.conv_title) ? ('[' + scopedLast.conv_title + '] ') : '';
+  document.getElementById('kpiInTitle').textContent = 'Input Tokens' + scopeTag;
+  document.getElementById('kpiOutTitle').textContent = 'Output Tokens' + scopeTag;
+  const kpiLastTitleEl = document.getElementById('kpiLastTitle');
+  kpiLastTitleEl.textContent = 'Latest Step' + stepTag + scopeTag;
+  kpiLastTitleEl.title = lastConvNote ? ('Global latest step in ' + scopedLast.conv_title) : '';
+  document.getElementById('kpiTimingTitle').textContent = (selectedModelEntry ? 'Model Timing' : (isAllMode ? 'Total Timing' : 'Session Timing')) + scopeTag;
+
+  document.getElementById('totGrossIn').textContent = fmtCompact(scopedTot.gross_input_tokens);
+  document.getElementById('totIn').textContent = fmtInt(scopedTot.input_tokens);
+  document.getElementById('totCache').textContent = fmtInt(scopedTot.cache_read_tokens);
+  document.getElementById('totHitPct').textContent = (scopedTot.cache_hit_pct || 0) + '%';
+
+  document.getElementById('totOut').textContent = fmtCompact(scopedTot.output_tokens);
+  document.getElementById('totThink').textContent = fmtInt(scopedTot.est_thinking_tokens);
+  document.getElementById('totVis').textContent = fmtInt(scopedTot.est_visible_tokens);
+
+  const lastDurEl = document.getElementById('lastDur');
+  lastDurEl.textContent = (scopedLast && scopedLast.duration_s != null) ? (scopedLast.duration_s + 's') : '—';
+  if (!scopedLast) {
+    lastDurEl.title = '';
+  } else if (scopedLast.step_kind === 'checkpoint') {
+    lastDurEl.title = lastConvNote + 'System compaction call (CHECKPOINT; untimed)';
+  } else if (scopedLast.duration_s != null) {
+    const lastRetryNote = scopedLast.retry_wait_s > 0
+      ? (' · +' + fmtDuration(scopedLast.retry_wait_s) + fmtExactSecNote(scopedLast.retry_wait_s) + ' retry wait')
+      : '';
+    lastDurEl.title = lastConvNote + 'Model inference: ' + scopedLast.duration_s + 's (' + srcLabel(scopedLast.duration_source) + ')' + lastRetryNote;
+  } else {
+    lastDurEl.title = lastConvNote + 'Model inference duration unavailable';
+  }
+
+  const lastDelayEl = document.getElementById('lastDelay');
+  const lastModelEntry = selectedModelEntry || (scopedLast ? byModel.find(function (bm) { return bm.model_name === scopedLast.model_name; }) : null);
+  const lastFit = lastModelEntry && lastModelEntry.latency_fit;
+  const lastRetryS = Number((scopedLast && scopedLast.retry_wait_s) || 0);
+  if (!scopedLast) {
+    lastDelayEl.textContent = '—';
+    lastDelayEl.title = '';
+  } else if (scopedLast.est_delay_s != null) {
+    const combinedLastDelay = Number(scopedLast.est_delay_s) + lastRetryS;
+    lastDelayEl.textContent = '~' + combinedLastDelay.toFixed(2) + 's' + (lastRetryS > 0 ? ' (↻)' : '');
+    const retryPart = lastRetryS > 0
+      ? (' (~' + Number(scopedLast.est_delay_s).toFixed(2) + 's roofline + ' + fmtDuration(lastRetryS) + fmtExactSecNote(lastRetryS) + ' retry wait)')
+      : '';
+    if (lastFit && lastFit.available) {
+      const expectedLastS = Number(lastFit.inferred_ttft_s) + Number(lastFit.slope_s_per_tok) * scopedLast.output_tokens;
+      lastDelayEl.title = 'Actual ' + scopedLast.duration_s + 's vs ~' + expectedLastS.toFixed(2) + 's speed roofline' + retryPart;
+    } else {
+      lastDelayEl.title = 'Estimated excess latency above speed roofline' + retryPart;
+    }
+  } else if (lastRetryS > 0) {
+    lastDelayEl.textContent = '+' + fmtDuration(lastRetryS) + ' (↻)';
+    lastDelayEl.title = 'Retry wait before winning attempt: ' + fmtDuration(lastRetryS) + fmtExactSecNote(lastRetryS) +
+      (scopedLast.cold_cache_spike ? ' (❄ cold prefill; excluded from warm roofline)' : '');
+  } else if (scopedLast.step_kind === 'checkpoint') {
+    lastDelayEl.textContent = '—';
+    lastDelayEl.title = 'System compaction call (excluded from roofline delay)';
+  } else if (scopedLast.cold_cache_spike) {
+    lastDelayEl.textContent = '— (❄ cold)';
+    lastDelayEl.title = 'Cold KV-cache prefill step; excluded from warm excess delay';
+  } else if (scopedLast.duration_s == null) {
+    lastDelayEl.textContent = '—';
+    lastDelayEl.title = 'Step duration unavailable';
+  } else if (!lastFit || lastFit.reason === 'min_steps') {
+    lastDelayEl.textContent = '— (' + ((lastFit && lastFit.warm_count) || 0) + '/4)';
+    lastDelayEl.title = 'Needs ≥4 warm timed steps on ' + shortModelName(scopedLast.model_name) + ' to estimate delay';
+  } else if (lastFit.reason === 'unattributed') {
+    lastDelayEl.textContent = '—';
+    lastDelayEl.title = 'Roofline delay disabled for unattributed ("unknown" / "auto") model steps';
+  } else {
+    lastDelayEl.textContent = '—';
+    lastDelayEl.title = 'Speed roofline not yet available for ' + shortModelName(scopedLast.model_name);
+  }
+
+  const lastOutEl = document.getElementById('lastOut');
+  lastOutEl.textContent = scopedLast ? (fmtInt(scopedLast.output_tokens) + ' tok') : '—';
+  lastOutEl.title = scopedLast
+    ? (lastConvNote + fmtInt(scopedLast.output_tokens) + ' output (~' + fmtInt(scopedLast.est_thinking_tokens) + ' thinking, ~' + fmtInt(scopedLast.est_visible_tokens) + ' visible + tools)')
+    : '';
+
+  const sumModelEl = document.getElementById('sumModelTime');
+  const sumModelTimeS = scopedTot.model_time_s || 0;
+  const sumInfTimeS = scopedTot.inference_time_s != null ? scopedTot.inference_time_s : sumModelTimeS;
+  sumModelEl.textContent = fmtDuration(sumModelTimeS);
+  sumModelEl.title = (scopedTot.timed_steps_count || 0) + ' timed step(s): ' +
+    fmtDuration(sumInfTimeS) + fmtExactSecNote(sumInfTimeS) + ' inference' +
+    fmtColdTimeNote(scopedTot) + fmtWastedTimeNote(scopedTot);
+
+  const sumDelayEl = document.getElementById('sumEstDelay');
+  const scopedWastedS = Number(scopedTot.wasted_time_s || 0);
+  if (scopedTot.est_total_delay_s != null) {
+    const totDelay = Number(scopedTot.est_total_delay_s);
+    const partialScoped = (scopedTot.est_delay_steps_count || 0) < (scopedTot.warm_timed_steps_count || 0) || ((scopedTot.est_delay_steps_count || 0) === 0 && scopedWastedS > 0);
+    sumDelayEl.textContent = fmtApproxDuration(totDelay) + (partialScoped ? '*' : '');
+    const dParts = [];
+    if (scopedTot.est_warm_delay_s != null) {
+      dParts.push('~' + fmtDuration(scopedTot.est_warm_delay_s) + fmtExactSecNote(scopedTot.est_warm_delay_s) + ' warm roofline across ' + (scopedTot.est_delay_steps_count || 0) + '/' + (scopedTot.warm_timed_steps_count || 0) + ' warm step(s)');
+    }
+    if (scopedWastedS > 0) {
+      const wSum = fmtWastedSummary(scopedTot);
+      dParts.push(fmtDuration(scopedWastedS) + fmtExactSecNote(scopedWastedS) + ' retry/failed wait' + (wSum ? (' (' + wSum + ')') : ''));
+    }
+    sumDelayEl.title = 'Estimated total delay included in model time: ' +
+      fmtApproxDuration(totDelay) + fmtExactSecNote(totDelay) +
+      (dParts.length ? (' (' + dParts.join(' + ') + ')') : '') +
+      (sumModelTimeS > 0 ? (' · ' + Math.min(100, Math.round((totDelay / sumModelTimeS) * 100)) + '% of model time') : '');
+  } else if (selectedModelEntry && selectedModelEntry.latency_fit && selectedModelEntry.latency_fit.reason === 'min_steps') {
+    sumDelayEl.textContent = '— (' + (selectedModelEntry.latency_fit.warm_count || 0) + '/4)';
+    sumDelayEl.title = 'Needs ≥4 warm timed steps on ' + shortModelName(selectedModelEntry.model_name) + ' to estimate cumulative delay';
+  } else if (selectedModelEntry && selectedModelEntry.latency_fit && selectedModelEntry.latency_fit.reason === 'unattributed') {
+    sumDelayEl.textContent = '—';
+    sumDelayEl.title = 'Roofline delay disabled for unattributed ("unknown" / "auto") model steps';
+  } else {
+    sumDelayEl.textContent = '—';
+    sumDelayEl.title = 'Needs ≥4 warm timed steps on a model to fit its speed roofline';
+  }
+
+  const sumWastedRowEl = document.getElementById('sumWastedRow');
+  const sumWastedEl = document.getElementById('sumWastedTime');
+  if (sumWastedRowEl && sumWastedEl) {
+    if (scopedWastedS > 0) {
+      const wSum = fmtWastedSummary(scopedTot);
+      sumWastedRowEl.style.display = '';
+      sumWastedEl.textContent = fmtDuration(scopedWastedS);
+      sumWastedEl.title = 'Included in Model Time and ~Est. Total Delay: ' +
+        fmtDuration(scopedWastedS) + fmtExactSecNote(scopedWastedS) +
+        (wSum ? (' (' + wSum + ')') : '');
+    } else {
+      sumWastedRowEl.style.display = 'none';
+    }
+  }
+
+  const sumToolEl = document.getElementById('sumToolTime');
+  const sumToolTimeS = scopedTot.tool_time_s || 0;
+  sumToolEl.textContent = fmtDuration(sumToolTimeS);
+  sumToolEl.title = 'Cumulative tool execution time: ' + fmtDuration(sumToolTimeS) + fmtExactSecNote(sumToolTimeS);
+  const stepCountLblEl = document.getElementById('stepCountLbl');
+  if (stepCountLblEl) stepCountLblEl.textContent = isAllMode ? 'Total Steps' : 'Planner Steps';
+  document.getElementById('stepCount').textContent = String(scopedStepsCount);
+
+  const subs = m.subagents || { count: 0, items: [], totals: {} };
+  const subCard = document.getElementById('subagentCard');
+  if (!isAllMode && subs.count > 0) {
+    subCard.classList.add('visible');
+    const subVal = subs.valuation || {};
+    const subCostNote = (subVal.coverage && subVal.coverage.priced_steps > 0) ? (' · ' + fmtUsd(subVal.cost_usd)) : '';
+    document.getElementById('subSummary').textContent = subs.count + ' subagent(s) · ' + fmtCompact(subs.totals.total_tokens) + ' tok' + subCostNote;
+    document.getElementById('grandTotalTok').textContent = fmtInt((m.grand_totals || {}).total_tokens || 0) + ' tok';
+    const subChips = document.getElementById('subChips');
+    subChips.innerHTML = '';
+    subs.items.forEach(function (it) {
+      const ch = document.createElement('span');
+      ch.className = 'chip';
+      const modelNote = it.model_name ? (' [' + it.model_name + ']') : '';
+      ch.textContent = (it.role || 'Subagent') + modelNote + ' (' + it.planner_steps_count + ' steps · ' + fmtCompact((it.input_tokens || 0) + (it.cache_read_tokens || 0) + (it.output_tokens || 0)) + ' tok)';
+      if (it.cost_usd != null) {
+        ch.title = 'Paygo: ' + fmtUsd(it.cost_usd) + ' (' + fmtCredits(it.credits) + ')';
+      }
+      subChips.appendChild(ch);
+    });
+  } else {
+    subCard.classList.remove('visible');
+  }
+  if (isAllMode) {
+    subCard.style.display = 'none';
+    return;
+  }
+  subCard.style.display = '';
+
+  renderChart(allSteps, colorMap, byModel);
+
+  const shownSteps = state.modelFilter
+    ? allSteps.filter(function (s) { return s.model_name === state.modelFilter; })
+    : allSteps;
+  const orderedSteps = shownSteps.slice().reverse();
+  const canFold = orderedSteps.length > RECENT_STEPS_LIMIT;
+  const isFolded = canFold && !state.showAllSteps;
+  const visibleSteps = isFolded ? orderedSteps.slice(0, RECENT_STEPS_LIMIT) : orderedSteps;
+  const hiddenCount = orderedSteps.length - visibleSteps.length;
+
+  const stepsMetaEl = document.getElementById('stepsMeta');
+  if (state.modelFilter) {
+    stepsMetaEl.textContent = isFolded
+      ? ('Filtered: ' + shortModelName(state.modelFilter) + ' (latest ' + visibleSteps.length + ' of ' + orderedSteps.length + ') · Click row for details')
+      : ('Filtered: ' + shortModelName(state.modelFilter) + ' (' + orderedSteps.length + ' / ' + allSteps.length + ' steps) · Click row for details');
+  } else {
+    stepsMetaEl.textContent = isFolded
+      ? ('Latest ' + visibleSteps.length + ' of ' + orderedSteps.length + ' steps · Click row for details')
+      : ('All Models · ' + orderedSteps.length + ' steps · Click row for details');
+  }
+
+  const toggleBtn = document.getElementById('stepsToggleBtn');
+  if (!canFold) {
+    toggleBtn.style.display = 'none';
+  } else if (isFolded) {
+    toggleBtn.style.display = '';
+    toggleBtn.textContent = 'Show all (' + orderedSteps.length + ') ▾';
+    toggleBtn.title = 'Expand table to view all ' + orderedSteps.length + ' steps (' + hiddenCount + ' older hidden)';
+  } else {
+    toggleBtn.style.display = '';
+    toggleBtn.textContent = 'Recent (' + RECENT_STEPS_LIMIT + ') ▴';
+    toggleBtn.title = 'Fold table back to the ' + RECENT_STEPS_LIMIT + ' most recent steps';
+  }
+
+  const tbody = document.getElementById('stepsTbody');
+  tbody.innerHTML = '';
+  if (orderedSteps.length === 0) {
+    const noStepsTr = document.createElement('tr');
+    noStepsTr.className = 'muted';
+    noStepsTr.innerHTML = '<td colspan="7" class="muted">No steps recorded yet</td>';
+    tbody.appendChild(noStepsTr);
+  }
+
+  visibleSteps.forEach(function (s) {
+    const tr = document.createElement('tr');
+    tr.className = 'step-row';
+    const isCheckpoint = s.step_kind === 'checkpoint';
+    let flagsHtml = '';
+    if (s.cold_cache_spike) {
+      const coldTip = 'Cold KV-cache prefill: >=25k uncached tokens with <20% cache hit (' + fmtInt(s.input_tokens) + ' uncached of ' + fmtInt(s.total_context) + ' total)';
+      flagsHtml += ' <span class="step-flag" title="' + esc(coldTip) + '">❄</span>';
+    }
+    if (isCheckpoint) {
+      flagsHtml += ' <span class="step-flag" title="System compaction call (CHECKPOINT): summarized history into <CONTEXT_SUMMARY>">⇄</span>';
+    } else if (s.compacted) {
+      flagsHtml += ' <span class="step-flag" title="Context compacted: resumed from <CONTEXT_SUMMARY> after CHECKPOINT compaction">⇄</span>';
+    }
+    if ((s.retry_wait_s || 0) > 0 || (s.retry_count || 0) > 0) {
+      const rCount = s.retry_count || 1;
+      const rTip = s.retry_wait_s > 0
+        ? ('Retried (' + rCount + '): +' + fmtDuration(s.retry_wait_s) + fmtExactSecNote(s.retry_wait_s) + ' failed-attempt wait before winning step')
+        : ('Retried after ' + rCount + ' failed attempt(s)');
+      flagsHtml += ' <span class="step-flag" title="' + esc(rTip) + '">↻</span>';
+    }
+
+    const mCol = colorMap[s.model_name] || 'var(--m-muted)';
+    const switchTag = s.model_switched
+      ? '<span class="step-flag" title="Model switched from previous step">↱ </span>'
+      : '';
+
+    const stepTitle = 'Ordinal #' + s.ordinal + ', raw step_index ' + s.step_index +
+      (s.created_at ? (', recorded at ' + s.created_at) : '') + '. Click row to expand details.';
+    const modelTitle = s.model_name + (isCheckpoint ? ' (system compaction call)' : '');
+    const ctxTitle = fmtInt(s.total_context) + ' total context tokens (' +
+      fmtInt(s.cache_read_tokens) + ' cached read = ' + s.cache_hit_pct + '% hit, ' +
+      fmtInt(s.input_tokens) + ' uncached prefill)';
+    const outTitle = fmtInt(s.output_tokens) + ' output tokens (~' +
+      fmtInt(s.est_thinking_tokens) + ' est. thinking, ~' +
+      fmtInt(s.est_visible_tokens) + (isCheckpoint ? ' est. summary)' : ' est. visible + tools)');
+    const retryDurNote = s.retry_wait_s > 0
+      ? (' · +' + fmtDuration(s.retry_wait_s) + fmtExactSecNote(s.retry_wait_s) + ' retry wait')
+      : '';
+    const durTitle = isCheckpoint
+      ? 'No hook timing for internal system compaction calls; excluded from avg tok/s'
+      : (s.duration_s != null
+        ? ('Model inference: ' + s.duration_s + 's (' + srcLabel(s.duration_source) + ') · Tool exec: ' + s.tool_exec_s + 's' + retryDurNote)
+        : ('Duration unavailable (historical step without lifecycle hooks or tool-start timestamps; excluded from avg tok/s)' + retryDurNote));
+    const durCellHtml = esc(s.duration_s != null ? s.duration_s + 's' : '—') +
+      (s.retry_wait_s > 0 ? (' <span class="muted">(+' + esc(fmtDuration(s.retry_wait_s)) + ')</span>') : '');
+    const tpsTitle = isCheckpoint
+      ? 'Throughput unavailable on system compaction calls (excluded from avg tok/s)'
+      : (s.effective_tps != null
+        ? (fmtInt(s.output_tokens) + ' out / ' + s.duration_s + 's = ' + s.effective_tps + ' tok/s')
+        : 'Throughput unavailable (missing step duration)');
+
+    const toolsList = s.tool_names || [];
+    let toolsCellHtml;
+    let toolsTitle;
+    if (isCheckpoint) {
+      toolsTitle = 'System context compaction call (CHECKPOINT): summarized history into <CONTEXT_SUMMARY>';
+      toolsCellHtml = '<span class="pill compact" title="' + esc(toolsTitle) + '">⇄ compaction</span>';
+    } else if (toolsList.length > 0) {
+      toolsTitle = toolsList.length + ' tool call(s): ' + toolsList.join(', ') + ' (tool exec: ' + s.tool_exec_s + 's)';
+      toolsCellHtml = esc(toolsList.join(', '));
+    } else {
+      toolsTitle = 'Direct model response (no tool calls invoked)';
+      toolsCellHtml = 'reply';
+    }
+
+    tr.innerHTML =
+      '<td class="mono" title="' + esc(stepTitle) + '">#' + esc(s.ordinal) + flagsHtml + '</td>' +
+      '<td title="' + esc(modelTitle) + '"><span class="model-badge" title="' + esc(modelTitle) + '"><span class="model-dot" style="background:' + esc(mCol) + '"></span>' + switchTag + '<span>' + esc(shortModelName(s.model_name)) + '</span></span></td>' +
+      '<td class="mono" title="' + esc(ctxTitle) + '">' + esc(fmtCompact(s.total_context)) + ' <span class="muted">(' + esc(s.cache_hit_pct) + '%)</span></td>' +
+      '<td class="mono" title="' + esc(outTitle) + '">' + esc(fmtInt(s.output_tokens)) + ' <span class="muted">(~' + esc(fmtInt(s.est_thinking_tokens)) + ')</span></td>' +
+      '<td class="mono" title="' + esc(durTitle) + '">' + durCellHtml + '</td>' +
+      '<td class="mono" title="' + esc(tpsTitle) + '">' + esc(s.effective_tps != null ? s.effective_tps : '—') + '</td>' +
+      '<td class="muted tools-cell" title="' + esc(toolsTitle) + '">' + toolsCellHtml + '</td>';
+
+    tr.addEventListener('click', function () {
+      state.expandedStep = (state.expandedStep === s.step_index) ? null : s.step_index;
+      renderMetrics(state.lastPayload);
+    });
+    tbody.appendChild(tr);
+
+    if (state.expandedStep === s.step_index) {
+      const dtr = document.createElement('tr');
+      dtr.className = 'detail-row';
+      dtr.innerHTML =
+        '<td colspan="7">' +
+        '<b>Step ' + esc(s.step_index) + '</b>' +
+        (isCheckpoint ? ' · Kind: <span class="mono">Compaction (CHECKPOINT)</span>' : '') +
+        ' · Model: <span class="mono">' + esc(s.model_name) + '</span>' +
+        (s.model_switched ? ' <span class="pill info">Model Switch</span>' : '') + ' · ' +
+        (s.cost_usd != null ? ('Paygo: <span class="mono">' + esc(fmtUsd(s.cost_usd)) + ' (' + esc(fmtCredits(s.credits)) + ')</span> · ') : '') +
+        'Uncached: <span class="mono">' + esc(fmtInt(s.input_tokens)) + '</span> · ' +
+        'Cached: <span class="mono">' + esc(fmtInt(s.cache_read_tokens)) + '</span> · ' +
+        (isCheckpoint ? 'Summary est: ' : 'Visible est: ') + '<span class="mono">' + esc(fmtInt(s.est_visible_tokens)) + '</span> · ' +
+        (s.retry_wait_s > 0 ? ('Retry wait: <span class="mono">' + esc(fmtDuration(s.retry_wait_s)) + '</span> · ') : '') +
+        'Tool exec: <span class="mono">' + esc(s.tool_exec_s) + 's</span> · ' +
+        'Source: <span class="mono">' + esc(srcLabel(s.duration_source)) + '</span> · ' +
+        'At: <span class="mono">' + esc(s.created_at) + '</span>' +
+        '</td>';
+      tbody.appendChild(dtr);
+    }
+  });
+
+  if (canFold) {
+    const foldTr = document.createElement('tr');
+    foldTr.className = 'steps-fold-row';
+    const foldTd = document.createElement('td');
+    foldTd.setAttribute('colspan', '7');
+    foldTd.textContent = isFolded
+      ? ('Show ' + hiddenCount + ' older step' + (hiddenCount === 1 ? '' : 's') + ' (' + orderedSteps.length + ' total) ▾')
+      : ('Fold to ' + RECENT_STEPS_LIMIT + ' most recent steps ▴');
+    foldTr.appendChild(foldTd);
+    foldTr.addEventListener('click', function () {
+      state.showAllSteps = !state.showAllSteps;
+      renderMetrics(state.lastPayload);
+    });
+    tbody.appendChild(foldTr);
+  }
+}
+
+function abortPendingFetch() {
+  if (state.fetchAbort) {
+    try { state.fetchAbort.abort(); } catch (e) {}
+    state.fetchAbort = null;
+  }
+}
+
+function applyCombined(data) {
+  if (!data) return false;
+  if (data.sub_id) state.sseSubId = data.sub_id;
+  if (data.conversations) renderConversations(data.conversations);
+  let matched = true;
+  if (data.metrics) {
+    const m = data.metrics;
+    const mMode = m.mode === 'all' ? 'all' : 'conversation';
+    if (mMode !== state.viewMode) {
+      matched = false;
+    } else if (mMode === 'all' && m.window && m.window !== state.timeWindow) {
+      matched = false;
+    } else if (
+      mMode === 'conversation' &&
+      !state.followActive &&
+      state.selectedConvId &&
+      m.conversation_id &&
+      m.conversation_id !== state.selectedConvId
+    ) {
+      matched = false;
+    } else {
+      state.lastPayload = m;
+      state.lastSnapshotAtMs = Date.now();
+      renderMetrics(m);
+    }
+  }
+  return matched;
+}
+
+function fetchOnce(convId, win) {
+  const reqConv = convId !== undefined ? convId : currentRequestedConvId();
+  const reqWin = win !== undefined ? win : state.timeWindow;
+  const expectedMode = reqConv === ALL_CONVERSATIONS_ID ? 'all' : 'conversation';
+  const subId = (state.es && state.es.readyState === 1 && state.sseSubId) ? state.sseSubId : null;
+  abortPendingFetch();
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  state.fetchAbort = ctrl;
+  const url = buildUrl('/api/snapshot', reqConv, reqWin, subId);
+  sidecarFetch(url, ctrl ? { signal: ctrl.signal } : undefined)
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function (data) {
+      if (ctrl && state.fetchAbort === ctrl) state.fetchAbort = null;
+      if (state.viewMode !== expectedMode) return;
+      if (expectedMode === 'all' && state.timeWindow !== reqWin) return;
+      applyCombined(data);
+      if (subId && data && data.retargeted === false && !state.sseRetryTimer) {
+        state.sseSubId = null;
+        connectSSE();
+      }
+    })
+    .catch(function (err) {
+      if (ctrl && state.fetchAbort === ctrl) state.fetchAbort = null;
+      if (err && err.name === 'AbortError') return;
+    });
+}
+
+function switchTarget(convId, win) {
+  if (state.es && state.es.readyState === 1 && state.sseSubId) {
+    fetchOnce(convId, win);
+  } else {
+    abortPendingFetch();
+    connectSSE();
+  }
+}
+
+function clearSseTimers() {
+  if (state.sseRetryTimer) {
+    clearTimeout(state.sseRetryTimer);
+    state.sseRetryTimer = null;
+  }
+  if (state.sseWatchdogTimer) {
+    clearTimeout(state.sseWatchdogTimer);
+    state.sseWatchdogTimer = null;
+  }
+}
+
+function markSseHealthy() {
+  state.sseRetryCount = 0;
+  state.healthFailCount = 0;
+  state.lastSseActivityMs = Date.now();
+  const pill = document.getElementById('ssePill');
+  const dot = document.getElementById('sseDot');
+  const lbl = document.getElementById('sseLabel');
+  if (dot) dot.className = 'dot live';
+  if (lbl) lbl.textContent = 'Live';
+  if (pill) pill.style.display = 'none';
+}
+
+function showSseReconnecting() {
+  const pill = document.getElementById('ssePill');
+  const dot = document.getElementById('sseDot');
+  const lbl = document.getElementById('sseLabel');
+  if (dot) dot.className = 'dot err';
+  if (lbl) {
+    lbl.textContent = state.healthFailCount >= 4
+      ? 'Server unreachable — reopen panel if restarted'
+      : 'Reconnecting';
+  }
+  if (pill) pill.style.display = '';
+}
+
+function scheduleSseRetry() {
+  const delayMs = Math.min(5000, 1000 * Math.pow(2, Math.min(state.sseRetryCount, 3)));
+  state.sseRetryCount += 1;
+  state.sseRetryTimer = setTimeout(function () {
+    state.sseRetryTimer = null;
+    connectSSE();
+  }, delayMs);
+}
+
+function probeHealthOnDisconnect(allowRestFallback) {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(function () {
+    try { ctrl.abort(); } catch (e) {}
+  }, 2500) : null;
+  sidecarFetch(buildUrl('/healthz', null), ctrl ? { signal: ctrl.signal } : undefined)
+    .then(function (r) {
+      if (timer) clearTimeout(timer);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      state.healthFailCount = 0;
+      showSseReconnecting();
+      if (allowRestFallback) {
+        fetchOnce();
+      }
+    })
+    .catch(function () {
+      if (timer) clearTimeout(timer);
+      state.healthFailCount += 1;
+      showSseReconnecting();
+    });
+}
+
+function handleSseDisconnect(es) {
+  if (state.es !== es) return;
+  clearSseTimers();
+  try { es.close(); } catch (e) {}
+  state.es = null;
+  state.sseSubId = null;
+  showSseReconnecting();
+  probeHealthOnDisconnect(state.sseRetryCount === 0);
+  scheduleSseRetry();
+}
+
+function armSseWatchdog(es) {
+  if (state.sseWatchdogTimer) {
+    clearTimeout(state.sseWatchdogTimer);
+    state.sseWatchdogTimer = null;
+  }
+  if (state.es !== es) return;
+  state.sseWatchdogTimer = setTimeout(function () {
+    state.sseWatchdogTimer = null;
+    handleSseDisconnect(es);
+  }, SSE_WATCHDOG_MS);
+}
+
+function connectSSE() {
+  clearSseTimers();
+  state.sseSubId = null;
+  if (state.es) {
+    try { state.es.close(); } catch (e) {}
+    state.es = null;
+  }
+  const targetConv = currentRequestedConvId();
+  const targetWin = state.timeWindow;
+  let es;
+  try {
+    es = new EventSource(buildUrl('/events', targetConv, targetWin));
+  } catch (e) {
+    state.es = null;
+    showSseReconnecting();
+    probeHealthOnDisconnect(false);
+    scheduleSseRetry();
+    return;
+  }
+  state.es = es;
+  armSseWatchdog(es);
+
+  function onData(ev) {
+    if (state.es !== es) return;
+    markSseHealthy();
+    armSseWatchdog(es);
+    try {
+      const parsed = JSON.parse(ev.data);
+      const matched = applyCombined(parsed);
+      if (ev.type === 'snapshot' && !matched && state.sseSubId && es.readyState === 1) {
+        fetchOnce();
+      }
+    } catch (e) {}
+  }
+
+  es.onopen = function () {
+    if (state.es !== es) return;
+    markSseHealthy();
+    armSseWatchdog(es);
+  };
+  es.addEventListener('snapshot', onData);
+  es.addEventListener('update', onData);
+  es.addEventListener('ping', function () {
+    if (state.es !== es) return;
+    markSseHealthy();
+    armSseWatchdog(es);
+    if (
+      !document.hidden &&
+      state.viewMode === 'all' &&
+      (state.timeWindow === '5h' || state.timeWindow === '24h') &&
+      (Date.now() - (state.lastSnapshotAtMs || 0)) >= 60000
+    ) {
+      fetchOnce();
+    }
+  });
+  es.onerror = function () {
+    handleSseDisconnect(es);
+  };
+}
+
+function ensureSseAlive() {
+  const stale = state.lastSseActivityMs > 0 && (Date.now() - state.lastSseActivityMs) > 20000;
+  if (!state.es || state.es.readyState !== 1 || state.sseRetryTimer !== null || stale) {
+    state.sseRetryCount = 0;
+    connectSSE();
+  }
+}
+
+function initDashboard() {
+  initThemeControls(function () {
+    state.lastScatterKey = null;
+    state.lastHistoryKey = null;
+  });
+
+  initPricingModal(function () {
+    fetchOnce();
+  });
+
+  document.getElementById('ssePill').addEventListener('click', function () {
+    state.sseRetryCount = 0;
+    state.healthFailCount = 0;
+    connectSSE();
+  });
+
+  window.addEventListener('online', function () {
+    ensureSseAlive();
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    syncGeneratingTimer();
+    if (!document.hidden) {
+      ensureSseAlive();
+    }
+  });
+
+  document.getElementById('modeConvBtn').addEventListener('click', function () {
+    if (state.viewMode === 'conversation') return;
+    state.viewMode = 'conversation';
+    state.modelFilter = null;
+    state.expandedStep = null;
+    state.showAllSteps = false;
+    state.showColdPrefills = false;
+    state.lastScatterKey = null;
+    syncModeControls();
+    switchTarget();
+  });
+
+  document.getElementById('modeAllBtn').addEventListener('click', function () {
+    if (state.viewMode === 'all') return;
+    state.viewMode = 'all';
+    state.modelFilter = null;
+    state.expandedStep = null;
+    state.showAllSteps = false;
+    state.showColdPrefills = false;
+    state.lastScatterKey = null;
+    syncModeControls();
+    switchTarget();
+  });
+
+  document.querySelectorAll('.filter-pill[data-window]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const win = btn.getAttribute('data-window') || 'all';
+      if (state.viewMode === 'all' && state.timeWindow === win) return;
+      state.viewMode = 'all';
+      state.timeWindow = win;
+      state.lastScatterKey = null;
+      syncModeControls();
+      switchTarget();
+    });
+  });
+
+  document.getElementById('stepsToggleBtn').addEventListener('click', function () {
+    state.showAllSteps = !state.showAllSteps;
+    if (state.lastPayload) renderMetrics(state.lastPayload);
+  });
+
+  document.getElementById('coldToggleBtn').addEventListener('click', function () {
+    state.showColdPrefills = !state.showColdPrefills;
+    state.lastScatterKey = null;
+    if (state.lastPayload) renderMetrics(state.lastPayload);
+  });
+
+  document.getElementById('scatterCloseBtn').addEventListener('click', function () {
+    clearModelFilter();
+  });
+
+  document.getElementById('byModelScope').addEventListener('click', function () {
+    if (state.modelFilter === null) return;
+    clearModelFilter();
+  });
+
+  document.querySelectorAll('#valPoolToggle [data-pool]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (btn.disabled) return;
+      const pool = btn.getAttribute('data-pool') || 'all';
+      state.valPool = pool;
+      if (state.modelFilter !== null) {
+        state.modelFilter = null;
+        state.lastScatterKey = null;
+      }
+      if (state.lastPayload) renderMetrics(state.lastPayload);
+    });
+  });
+
+  document.getElementById('valModelOverridePill').addEventListener('click', function () {
+    if (state.modelFilter === null) return;
+    clearModelFilter();
+  });
+
+  document.getElementById('convSelect').addEventListener('change', function (e) {
+    const val = e.target.value || null;
+    state.viewMode = 'conversation';
+    state.followActive = false;
+    state.selectedConvId = val;
+    state.modelFilter = null;
+    state.expandedStep = null;
+    state.showAllSteps = false;
+    state.showColdPrefills = false;
+    state.lastScatterKey = null;
+    document.getElementById('followToggle').checked = false;
+    syncModeControls();
+    switchTarget(val);
+  });
+
+  document.getElementById('followToggle').addEventListener('change', function (e) {
+    state.viewMode = 'conversation';
+    state.followActive = Boolean(e.target.checked);
+    if (state.followActive) {
+      state.selectedConvId = null;
+      state.modelFilter = null;
+      state.expandedStep = null;
+      state.showAllSteps = false;
+      state.showColdPrefills = false;
+      state.lastScatterKey = null;
+      syncModeControls();
+      switchTarget(null);
+    } else {
+      syncModeControls();
+      if (!(state.es && state.es.readyState === 1 && state.sseSubId)) {
+        connectSSE();
+      }
+    }
+  });
+
+  syncModeControls();
+  syncGeneratingTimer();
+  connectSSE();
+}
+
+initDashboard();

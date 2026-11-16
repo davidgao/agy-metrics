@@ -1,0 +1,885 @@
+"""SQLite WAL rollup cache, schema migrations, and corruption recovery."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+import json
+from pathlib import Path
+import sqlite3
+from typing import Any
+
+from .models import (
+    ConversationState,
+    _DELAY_FREEZE_MIN_WARM,
+    _FIT_MAX_RECENT_STEPS,
+    _ROLLUP_SCHEMA_VERSION,
+    _is_unattributed_model,
+    _parse_iso_epoch,
+    _safe_int,
+)
+from .roofline import compute_roofline_fit
+
+_ROLLUP_AGG_COLS_SQL = """
+    SUM(is_step),
+    COALESCE(SUM(CASE WHEN is_step = 1 THEN is_checkpoint ELSE 0 END), 0),
+    COALESCE(SUM(input_tokens), 0),
+    COALESCE(SUM(cache_read_tokens), 0),
+    COALESCE(SUM(output_tokens), 0),
+    COALESCE(SUM(est_thinking_tokens), 0),
+    COALESCE(SUM(est_visible_tokens), 0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND duration_s IS NOT NULL AND duration_s > 0 THEN duration_s ELSE 0.0 END), 0.0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND duration_s IS NOT NULL AND duration_s > 0 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND is_checkpoint = 0 AND cold_cache_spike = 1 AND duration_s IS NOT NULL AND duration_s > 0 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND is_checkpoint = 0 AND cold_cache_spike = 1 AND duration_s IS NOT NULL AND duration_s > 0 THEN duration_s ELSE 0.0 END), 0.0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND duration_s IS NOT NULL AND duration_s > 0 THEN output_tokens ELSE 0 END), 0),
+    COALESCE(SUM(tool_exec_s), 0.0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND is_checkpoint = 0 AND cold_cache_spike = 0 AND duration_s IS NOT NULL AND duration_s > 0 AND output_tokens > 0 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND is_checkpoint = 0 AND cold_cache_spike = 1 AND duration_s IS NOT NULL AND duration_s > 0 AND output_tokens > 0 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND est_delay_s IS NOT NULL THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(est_delay_s), 0.0),
+    COALESCE(SUM(compaction_event), 0),
+    COALESCE(SUM(wasted_s), 0.0),
+    COALESCE(SUM(is_retry), 0),
+    COALESCE(SUM(is_failed_turn), 0)
+"""
+
+
+def _events_union_sql(where_clause: str) -> str:
+    return f"""
+        SELECT (CASE WHEN epoch_s > 0 THEN CAST(epoch_s / 3600 AS INT) * 3600 ELSE 0 END) AS hour_epoch,
+               conv_id, model_name,
+               1 AS is_step, is_checkpoint, input_tokens, cache_read_tokens,
+               output_tokens, est_thinking_tokens, est_visible_tokens,
+               duration_s, tool_exec_s, cold_cache_spike, est_delay_s, compaction_event,
+               retry_wait_s AS wasted_s,
+               (CASE WHEN retry_wait_s > 0 OR retry_count > 0 THEN 1 ELSE 0 END) AS is_retry,
+               0 AS is_failed_turn
+        FROM step_lite
+        WHERE {where_clause}
+        UNION ALL
+        SELECT (CASE WHEN epoch_s > 0 THEN CAST(epoch_s / 3600 AS INT) * 3600 ELSE 0 END) AS hour_epoch,
+               conv_id, model_name,
+               0 AS is_step, 0 AS is_checkpoint, 0 AS input_tokens, 0 AS cache_read_tokens,
+               0 AS output_tokens, 0 AS est_thinking_tokens, 0 AS est_visible_tokens,
+               NULL AS duration_s, 0.0 AS tool_exec_s, 0 AS cold_cache_spike, NULL AS est_delay_s, 0 AS compaction_event,
+               wasted_s,
+               0 AS is_retry,
+               1 AS is_failed_turn
+        FROM failed_turn_lite
+        WHERE {where_clause}
+    """
+
+
+class MetricsStore:
+    """SQLite persistence and rollup query manager with automatic corruption recovery."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.closed = False
+        self.wal_write_count = 0
+        self.synced_delay_sig: dict[str, tuple[int, float, float]] = {}
+        self.global_fit_cache: dict[
+            str, tuple[tuple[tuple[int, float, str], ...], dict[str, Any]]
+        ] = {}
+        self.db: sqlite3.Connection = self.init_rollup_db()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+        self.closed = True
+
+    @staticmethod
+    def create_rollup_schema(db: sqlite3.Connection) -> None:
+        ver = db.execute("PRAGMA user_version").fetchone()[0]
+        if ver != _ROLLUP_SCHEMA_VERSION:
+            db.executescript(
+                """
+                DROP TABLE IF EXISTS failed_turn_lite;
+                DROP TABLE IF EXISTS step_lite;
+                DROP TABLE IF EXISTS hour_model_totals;
+                DROP TABLE IF EXISTS conv_model_totals;
+                DROP TABLE IF EXISTS conv_meta;
+                """
+            )
+            db.execute(f"PRAGMA user_version = {_ROLLUP_SCHEMA_VERSION}")
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conv_meta (
+                conv_id TEXT PRIMARY KEY,
+                t_path TEXT NOT NULL,
+                t_ino INT NOT NULL,
+                t_size INT NOT NULL,
+                t_mtime_ns INT NOT NULL,
+                h_path TEXT NOT NULL,
+                h_ino INT NOT NULL,
+                h_size INT NOT NULL,
+                h_mtime_ns INT NOT NULL,
+                hook_reported_transcript TEXT NOT NULL,
+                fallback_model_hint TEXT NOT NULL,
+                title TEXT NOT NULL,
+                current_model_name TEXT NOT NULL,
+                planner_steps_count INT NOT NULL,
+                current_tokens INT NOT NULL,
+                updated_at_ms INT NOT NULL,
+                compacted_count INT NOT NULL,
+                child_subagents_json TEXT NOT NULL,
+                child_subagent_models_json TEXT NOT NULL,
+                own_in INT NOT NULL,
+                own_cache INT NOT NULL,
+                own_out INT NOT NULL,
+                own_think INT NOT NULL,
+                own_vis INT NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS conv_model_totals (
+                conv_id TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                steps_count INT NOT NULL,
+                compaction_steps_count INT NOT NULL,
+                input_tokens INT NOT NULL,
+                cache_read_tokens INT NOT NULL,
+                output_tokens INT NOT NULL,
+                est_thinking_tokens INT NOT NULL,
+                est_visible_tokens INT NOT NULL,
+                model_time_s REAL NOT NULL,
+                timed_steps_count INT NOT NULL,
+                cold_timed_steps_count INT NOT NULL,
+                cold_model_time_s REAL NOT NULL,
+                timed_output_tokens INT NOT NULL,
+                tool_time_s REAL NOT NULL,
+                warm_timed_steps_count INT NOT NULL,
+                cold_excluded_count INT NOT NULL,
+                est_delay_steps_count INT NOT NULL,
+                est_total_delay_s REAL NOT NULL,
+                compacted_events_count INT NOT NULL,
+                wasted_time_s REAL NOT NULL,
+                retry_steps_count INT NOT NULL,
+                failed_turns_count INT NOT NULL,
+                PRIMARY KEY (conv_id, model_name)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS hour_model_totals (
+                hour_epoch INT NOT NULL,
+                conv_id TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                steps_count INT NOT NULL,
+                compaction_steps_count INT NOT NULL,
+                input_tokens INT NOT NULL,
+                cache_read_tokens INT NOT NULL,
+                output_tokens INT NOT NULL,
+                est_thinking_tokens INT NOT NULL,
+                est_visible_tokens INT NOT NULL,
+                model_time_s REAL NOT NULL,
+                timed_steps_count INT NOT NULL,
+                cold_timed_steps_count INT NOT NULL,
+                cold_model_time_s REAL NOT NULL,
+                timed_output_tokens INT NOT NULL,
+                tool_time_s REAL NOT NULL,
+                warm_timed_steps_count INT NOT NULL,
+                cold_excluded_count INT NOT NULL,
+                est_delay_steps_count INT NOT NULL,
+                est_total_delay_s REAL NOT NULL,
+                compacted_events_count INT NOT NULL,
+                wasted_time_s REAL NOT NULL,
+                retry_steps_count INT NOT NULL,
+                failed_turns_count INT NOT NULL,
+                PRIMARY KEY (hour_epoch, conv_id, model_name)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_hour_conv ON hour_model_totals(conv_id);
+
+            CREATE TABLE IF NOT EXISTS step_lite (
+                conv_id TEXT NOT NULL,
+                ordinal INT NOT NULL,
+                step_index INT NOT NULL,
+                created_at TEXT NOT NULL,
+                epoch_s REAL NOT NULL,
+                model_name TEXT NOT NULL,
+                is_checkpoint INT NOT NULL,
+                input_tokens INT NOT NULL,
+                cache_read_tokens INT NOT NULL,
+                output_tokens INT NOT NULL,
+                est_thinking_tokens INT NOT NULL,
+                est_visible_tokens INT NOT NULL,
+                duration_s REAL,
+                duration_source TEXT,
+                tool_exec_s REAL NOT NULL,
+                cold_cache_spike INT NOT NULL,
+                compacted INT NOT NULL,
+                compaction_event INT NOT NULL,
+                retry_wait_s REAL NOT NULL DEFAULT 0.0,
+                retry_count INT NOT NULL DEFAULT 0,
+                est_delay_s REAL,
+                delay_finalized INT NOT NULL DEFAULT 0,
+                PRIMARY KEY (conv_id, ordinal)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS failed_turn_lite (
+                conv_id TEXT NOT NULL,
+                seq INT NOT NULL,
+                epoch_s REAL NOT NULL,
+                model_name TEXT NOT NULL,
+                wasted_s REAL NOT NULL,
+                PRIMARY KEY (conv_id, seq)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_failed_turn_epoch
+                ON failed_turn_lite(epoch_s DESC, conv_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_step_epoch
+                ON step_lite(epoch_s DESC, conv_id DESC, ordinal DESC);
+            CREATE INDEX IF NOT EXISTS idx_step_model_epoch
+                ON step_lite(model_name, epoch_s DESC, conv_id DESC, ordinal DESC);
+            CREATE INDEX IF NOT EXISTS idx_step_model_timed
+                ON step_lite(model_name, epoch_s DESC, conv_id DESC, ordinal DESC)
+                WHERE is_checkpoint = 0 AND duration_s IS NOT NULL AND duration_s > 0;
+            CREATE INDEX IF NOT EXISTS idx_step_model_unfinalized
+                ON step_lite(model_name, conv_id, ordinal)
+                WHERE delay_finalized = 0
+                  AND is_checkpoint = 0
+                  AND cold_cache_spike = 0
+                  AND duration_s IS NOT NULL
+                  AND duration_s > 0
+                  AND output_tokens > 0;
+            """
+        )
+
+    def unlink_rollup_files(self) -> None:
+        db_path = self.state_dir / "rollup_cache.sqlite3"
+        for p in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def init_rollup_db(self, allow_unlink: bool = True) -> sqlite3.Connection:
+        db_path = self.state_dir / "rollup_cache.sqlite3"
+        db: sqlite3.Connection | None = None
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            db = sqlite3.connect(str(db_path), timeout=15.0, check_same_thread=False)
+            db.execute("PRAGMA busy_timeout=3000")
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
+            db.execute("PRAGMA wal_autocheckpoint=250")
+            self.create_rollup_schema(db)
+            db.execute("SELECT COUNT(*) FROM conv_meta LIMIT 1").fetchone()
+            db.execute("SELECT COUNT(*) FROM step_lite LIMIT 1").fetchone()
+            return db
+        except sqlite3.DatabaseError:
+            if db is not None:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+                db = None
+            if allow_unlink:
+                self.unlink_rollup_files()
+                return self.init_rollup_db(allow_unlink=False)
+        except (OSError, sqlite3.Error):
+            if db is not None:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+        mem_db = sqlite3.connect(":memory:", check_same_thread=False)
+        self.create_rollup_schema(mem_db)
+        return mem_db
+
+    def reset_to_memory_db(self) -> None:
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+        mem_db = sqlite3.connect(":memory:", check_same_thread=False)
+        self.create_rollup_schema(mem_db)
+        self.db = mem_db
+        self.closed = False
+        self.wal_write_count = 0
+        self.synced_delay_sig.clear()
+        self.global_fit_cache.clear()
+
+    def reset_fresh_disk_db(self) -> None:
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                db.close()
+            except sqlite3.Error:
+                pass
+        self.unlink_rollup_files()
+        self.db = self.init_rollup_db(allow_unlink=False)
+        self.closed = False
+        self.wal_write_count = 0
+        self.synced_delay_sig.clear()
+        self.global_fit_cache.clear()
+
+    def load_persisted_summaries(self) -> dict[str, ConversationState]:
+        conversations: dict[str, ConversationState] = {}
+        rows = self.db.execute(
+            """
+            SELECT conv_id, t_path, t_ino, t_size, t_mtime_ns,
+                   h_path, h_ino, h_size, h_mtime_ns,
+                   hook_reported_transcript, fallback_model_hint, title,
+                   current_model_name, planner_steps_count, current_tokens,
+                   updated_at_ms, compacted_count,
+                   child_subagents_json, child_subagent_models_json,
+                   own_in, own_cache, own_out, own_think, own_vis
+            FROM conv_meta
+            """
+        ).fetchall()
+        for row in rows:
+            cid = str(row[0])
+            conv = ConversationState(conversation_id=cid, hydrated=False)
+            conv.persisted_sig = (
+                str(row[1]),
+                _safe_int(row[2]),
+                _safe_int(row[3]),
+                _safe_int(row[4]),
+                str(row[5]),
+                _safe_int(row[6]),
+                _safe_int(row[7]),
+                _safe_int(row[8]),
+            )
+            conv.hook_reported_transcript = str(row[9] or "")
+            conv.fallback_model_hint = str(row[10] or "")
+            conv.title = str(row[11] or cid[:8])
+            conv.current_model_name = str(row[12] or "unknown")
+            conv.summary_steps_count = _safe_int(row[13])
+            conv.current_tokens = _safe_int(row[14])
+            conv.updated_at_ms = _safe_int(row[15])
+            conv.compacted_count = _safe_int(row[16])
+            try:
+                sub_map = json.loads(row[17] or "{}")
+                if isinstance(sub_map, dict):
+                    conv.child_subagents = {
+                        str(k): str(v) for k, v in sub_map.items()
+                    }
+            except json.JSONDecodeError:
+                pass
+            try:
+                sub_models = json.loads(row[18] or "{}")
+                if isinstance(sub_models, dict):
+                    conv.child_subagent_models = {
+                        str(k): str(v) for k, v in sub_models.items()
+                    }
+            except json.JSONDecodeError:
+                pass
+            conv.own_input_tokens = _safe_int(row[19])
+            conv.own_cache_read_tokens = _safe_int(row[20])
+            conv.own_output_tokens = _safe_int(row[21])
+            conv.own_est_thinking_tokens = _safe_int(row[22])
+            conv.own_est_visible_tokens = _safe_int(row[23])
+            conversations[cid] = conv
+        return conversations
+
+    def delete_conversation_rollup(
+        self, cid: str, on_error: Callable[[], None] | None = None
+    ) -> None:
+        self.synced_delay_sig.clear()
+        try:
+            with self.db:
+                self.db.execute("DELETE FROM failed_turn_lite WHERE conv_id = ?", (cid,))
+                self.db.execute("DELETE FROM step_lite WHERE conv_id = ?", (cid,))
+                self.db.execute(
+                    "DELETE FROM hour_model_totals WHERE conv_id = ?", (cid,)
+                )
+                self.db.execute(
+                    "DELETE FROM conv_model_totals WHERE conv_id = ?", (cid,)
+                )
+                self.db.execute("DELETE FROM conv_meta WHERE conv_id = ?", (cid,))
+        except sqlite3.Error:
+            if on_error is not None:
+                on_error()
+
+    def refresh_conv_rollup_tables(self, conv_ids: list[str] | set[str]) -> None:
+        agg = _ROLLUP_AGG_COLS_SQL
+        union_sql = _events_union_sql("conv_id = ?")
+        for cid in conv_ids:
+            self.db.execute(
+                "DELETE FROM hour_model_totals WHERE conv_id = ?", (cid,)
+            )
+            self.db.execute(
+                "DELETE FROM conv_model_totals WHERE conv_id = ?", (cid,)
+            )
+            self.db.execute(
+                f"""
+                INSERT INTO conv_model_totals
+                SELECT conv_id, model_name, {agg}
+                FROM ({union_sql})
+                GROUP BY conv_id, model_name
+                """,
+                (cid, cid),
+            )
+            self.db.execute(
+                f"""
+                INSERT INTO hour_model_totals
+                SELECT hour_epoch, conv_id, model_name, {agg}
+                FROM ({union_sql})
+                GROUP BY hour_epoch, conv_id, model_name
+                """,
+                (cid, cid),
+            )
+
+    def persist_conversation_rollup(
+        self,
+        conv: ConversationState,
+        file_sig: tuple[str, int, int, int, str, int, int, int],
+        on_recover: Callable[[], None] | None = None,
+        _allow_recover: bool = True,
+    ) -> None:
+        cid = conv.conversation_id
+
+        core_rows: list[tuple[Any, ...]] = []
+        touched_models: set[str] = set()
+        raw_steps = conv.raw_steps
+        for idx, s in enumerate(conv.steps):
+            epoch_s = 0.0
+            if idx < len(raw_steps) and raw_steps[idx].created_at_epoch is not None:
+                epoch_s = float(raw_steps[idx].created_at_epoch)
+            elif s.created_at:
+                parsed = _parse_iso_epoch(s.created_at)
+                if parsed is not None:
+                    epoch_s = float(parsed)
+
+            is_ckpt = 1 if s.step_kind == "checkpoint" else 0
+            cold = 1 if s.cold_cache_spike else 0
+            comp = 1 if s.compacted else 0
+            comp_ev = 1 if s.compaction_event else 0
+            touched_models.add(s.model_name)
+            core_rows.append(
+                (
+                    cid,
+                    s.ordinal,
+                    s.step_index,
+                    s.created_at,
+                    epoch_s,
+                    s.model_name,
+                    is_ckpt,
+                    s.input_tokens,
+                    s.cache_read_tokens,
+                    s.output_tokens,
+                    s.est_thinking_tokens,
+                    s.est_visible_tokens,
+                    float(s.duration_s) if s.duration_s is not None else None,
+                    s.duration_source,
+                    float(s.tool_exec_s),
+                    cold,
+                    comp,
+                    comp_ev,
+                    float(s.retry_wait_s),
+                    int(s.retry_count),
+                )
+            )
+
+        failed_rows: list[tuple[Any, ...]] = [
+            (cid, ft.seq, float(ft.epoch_s), ft.model_name, float(ft.wasted_s))
+            for ft in conv.failed_turns
+        ]
+        steps_fp: tuple[Any, ...] = (tuple(core_rows), tuple(failed_rows))
+        steps_changed = conv.persisted_steps_fp != steps_fp
+
+        conv_meta_params = (
+            cid,
+            file_sig[0],
+            file_sig[1],
+            file_sig[2],
+            file_sig[3],
+            file_sig[4],
+            file_sig[5],
+            file_sig[6],
+            file_sig[7],
+            conv.hook_reported_transcript,
+            conv.fallback_model_hint,
+            conv.title,
+            conv.current_model_name,
+            conv.summary_steps_count,
+            conv.current_tokens,
+            conv.updated_at_ms,
+            conv.compacted_count,
+            json.dumps(conv.child_subagents, separators=(",", ":")),
+            json.dumps(conv.child_subagent_models, separators=(",", ":")),
+            conv.own_input_tokens,
+            conv.own_cache_read_tokens,
+            conv.own_output_tokens,
+            conv.own_est_thinking_tokens,
+            conv.own_est_visible_tokens,
+        )
+
+        try:
+            if not steps_changed:
+                with self.db:
+                    self.db.execute(
+                        """
+                        INSERT OR REPLACE INTO conv_meta VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        conv_meta_params,
+                    )
+            else:
+                prev_delays: dict[tuple[int, str, int, float], tuple[float, int]] = {}
+                for row in self.db.execute(
+                    """
+                    SELECT ordinal, model_name, output_tokens, duration_s, est_delay_s, delay_finalized
+                    FROM step_lite
+                    WHERE conv_id = ? AND est_delay_s IS NOT NULL AND duration_s IS NOT NULL
+                    """,
+                    (cid,),
+                ).fetchall():
+                    prev_delays[
+                        (
+                            _safe_int(row[0]),
+                            str(row[1]),
+                            _safe_int(row[2]),
+                            round(float(row[3]), 6),
+                        )
+                    ] = (float(row[4]), _safe_int(row[5]))
+
+                step_rows: list[tuple[Any, ...]] = []
+                for row in core_rows:
+                    is_ckpt = row[6]
+                    out_tok = row[9]
+                    dur_s = row[12]
+                    cold = row[15]
+                    saved_delay: float | None = None
+                    saved_fin = 0
+                    if (
+                        not is_ckpt
+                        and not cold
+                        and dur_s is not None
+                        and dur_s > 0.0
+                        and out_tok > 0
+                    ):
+                        prev = prev_delays.get(
+                            (row[1], row[5], out_tok, round(float(dur_s), 6))
+                        )
+                        if prev is not None:
+                            saved_delay, saved_fin = prev
+                    step_rows.append((*row, saved_delay, saved_fin))
+
+                for m_name in touched_models:
+                    self.synced_delay_sig.pop(m_name, None)
+
+                with self.db:
+                    self.db.execute("DELETE FROM failed_turn_lite WHERE conv_id = ?", (cid,))
+                    self.db.execute("DELETE FROM step_lite WHERE conv_id = ?", (cid,))
+                    self.db.execute(
+                        """
+                        INSERT OR REPLACE INTO conv_meta VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        conv_meta_params,
+                    )
+                    if step_rows:
+                        self.db.executemany(
+                            "INSERT INTO step_lite VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            step_rows,
+                        )
+                    if failed_rows:
+                        self.db.executemany(
+                            "INSERT INTO failed_turn_lite VALUES (?, ?, ?, ?, ?)",
+                            failed_rows,
+                        )
+                    self.refresh_conv_rollup_tables([cid])
+                conv.persisted_steps_fp = steps_fp
+
+            conv.persisted_sig = file_sig
+            self.wal_write_count += 1
+            if self.wal_write_count % 50 == 0:
+                try:
+                    self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+        except sqlite3.Error:
+            if _allow_recover and on_recover is not None:
+                on_recover()
+
+    def get_global_model_fit_and_sync_delays(
+        self,
+        model_name: str,
+        on_fit_computed: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Compute global roofline per model over recent <=100 warm steps & sync delays."""
+        cnt_row = self.db.execute(
+            """
+            SELECT COALESCE(SUM(warm_timed_steps_count), 0),
+                   COALESCE(SUM(cold_excluded_count), 0)
+            FROM conv_model_totals
+            WHERE model_name = ?
+            """,
+            (model_name,),
+        ).fetchone()
+        g_warm = int(cnt_row[0] or 0) if cnt_row else 0
+        g_cold = int(cnt_row[1] or 0) if cnt_row else 0
+
+        if _is_unattributed_model(model_name):
+            return {
+                "available": False,
+                "reason": "unattributed",
+                "warm_count": g_warm,
+                "used_count": 0,
+                "token_spread": 0,
+                "quantile_pct": None,
+                "inferred_ttft_s": None,
+                "inferred_decode_tps": None,
+                "slope_s_per_tok": None,
+                "avg_delay_s": None,
+                "median_delay_s": None,
+                "cold_excluded_count": g_cold,
+            }
+
+        warm_rows_desc = self.db.execute(
+            """
+            SELECT output_tokens, duration_s, duration_source
+            FROM step_lite
+            WHERE model_name = ?
+              AND is_checkpoint = 0
+              AND cold_cache_spike = 0
+              AND duration_s IS NOT NULL
+              AND duration_s > 0
+              AND output_tokens > 0
+            ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+            LIMIT ?
+            """,
+            (model_name, _FIT_MAX_RECENT_STEPS),
+        ).fetchall()
+        warm_key = tuple(
+            (int(r[0]), float(r[1]), str(r[2] or ""))
+            for r in reversed(warm_rows_desc)
+        )
+
+        cached = self.global_fit_cache.get(model_name)
+        if cached is not None and cached[0] == warm_key:
+            base_fit = cached[1]
+        else:
+            if on_fit_computed is not None:
+                on_fit_computed()
+            base_fit = compute_roofline_fit(warm_key)
+            self.global_fit_cache[model_name] = (warm_key, base_fit)
+
+        fit: dict[str, Any] = {
+            **base_fit,
+            "warm_count": g_warm,
+            "cold_excluded_count": g_cold,
+        }
+        if fit["available"]:
+            b_val = float(fit["inferred_ttft_s"])
+            s_val = float(fit["slope_s_per_tok"])
+            sig = (g_warm, b_val, s_val)
+            if self.synced_delay_sig.get(model_name) != sig:
+                affected_rows = self.db.execute(
+                    """
+                    SELECT DISTINCT conv_id
+                    FROM step_lite
+                    WHERE model_name = ?
+                      AND delay_finalized = 0
+                      AND is_checkpoint = 0
+                      AND cold_cache_spike = 0
+                      AND duration_s IS NOT NULL
+                      AND duration_s > 0
+                      AND output_tokens > 0
+                    """,
+                    (model_name,),
+                ).fetchall()
+                if affected_rows:
+                    affected_cids = [str(r[0]) for r in affected_rows]
+                    new_fin = 1 if g_warm >= _DELAY_FREEZE_MIN_WARM else 0
+                    with self.db:
+                        self.db.execute(
+                            """
+                            UPDATE step_lite
+                            SET est_delay_s = ROUND(MAX(0.0, duration_s - (? + ? * output_tokens)), 2),
+                                delay_finalized = ?
+                            WHERE model_name = ?
+                              AND delay_finalized = 0
+                              AND is_checkpoint = 0
+                              AND cold_cache_spike = 0
+                              AND duration_s IS NOT NULL
+                              AND duration_s > 0
+                              AND output_tokens > 0
+                            """,
+                            (b_val, s_val, new_fin, model_name),
+                        )
+                        self.refresh_conv_rollup_tables(affected_cids)
+                self.synced_delay_sig[model_name] = sig
+
+        return fit
+
+    def query_window_val_rows(
+        self,
+        cutoff_epoch: float,
+        conv_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if conv_ids is not None and len(conv_ids) == 0:
+            return []
+        boundary_hour = int(cutoff_epoch // 3600) * 3600
+        ceil_hour = boundary_hour + 3600
+        if conv_ids is None:
+            sql = """
+                SELECT model_name,
+                       SUM(steps_count),
+                       SUM(input_tokens),
+                       SUM(cache_read_tokens),
+                       SUM(output_tokens)
+                FROM (
+                    SELECT model_name, steps_count, input_tokens, cache_read_tokens, output_tokens
+                    FROM hour_model_totals
+                    WHERE hour_epoch >= ?
+                    UNION ALL
+                    SELECT model_name,
+                           COUNT(*),
+                           COALESCE(SUM(input_tokens), 0),
+                           COALESCE(SUM(cache_read_tokens), 0),
+                           COALESCE(SUM(output_tokens), 0)
+                    FROM step_lite
+                    WHERE epoch_s >= ? AND epoch_s < ?
+                    GROUP BY model_name
+                )
+                GROUP BY model_name
+            """
+            params: tuple[Any, ...] = (ceil_hour, cutoff_epoch, ceil_hour)
+        else:
+            placeholders = ",".join("?" for _ in conv_ids)
+            sql = f"""
+                SELECT model_name,
+                       SUM(steps_count),
+                       SUM(input_tokens),
+                       SUM(cache_read_tokens),
+                       SUM(output_tokens)
+                FROM (
+                    SELECT model_name, steps_count, input_tokens, cache_read_tokens, output_tokens
+                    FROM hour_model_totals
+                    WHERE conv_id IN ({placeholders}) AND hour_epoch >= ?
+                    UNION ALL
+                    SELECT model_name,
+                           COUNT(*),
+                           COALESCE(SUM(input_tokens), 0),
+                           COALESCE(SUM(cache_read_tokens), 0),
+                           COALESCE(SUM(output_tokens), 0)
+                    FROM step_lite
+                    WHERE conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?
+                    GROUP BY model_name
+                )
+                GROUP BY model_name
+            """
+            params = (*conv_ids, ceil_hour, *conv_ids, cutoff_epoch, ceil_hour)
+
+        rows = self.db.execute(sql, params).fetchall()
+        return [
+            {
+                "model_name": str(r[0]),
+                "steps_count": int(r[1] or 0),
+                "input_tokens": int(r[2] or 0),
+                "cache_read_tokens": int(r[3] or 0),
+                "output_tokens": int(r[4] or 0),
+            }
+            for r in rows
+        ]
+
+    def query_window_models(self, cutoff_epoch: float | None) -> list[str]:
+        """Return distinct model names active inside the given window."""
+        if cutoff_epoch is None:
+            return [
+                str(r[0])
+                for r in self.db.execute(
+                    "SELECT DISTINCT model_name FROM conv_model_totals"
+                ).fetchall()
+            ]
+        boundary_hour = int(cutoff_epoch // 3600) * 3600
+        ceil_hour = boundary_hour + 3600
+        return [
+            str(r[0])
+            for r in self.db.execute(
+                """
+                SELECT DISTINCT model_name FROM hour_model_totals WHERE hour_epoch >= ?
+                UNION
+                SELECT DISTINCT model_name FROM step_lite WHERE epoch_s >= ? AND epoch_s < ?
+                UNION
+                SELECT DISTINCT model_name FROM failed_turn_lite WHERE epoch_s >= ? AND epoch_s < ?
+                """,
+                (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+            ).fetchall()
+        ]
+
+    def query_all_model_aggregates(
+        self, cutoff_epoch: float | None
+    ) -> tuple[list[tuple[Any, ...]], list[str] | None]:
+        """Return (model_agg_rows, distinct_conv_ids_or_none) after delay sync."""
+        if cutoff_epoch is None:
+            agg_rows = self.db.execute(
+                """
+                SELECT model_name,
+                       SUM(steps_count), SUM(compaction_steps_count),
+                       SUM(input_tokens), SUM(cache_read_tokens),
+                       SUM(output_tokens), SUM(est_thinking_tokens), SUM(est_visible_tokens),
+                       SUM(model_time_s), SUM(timed_steps_count),
+                       SUM(cold_timed_steps_count), SUM(cold_model_time_s),
+                       SUM(timed_output_tokens), SUM(tool_time_s),
+                       SUM(warm_timed_steps_count), SUM(cold_excluded_count),
+                       SUM(est_delay_steps_count), SUM(est_total_delay_s),
+                       SUM(compacted_events_count),
+                       SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+                FROM conv_model_totals
+                GROUP BY model_name
+                """
+            ).fetchall()
+            return agg_rows, None
+
+        boundary_hour = int(cutoff_epoch // 3600) * 3600
+        ceil_hour = boundary_hour + 3600
+        union_sql = _events_union_sql("epoch_s >= ? AND epoch_s < ?")
+        agg_rows = self.db.execute(
+            f"""
+            SELECT model_name,
+                   SUM(steps_count), SUM(compaction_steps_count),
+                   SUM(input_tokens), SUM(cache_read_tokens),
+                   SUM(output_tokens), SUM(est_thinking_tokens), SUM(est_visible_tokens),
+                   SUM(model_time_s), SUM(timed_steps_count),
+                   SUM(cold_timed_steps_count), SUM(cold_model_time_s),
+                   SUM(timed_output_tokens), SUM(tool_time_s),
+                   SUM(warm_timed_steps_count), SUM(cold_excluded_count),
+                   SUM(est_delay_steps_count), SUM(est_total_delay_s),
+                   SUM(compacted_events_count),
+                   SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+            FROM (
+                SELECT model_name, steps_count, compaction_steps_count,
+                       input_tokens, cache_read_tokens,
+                       output_tokens, est_thinking_tokens, est_visible_tokens,
+                       model_time_s, timed_steps_count,
+                       cold_timed_steps_count, cold_model_time_s,
+                       timed_output_tokens, tool_time_s,
+                       warm_timed_steps_count, cold_excluded_count,
+                       est_delay_steps_count, est_total_delay_s,
+                       compacted_events_count,
+                       wasted_time_s, retry_steps_count, failed_turns_count
+                FROM hour_model_totals
+                WHERE hour_epoch >= ?
+                UNION ALL
+                SELECT model_name, {_ROLLUP_AGG_COLS_SQL}
+                FROM ({union_sql})
+                GROUP BY model_name
+            )
+            GROUP BY model_name
+            """,
+            (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+        ).fetchall()
+        win_conv_rows = self.db.execute(
+            """
+            SELECT DISTINCT conv_id FROM hour_model_totals WHERE hour_epoch >= ?
+            UNION
+            SELECT DISTINCT conv_id FROM step_lite WHERE epoch_s >= ? AND epoch_s < ?
+            UNION
+            SELECT DISTINCT conv_id FROM failed_turn_lite WHERE epoch_s >= ? AND epoch_s < ?
+            """,
+            (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+        ).fetchall()
+        return agg_rows, [str(r[0]) for r in win_conv_rows]

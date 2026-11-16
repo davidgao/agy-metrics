@@ -1,0 +1,7 @@
+{
+  "name": "agy-metrics",
+  "displayName": "AGY Metrics",
+  "version": "0.1.0",
+  "description": "Local telemetry dashboard for Antigravity Desktop: monitors input/cached/thinking/output tokens, context window breakdown, per-step latency, and effective tokens/sec in the Auxiliary Pane.",
+  "logo": "assets/logo.svg"
+}

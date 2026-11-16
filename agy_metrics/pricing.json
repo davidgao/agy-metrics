@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-11-14",
+  "credits_per_usd": 100.0,
+  "orchestrator": {
+    "default_planner_id": "gemini-4-carbon",
+    "executor_id": "gemini-4-hydrogen"
+  },
+  "models": [
+    {
+      "id": "gemini-4-carbon",
+      "label": "Gemini 4 Carbon",
+      "pool": "gemini",
+      "match_any": ["carbon"],
+      "rates": {
+        "input": 2.0,
+        "cache_read": 0.1,
+        "output": 10.0
+      },
+      "upcoming_rates": {
+        "effective_date": "2026-12-01",
+        "label": "Standard rate",
+        "input": 4.0,
+        "cache_read": 0.2,
+        "output": 20.0
+      }
+    },
+    {
+      "id": "gemini-4-argon",
+      "label": "Gemini 4 Argon",
+      "pool": "gemini",
+      "match_any": ["argon"],
+      "rates": {
+        "input": 2.0,
+        "cache_read": 0.1,
+        "output": 10.0
+      },
+      "upcoming_rates": {
+        "effective_date": "2026-12-01",
+        "label": "Standard rate",
+        "input": 4.0,
+        "cache_read": 0.2,
+        "output": 20.0
+      }
+    },
+    {
+      "id": "gemini-4-hydrogen",
+      "label": "Gemini 4 Hydrogen",
+      "pool": "gemini",
+      "match_any": ["hydrogen"],
+      "rates": {
+        "input": 1.5,
+        "cache_read": 0.075,
+        "output": 7.5
+      }
+    },
+    {
+      "id": "gemini-flash-lite",
+      "label": "Gemini Flash-Lite",
+      "pool": "gemini",
+      "match_any": ["flash-lite", "flash_lite", "flash lite"],
+      "rates": {
+        "input": 0.3,
+        "cache_read": 0.03,
+        "output": 2.5
+      }
+    },
+    {
+      "id": "gemini-flash",
+      "label": "Gemini Flash",
+      "pool": "gemini",
+      "match_any": ["flash"],
+      "rates": {
+        "input": 0.75,
+        "cache_read": 0.075,
+        "output": 3.75
+      },
+      "upcoming_rates": {
+        "effective_date": "2027-01-01",
+        "label": "Standard rate",
+        "input": 1.5,
+        "cache_read": 0.15,
+        "output": 7.5
+      }
+    },
+    {
+      "id": "gemini-pro",
+      "label": "Gemini Pro",
+      "pool": "gemini",
+      "match_any": [
+        "gemini 3 pro",
+        "gemini 3.1 pro",
+        "gemini-3-pro",
+        "gemini-3.1-pro",
+        "gemini 2.5 pro",
+        "gemini-2.5-pro",
+        "subagent · pro"
+      ],
+      "rates": {
+        "input": 2.0,
+        "cache_read": 0.2,
+        "output": 12.0
+      }
+    },
+    {
+      "id": "claude-opus",
+      "label": "Claude Opus",
+      "pool": "partner",
+      "match_any": ["opus"],
+      "rates": {
+        "input": 4.0,
+        "cache_read": 0.2,
+        "output": 20.0
+      }
+    },
+    {
+      "id": "claude-sonnet",
+      "label": "Claude Sonnet",
+      "pool": "partner",
+      "match_any": ["sonnet"],
+      "rates": {
+        "input": 2.0,
+        "cache_read": 0.1,
+        "output": 10.0
+      }
+    },
+    {
+      "id": "claude-haiku",
+      "label": "Claude Haiku",
+      "pool": "partner",
+      "match_any": ["haiku"],
+      "rates": {
+        "input": 0.8,
+        "cache_read": 0.08,
+        "output": 4.0
+      }
+    },
+    {
+      "id": "gpt-oss",
+      "label": "GPT-OSS",
+      "pool": "partner",
+      "match_any": ["gpt-oss", "gpt oss"],
+      "rates": {
+        "input": 0.15,
+        "cache_read": 0.015,
+        "output": 0.6
+      }
+    }
+  ]
+}
