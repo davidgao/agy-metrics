@@ -3,5 +3,11 @@
   "displayName": "AGY Metrics",
   "version": "0.1.0",
   "description": "Local telemetry dashboard for Antigravity Desktop: monitors input/cached/thinking/output tokens, context window breakdown, per-step latency, and effective tokens/sec in the Auxiliary Pane.",
+  "author": {
+    "name": "David Gao",
+    "url": "https://github.com/davidgao"
+  },
+  "homepage": "https://github.com/davidgao/agy-metrics",
+  "repository": "https://github.com/davidgao/agy-metrics",
   "logo": "assets/logo.svg"
 }

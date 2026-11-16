@@ -13,5 +13,9 @@ authors = [{ name = "David Gao" }]
 requires-python = ">=3.10"
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/davidgao/agy-metrics"
+Repository = "https://github.com/davidgao/agy-metrics"
+
 [tool.setuptools.packages.find]
 include = ["agy_metrics*"]
