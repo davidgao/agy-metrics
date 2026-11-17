@@ -27,7 +27,9 @@ import {
   ALL_CONVERSATIONS_ID,
   RECENT_STEPS_LIMIT,
   buildUrl,
+  canUseEventSource,
   currentRequestedConvId,
+  hasSidecarFetch,
   sidecarFetch,
   state,
   syncGeneratingTimer,
@@ -36,6 +38,9 @@ import {
 import { initThemeControls } from './theme.js';
 
 const SSE_WATCHDOG_MS = 35000;
+const POLL_IDLE_MS = 1500;
+const POLL_GENERATING_MS = 600;
+const INIT_SNAPSHOT_FALLBACK_MS = 900;
 
 function renderConversations(convsData) {
   if (!convsData) return;
@@ -579,6 +584,11 @@ function abortPendingFetch() {
 function applyCombined(data) {
   if (!data) return false;
   if (data.sub_id) state.sseSubId = data.sub_id;
+  if (data.etag) state.lastEtag = data.etag;
+  if (data.unchanged) {
+    state.lastSnapshotAtMs = Date.now();
+    return true;
+  }
   if (data.conversations) renderConversations(data.conversations);
   let matched = true;
   if (data.metrics) {
@@ -605,16 +615,44 @@ function applyCombined(data) {
   return matched;
 }
 
-function fetchOnce(convId, win) {
+function stopPolling() {
+  if (state.pollTimer) {
+    clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+function clearInitFallback() {
+  if (state.initFallbackTimer) {
+    clearTimeout(state.initFallbackTimer);
+    state.initFallbackTimer = null;
+  }
+}
+
+function schedulePoll(customDelayMs) {
+  stopPolling();
+  if (typeof document !== 'undefined' && document.hidden) return;
+  const delay = customDelayMs != null
+    ? customDelayMs
+    : (state.status === 'generating' ? POLL_GENERATING_MS : POLL_IDLE_MS);
+  state.pollTimer = setTimeout(function () {
+    state.pollTimer = null;
+    pollSnapshot();
+  }, delay);
+}
+
+function fetchOnce(convId, win, useEtag) {
   const reqConv = convId !== undefined ? convId : currentRequestedConvId();
   const reqWin = win !== undefined ? win : state.timeWindow;
   const expectedMode = reqConv === ALL_CONVERSATIONS_ID ? 'all' : 'conversation';
   const subId = (state.es && state.es.readyState === 1 && state.sseSubId) ? state.sseSubId : null;
   abortPendingFetch();
+  stopPolling();
   const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
   state.fetchAbort = ctrl;
-  const url = buildUrl('/api/snapshot', reqConv, reqWin, subId);
-  sidecarFetch(url, ctrl ? { signal: ctrl.signal } : undefined)
+  const etagArg = useEtag ? state.lastEtag : null;
+  const url = buildUrl('/api/snapshot', reqConv, reqWin, subId, etagArg);
+  return sidecarFetch(url, ctrl ? { signal: ctrl.signal } : undefined)
     .then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
@@ -623,21 +661,56 @@ function fetchOnce(convId, win) {
       if (ctrl && state.fetchAbort === ctrl) state.fetchAbort = null;
       if (state.viewMode !== expectedMode) return;
       if (expectedMode === 'all' && state.timeWindow !== reqWin) return;
+      if (
+        expectedMode === 'conversation' &&
+        !state.followActive &&
+        state.selectedConvId &&
+        reqConv !== state.selectedConvId
+      ) {
+        return;
+      }
+      state.healthFailCount = 0;
+      markSseHealthy();
       applyCombined(data);
-      if (subId && data && data.retargeted === false && !state.sseRetryTimer) {
+      if (subId && data && data.retargeted === false && !state.sseDisabled && !state.sseRetryTimer) {
         state.sseSubId = null;
         connectSSE();
+      }
+      if (state.sseDisabled || !state.es || state.es.readyState !== 1 || !state.sseSubId) {
+        schedulePoll();
       }
     })
     .catch(function (err) {
       if (ctrl && state.fetchAbort === ctrl) state.fetchAbort = null;
       if (err && err.name === 'AbortError') return;
+      state.healthFailCount += 1;
+      if (!state.es || state.es.readyState !== 1) {
+        showSseReconnecting();
+      }
+      if (state.sseDisabled || !state.es || state.es.readyState !== 1 || !state.sseSubId) {
+        const errDelay = Math.min(5000, 1000 * Math.pow(2, Math.min(state.healthFailCount, 3)));
+        schedulePoll(errDelay);
+      }
     });
 }
 
-function switchTarget(convId, win) {
+function pollSnapshot() {
   if (state.es && state.es.readyState === 1 && state.sseSubId) {
-    fetchOnce(convId, win);
+    stopPolling();
+    return;
+  }
+  fetchOnce(undefined, undefined, true);
+}
+
+function switchTarget(convId, win) {
+  state.lastEtag = null;
+  if (
+    (state.es && state.es.readyState === 1 && state.sseSubId) ||
+    state.sseDisabled ||
+    !canUseEventSource() ||
+    state.pollTimer !== null
+  ) {
+    fetchOnce(convId, win, false);
   } else {
     abortPendingFetch();
     connectSSE();
@@ -645,6 +718,7 @@ function switchTarget(convId, win) {
 }
 
 function clearSseTimers() {
+  clearInitFallback();
   if (state.sseRetryTimer) {
     clearTimeout(state.sseRetryTimer);
     state.sseRetryTimer = null;
@@ -689,36 +763,22 @@ function scheduleSseRetry() {
   }, delayMs);
 }
 
-function probeHealthOnDisconnect(allowRestFallback) {
-  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(function () {
-    try { ctrl.abort(); } catch (e) {}
-  }, 2500) : null;
-  sidecarFetch(buildUrl('/healthz', null), ctrl ? { signal: ctrl.signal } : undefined)
-    .then(function (r) {
-      if (timer) clearTimeout(timer);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      state.healthFailCount = 0;
-      showSseReconnecting();
-      if (allowRestFallback) {
-        fetchOnce();
-      }
-    })
-    .catch(function () {
-      if (timer) clearTimeout(timer);
-      state.healthFailCount += 1;
-      showSseReconnecting();
-    });
-}
-
 function handleSseDisconnect(es) {
   if (state.es !== es) return;
   clearSseTimers();
   try { es.close(); } catch (e) {}
   state.es = null;
   state.sseSubId = null;
-  showSseReconnecting();
-  probeHealthOnDisconnect(state.sseRetryCount === 0);
+  state.sseFailCount += 1;
+  if (state.sseFailCount >= 2 && state.lastSnapshotAtMs > 0) {
+    state.sseDisabled = true;
+    fetchOnce(undefined, undefined, true);
+    return;
+  }
+  if (state.lastSnapshotAtMs === 0) {
+    showSseReconnecting();
+  }
+  fetchOnce(undefined, undefined, Boolean(state.lastEtag));
   scheduleSseRetry();
 }
 
@@ -741,30 +801,50 @@ function connectSSE() {
     try { state.es.close(); } catch (e) {}
     state.es = null;
   }
+  if (state.sseDisabled || !canUseEventSource()) {
+    state.sseDisabled = true;
+    fetchOnce(undefined, undefined, false);
+    return;
+  }
   const targetConv = currentRequestedConvId();
   const targetWin = state.timeWindow;
   let es;
   try {
-    es = new EventSource(buildUrl('/events', targetConv, targetWin));
+    es = new EventSource(buildUrl('/events', targetConv, targetWin, null, null, true));
   } catch (e) {
     state.es = null;
+    state.sseFailCount += 1;
+    if (state.sseFailCount >= 2 && state.lastSnapshotAtMs > 0) {
+      state.sseDisabled = true;
+      fetchOnce(undefined, undefined, true);
+      return;
+    }
     showSseReconnecting();
-    probeHealthOnDisconnect(false);
+    fetchOnce(undefined, undefined, Boolean(state.lastEtag));
     scheduleSseRetry();
     return;
   }
   state.es = es;
   armSseWatchdog(es);
+  state.initFallbackTimer = setTimeout(function () {
+    state.initFallbackTimer = null;
+    if (state.es === es && !state.sseSubId) {
+      fetchOnce(undefined, undefined, false);
+    }
+  }, INIT_SNAPSHOT_FALLBACK_MS);
 
   function onData(ev) {
     if (state.es !== es) return;
+    state.sseFailCount = 0;
+    clearInitFallback();
+    stopPolling();
     markSseHealthy();
     armSseWatchdog(es);
     try {
       const parsed = JSON.parse(ev.data);
       const matched = applyCombined(parsed);
       if (ev.type === 'snapshot' && !matched && state.sseSubId && es.readyState === 1) {
-        fetchOnce();
+        fetchOnce(undefined, undefined, false);
       }
     } catch (e) {}
   }
@@ -778,6 +858,9 @@ function connectSSE() {
   es.addEventListener('update', onData);
   es.addEventListener('ping', function () {
     if (state.es !== es) return;
+    state.sseFailCount = 0;
+    clearInitFallback();
+    stopPolling();
     markSseHealthy();
     armSseWatchdog(es);
     if (
@@ -786,7 +869,7 @@ function connectSSE() {
       (state.timeWindow === '5h' || state.timeWindow === '24h') &&
       (Date.now() - (state.lastSnapshotAtMs || 0)) >= 60000
     ) {
-      fetchOnce();
+      fetchOnce(undefined, undefined, false);
     }
   });
   es.onerror = function () {
@@ -795,6 +878,10 @@ function connectSSE() {
 }
 
 function ensureSseAlive() {
+  if (state.sseDisabled || !canUseEventSource()) {
+    fetchOnce(undefined, undefined, Boolean(state.lastEtag));
+    return;
+  }
   const stale = state.lastSseActivityMs > 0 && (Date.now() - state.lastSseActivityMs) > 20000;
   if (!state.es || state.es.readyState !== 1 || state.sseRetryTimer !== null || stale) {
     state.sseRetryCount = 0;
@@ -809,10 +896,16 @@ function initDashboard() {
   });
 
   initPricingModal(function () {
-    fetchOnce();
+    state.lastEtag = null;
+    fetchOnce(undefined, undefined, false);
   });
 
   document.getElementById('ssePill').addEventListener('click', function () {
+    stopPolling();
+    if (!hasSidecarFetch()) {
+      state.sseDisabled = false;
+      state.sseFailCount = 0;
+    }
     state.sseRetryCount = 0;
     state.healthFailCount = 0;
     connectSSE();
@@ -824,7 +917,9 @@ function initDashboard() {
 
   document.addEventListener('visibilitychange', function () {
     syncGeneratingTimer();
-    if (!document.hidden) {
+    if (document.hidden) {
+      stopPolling();
+    } else {
       ensureSseAlive();
     }
   });
@@ -932,7 +1027,7 @@ function initDashboard() {
       switchTarget(null);
     } else {
       syncModeControls();
-      if (!(state.es && state.es.readyState === 1 && state.sseSubId)) {
+      if (!(state.es && state.es.readyState === 1 && state.sseSubId) && !(state.sseDisabled && state.pollTimer !== null)) {
         connectSSE();
       }
     }

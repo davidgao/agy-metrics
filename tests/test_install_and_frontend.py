@@ -343,14 +343,25 @@ class TestInstallAndFrontend(unittest.TestCase):
             self.assertNotIn(forbidden, combined.lower() if forbidden.islower() else combined, forbidden)
 
     def test_frontend_freeze_race_guards_and_demand_timer(self) -> None:
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         js_bundle = "\n".join(p.read_text(encoding="utf-8") for p in sorted(STATIC_DIR.glob("*.js")))
         state_js = (STATIC_DIR / "state.js").read_text(encoding="utf-8")
         format_js = (STATIC_DIR / "format.js").read_text(encoding="utf-8")
         pricing_js = (STATIC_DIR / "pricing-modal.js").read_text(encoding="utf-8")
         charts_js = (STATIC_DIR / "charts.js").read_text(encoding="utf-8")
 
+        self.assertIn('<script src="preload.js"></script>', html)
         self.assertNotIn("state.timeWindow = m.window", js_bundle)
-        for marker in ("/api/snapshot", "AbortController", "retargeted", "switchTarget"):
+        for marker in (
+            "/api/snapshot",
+            "AbortController",
+            "retargeted",
+            "switchTarget",
+            "hasSidecarFetch",
+            "canUseEventSource",
+            "sseDisabled",
+            "pollTimer",
+        ):
             self.assertIn(marker, js_bundle)
 
         # Generation timer is demand-driven (only runs while generating & visible)

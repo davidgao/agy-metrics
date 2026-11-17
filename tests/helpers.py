@@ -31,6 +31,7 @@ def running_server(
     *,
     poll_interval_s: float = 0.1,
     keepalive_s: float = 15.0,
+    managed_sidecar: bool | None = None,
 ) -> Iterator[tuple[Any, str]]:
     server, stop_event, _ = create_server(
         host="127.0.0.1",
@@ -38,6 +39,7 @@ def running_server(
         engine=engine,
         poll_interval_s=poll_interval_s,
         keepalive_s=keepalive_s,
+        managed_sidecar=managed_sidecar,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

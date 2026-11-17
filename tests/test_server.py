@@ -534,6 +534,269 @@ class TestServer(unittest.TestCase):
             finally:
                 engine.close()
 
+    def test_remote_control_hosts_managed_sidecar_and_proxy_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            state = root / "state"
+            cid = "eeeeeeee-1111-2222-3333-444444444444"
+            t_log = brain / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+            write_jsonl(
+                t_log,
+                [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-16T01:00:00Z",
+                        "content": "Remote control test",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-16T01:00:02Z",
+                        "input_tokens": 1200,
+                        "cache_read_tokens": 300,
+                        "output_tokens": 80,
+                        "content": "First step",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+            engine = MetricsEngine(brain_dir=brain, state_dir=state)
+            try:
+                # 1. Strict mode (managed_sidecar=False): trusted Remote Control / sidecar / CGNAT / private IP hosts pass
+                with running_server(engine, managed_sidecar=False) as (server, _base):
+                    port = server.server_address[1]
+                    trusted_cases = (
+                        ("antigravity.google", "https://antigravity.google"),
+                        ("r-123.antigravity.google", "https://r-123.antigravity.google"),
+                        ("antigravity.google.com", "https://antigravity.google.com"),
+                        ("abc-sidecar.usercontent.goog", "https://abc-sidecar.usercontent.goog"),
+                        ("agy-metrics/dashboard", "sidecar://agy-metrics/dashboard"),
+                        ("100.64.1.2:3389", "http://100.64.1.2:3389"),
+                        ("box.tail1234.ts.net", "https://box.tail1234.ts.net"),
+                        ("192.168.1.10:3389", "http://192.168.1.10:3389"),
+                    )
+                    for host_val, origin_val in trusted_cases:
+                        for method, path in (
+                            ("GET", "/"),
+                            ("GET", "/api/snapshot"),
+                            ("HEAD", "/"),
+                            ("HEAD", "/healthz"),
+                        ):
+                            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                            conn.request(method, path, headers={"Host": host_val})
+                            resp = conn.getresponse()
+                            body = resp.read()
+                            conn.close()
+                            self.assertEqual(resp.status, 200, f"{method} {path} Host={host_val}")
+                            if method == "HEAD":
+                                self.assertEqual(body, b"")
+                                self.assertGreater(int(resp.getheader("Content-Length") or "0"), 0)
+
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                        conn.request(
+                            "POST",
+                            "/api/pricing",
+                            body=b'{"action":"reset_all"}',
+                            headers={
+                                "Host": host_val,
+                                "Origin": origin_val,
+                                "Content-Type": "application/json",
+                            },
+                        )
+                        post_resp = conn.getresponse()
+                        post_resp.read()
+                        conn.close()
+                        self.assertEqual(
+                            post_resp.status,
+                            200,
+                            f"POST /api/pricing Host={host_val} Origin={origin_val}",
+                        )
+
+                    # AGY_METRICS_ALLOWED_HOSTS permits explicit exact & suffix matches, rejects others
+                    with patch.dict(
+                        os.environ,
+                        {"AGY_METRICS_ALLOWED_HOSTS": "custom.example.org,.corp.internal"},
+                        clear=False,
+                    ):
+                        for ok_host in ("custom.example.org", "dev.corp.internal:8080"):
+                            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                            conn.request("GET", "/healthz", headers={"Host": ok_host})
+                            resp = conn.getresponse()
+                            resp.read()
+                            conn.close()
+                            self.assertEqual(resp.status, 200, ok_host)
+
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                        conn.request("GET", "/healthz", headers={"Host": "evil.example"})
+                        resp = conn.getresponse()
+                        resp.read()
+                        conn.close()
+                        self.assertEqual(resp.status, 403)
+
+                    # OPTIONS preflight CORS headers
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                    conn.request(
+                        "OPTIONS",
+                        "/api/pricing",
+                        headers={
+                            "Host": "antigravity.google.com",
+                            "Origin": "https://antigravity.google.com",
+                        },
+                    )
+                    opt_ok = conn.getresponse()
+                    opt_ok.read()
+                    conn.close()
+                    self.assertEqual(opt_ok.status, 204)
+                    self.assertEqual(
+                        opt_ok.getheader("Access-Control-Allow-Origin"),
+                        "https://antigravity.google.com",
+                    )
+
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                    conn.request(
+                        "OPTIONS",
+                        "/api/pricing",
+                        headers={
+                            "Host": "antigravity.google.com",
+                            "Origin": "https://evil.example",
+                        },
+                    )
+                    opt_bad = conn.getresponse()
+                    opt_bad.read()
+                    conn.close()
+                    self.assertEqual(opt_bad.status, 204)
+                    self.assertIsNone(opt_bad.getheader("Access-Control-Allow-Origin"))
+
+                    # Sub-path proxy routes & /preload.js
+                    for sub_path in (
+                        "/preload.js",
+                        "/r/inst1/sidecars/agy-metrics/dashboard/",
+                        "/r/inst1/sidecars/agy-metrics/dashboard/preload.js",
+                        "/r/inst1/sidecars/agy-metrics/dashboard/static/styles.css",
+                        "/r/inst1/sidecars/agy-metrics/dashboard/api/snapshot",
+                        "/r/inst1/sidecars/agy-metrics/dashboard/api/pricing",
+                    ):
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                        conn.request("GET", sub_path, headers={"Host": "antigravity.google"})
+                        sub_resp = conn.getresponse()
+                        sub_resp.read()
+                        conn.close()
+                        self.assertEqual(sub_resp.status, 200, sub_path)
+
+                    # Conditional ?etag= on /api/snapshot
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                    conn.request("GET", "/api/snapshot", headers={"Host": "antigravity.google"})
+                    r1 = conn.getresponse()
+                    d1 = json.loads(r1.read().decode("utf-8"))
+                    conn.close()
+                    self.assertEqual(r1.status, 200)
+                    etag1 = d1["etag"]
+                    self.assertTrue(etag1)
+                    self.assertEqual(d1["metrics"]["totals"]["output_tokens"], 80)
+
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                    conn.request(
+                        "GET",
+                        f"/api/snapshot?etag={etag1}",
+                        headers={"Host": "antigravity.google"},
+                    )
+                    r2 = conn.getresponse()
+                    d2 = json.loads(r2.read().decode("utf-8"))
+                    conn.close()
+                    self.assertEqual(r2.status, 200)
+                    self.assertTrue(d2["unchanged"])
+                    self.assertEqual(d2["etag"], etag1)
+                    self.assertFalse(d2["retargeted"])
+
+                    with open(t_log, "a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "step_index": 2,
+                                    "type": "PLANNER_RESPONSE",
+                                    "created_at": "2026-11-16T01:00:05Z",
+                                    "input_tokens": 1300,
+                                    "cache_read_tokens": 300,
+                                    "output_tokens": 45,
+                                    "content": "Second step",
+                                    "tool_calls": [],
+                                }
+                            )
+                            + "\n"
+                        )
+                    engine.refresh_if_changed()
+
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+                    conn.request(
+                        "GET",
+                        f"/api/snapshot?etag={etag1}",
+                        headers={"Host": "antigravity.google"},
+                    )
+                    r3 = conn.getresponse()
+                    d3 = json.loads(r3.read().decode("utf-8"))
+                    conn.close()
+                    self.assertEqual(r3.status, 200)
+                    self.assertNotIn("unchanged", d3)
+                    self.assertNotEqual(d3["etag"], etag1)
+                    self.assertEqual(d3["metrics"]["totals"]["output_tokens"], 125)
+
+                # 2. Managed sidecar mode via ANTIGRAVITY_SIDECAR_WEB_PORT:
+                # unlisted proxy host works for GET and CSRF-token POST, rejected on POST without CSRF token
+                with patch.dict(
+                    os.environ, {"ANTIGRAVITY_SIDECAR_WEB_PORT": "3389"}, clear=False
+                ):
+                    with running_server(engine) as (managed_srv, _mbase):
+                        self.assertTrue(managed_srv.managed_sidecar)
+                        mport = managed_srv.server_address[1]
+                        proxy_host = "relay.enterprise-proxy.example:8443"
+
+                        conn = http.client.HTTPConnection("127.0.0.1", mport, timeout=2.0)
+                        conn.request("GET", "/", headers={"Host": proxy_host})
+                        root_r = conn.getresponse()
+                        root_html = root_r.read().decode("utf-8")
+                        conn.close()
+                        self.assertEqual(root_r.status, 200)
+                        marker = '<meta name="agy-csrf-token" content="'
+                        csrf_tok = root_html.split(marker, 1)[1].split('"', 1)[0]
+                        self.assertTrue(csrf_tok)
+
+                        conn = http.client.HTTPConnection("127.0.0.1", mport, timeout=2.0)
+                        conn.request("GET", "/api/snapshot", headers={"Host": proxy_host})
+                        snap_r = conn.getresponse()
+                        snap_r.read()
+                        conn.close()
+                        self.assertEqual(snap_r.status, 200)
+
+                        conn = http.client.HTTPConnection("127.0.0.1", mport, timeout=2.0)
+                        conn.request(
+                            "POST",
+                            "/api/pricing",
+                            body=b'{"action":"reset_all"}',
+                            headers={"Host": proxy_host, "Content-Type": "application/json"},
+                        )
+                        bad_post = conn.getresponse()
+                        bad_post.read()
+                        conn.close()
+                        self.assertEqual(bad_post.status, 403)
+
+                        conn = http.client.HTTPConnection("127.0.0.1", mport, timeout=2.0)
+                        conn.request(
+                            "POST",
+                            "/api/pricing",
+                            body=json.dumps(
+                                {"action": "reset_all", "_csrf_token": csrf_tok}
+                            ).encode("utf-8"),
+                            headers={"Host": proxy_host, "Content-Type": "application/json"},
+                        )
+                        ok_post = conn.getresponse()
+                        ok_post.read()
+                        conn.close()
+                        self.assertEqual(ok_post.status, 200)
+            finally:
+                engine.close()
+
 
 if __name__ == "__main__":
     unittest.main()

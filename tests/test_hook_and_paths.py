@@ -18,7 +18,7 @@ if str(TESTS_DIR) not in sys.path:
 
 from helpers import REPO_ROOT, write_jsonl  # noqa: E402
 from agy_metrics.engine import MetricsEngine  # noqa: E402
-from agy_metrics.paths import get_state_dir  # noqa: E402
+from agy_metrics.paths import get_app_data_dir, get_brain_dir, get_state_dir  # noqa: E402
 from hooks import run_hook  # noqa: E402
 
 
@@ -190,6 +190,76 @@ class TestHookAndPaths(unittest.TestCase):
                 self.assertTrue(eng.is_generating())
             finally:
                 eng.close()
+
+    def test_executable_data_dir_and_transcript_path_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exec_data = root / "custom_app" / "sidecar_data" / "agy-metrics" / "dashboard" / "data"
+            exec_data.mkdir(parents=True)
+            base_clean = {
+                k: v
+                for k, v in os.environ.items()
+                if k
+                not in (
+                    "AGY_METRICS_STATE_DIR",
+                    "PLUGIN_DATA",
+                    "AGY_METRICS_APP_DATA_DIR",
+                    "ANTIGRAVITY_APP_DATA_DIR",
+                    "ANTIGRAVITY_EXECUTABLE_DATA_DIR",
+                )
+            }
+            with patch.dict(
+                os.environ,
+                {**base_clean, "ANTIGRAVITY_EXECUTABLE_DATA_DIR": str(exec_data)},
+                clear=True,
+            ):
+                self.assertEqual(get_app_data_dir(), root / "custom_app")
+                self.assertEqual(get_brain_dir(), root / "custom_app" / "brain")
+                self.assertEqual(
+                    get_state_dir(), root / "custom_app" / "plugin_data" / "agy-metrics"
+                )
+                self.assertEqual(
+                    Path(run_hook._get_state_dir()),
+                    root / "custom_app" / "plugin_data" / "agy-metrics",
+                )
+
+            # Fallback scan under ~/.gemini when default antigravity/brain is absent
+            fake_home = root / "home"
+            (fake_home / ".gemini" / "config" / "brain").mkdir(parents=True)
+            (fake_home / ".gemini" / "antigravity_remote" / "brain").mkdir(parents=True)
+            with patch.dict(
+                os.environ, {**base_clean, "HOME": str(fake_home)}, clear=True
+            ):
+                self.assertEqual(
+                    get_app_data_dir(), fake_home / ".gemini" / "antigravity_remote"
+                )
+
+            # run_hook derives <appData> from transcriptPath when env vars are unset
+            cid = "ffffffff-1111-2222-3333-444444444444"
+            t_path = root / "remote_app" / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+            t_path.parent.mkdir(parents=True)
+            t_path.write_text("", encoding="utf-8")
+            proc = subprocess.run(
+                ["python3", "-S", "./hooks/run_hook.py", "PreInvocation"],
+                cwd=str(REPO_ROOT),
+                env={**base_clean, "HOME": str(fake_home)},
+                input=json.dumps(
+                    {
+                        "conversationId": cid,
+                        "modelName": "Carbon",
+                        "hookEventName": "PreInvocation",
+                        "transcriptPath": str(t_path),
+                    }
+                ),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(proc.stdout), {})
+            expected_hook_log = (
+                root / "remote_app" / "plugin_data" / "agy-metrics" / "conversations" / f"{cid}.hooks.jsonl"
+            )
+            self.assertTrue(expected_hook_log.is_file())
 
 
 if __name__ == "__main__":

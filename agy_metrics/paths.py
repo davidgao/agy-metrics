@@ -6,6 +6,16 @@ import os
 from pathlib import Path
 
 
+def _app_data_from_executable_data_dir(raw_dir: str | None) -> Path | None:
+    if not raw_dir or not raw_dir.strip():
+        return None
+    p = Path(raw_dir.strip()).expanduser()
+    for candidate in (p, *p.parents):
+        if candidate.name == "sidecar_data" and candidate.parent != candidate:
+            return candidate.parent
+    return None
+
+
 def get_app_data_dir() -> Path:
     explicit = os.environ.get("AGY_METRICS_APP_DATA_DIR")
     if explicit:
@@ -13,7 +23,22 @@ def get_app_data_dir() -> Path:
     env_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
     if env_dir:
         return Path(env_dir).expanduser()
-    return Path.home() / ".gemini" / "antigravity"
+    exec_app_data = _app_data_from_executable_data_dir(
+        os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+    )
+    if exec_app_data is not None:
+        return exec_app_data
+
+    gemini_root = Path.home() / ".gemini"
+    default = gemini_root / "antigravity"
+    if not (default / "brain").is_dir() and gemini_root.is_dir():
+        try:
+            for cand in sorted(gemini_root.iterdir(), key=lambda c: c.name):
+                if cand.name != "config" and cand.is_dir() and (cand / "brain").is_dir():
+                    return cand
+        except OSError:
+            pass
+    return default
 
 
 def get_brain_dir() -> Path:

@@ -1207,6 +1207,29 @@ class MetricsEngine:
                 res = self._get_metrics_unlocked(conversation_id, window=window)
                 return dict(res)
 
+    def get_state_etag(
+        self,
+        conversation_id: str | None = None,
+        window: str = "all",
+        refresh: bool = True,
+    ) -> str:
+        with self._lock:
+            if refresh:
+                self.refresh_if_changed(target_id=conversation_id)
+            norm_win = window if window in VALID_WINDOWS else "all"
+            eff_target = (
+                ALL_CONVERSATIONS_ID
+                if conversation_id == ALL_CONVERSATIONS_ID
+                else (conversation_id or self._select_active_conversation_id() or "")
+            )
+            gen_flag = 1 if self.is_generating() else 0
+            win_bucket = (
+                int(time.time() // 60)
+                if (eff_target == ALL_CONVERSATIONS_ID and norm_win != "all")
+                else 0
+            )
+            return f"{self._state_rev}:{eff_target}:{norm_win}:{gen_flag}:{win_bucket}"
+
     def get_snapshot(
         self,
         conversation_id: str | None = None,
@@ -1221,6 +1244,9 @@ class MetricsEngine:
             )
             conversations = self.list_conversations(refresh=False)
             return {
+                "etag": self.get_state_etag(
+                    conversation_id, window=window, refresh=False
+                ),
                 "conversations": conversations,
                 "metrics": metrics,
             }

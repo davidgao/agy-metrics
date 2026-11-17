@@ -89,6 +89,30 @@ def assemble_dashboard_html(static_dir: Path, csrf_token: str) -> bytes:
     assembled = assembled.replace(_APP_MODULE_TAG, script_block, 1)
     return assembled.encode("utf-8")
 _SINGLE_LABEL_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_SIDECAR_PATH_HOST_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_TRUSTED_HOST_EXACT = frozenset(
+    {"localhost", "antigravity.google", "antigravity.google.com"}
+)
+_TRUSTED_HOST_SUFFIXES = (
+    ".localhost",
+    ".antigravity.google",
+    ".antigravity.google.com",
+    ".usercontent.goog",
+    ".goog",
+    ".google.com",
+    ".gstatic.com",
+    ".run.app",
+    ".idx.dev",
+    ".cloudworkstations.dev",
+    ".sidecar",
+    ".antigravity",
+    ".agy-metrics",
+    ".ts.net",
+)
+_PRELOAD_STUB = b"/* agy-metrics preload stub */\n"
 
 
 def _compute_local_hostnames() -> frozenset[str]:
@@ -106,21 +130,95 @@ def _compute_local_hostnames() -> frozenset[str]:
 _LOCAL_HOSTNAMES = _compute_local_hostnames()
 
 
+def _extra_allowed_hosts() -> tuple[set[str], list[str], bool]:
+    raw = os.environ.get("AGY_METRICS_ALLOWED_HOSTS", "")
+    exact: set[str] = set()
+    suffixes: list[str] = []
+    allow_all = False
+    for entry in raw.split(","):
+        item = entry.strip().rstrip(".").lower()
+        if not item:
+            continue
+        if item == "*":
+            allow_all = True
+        elif item.startswith("."):
+            suffixes.append(item)
+        else:
+            exact.add(item)
+    return exact, suffixes, allow_all
+
+
 def _is_trusted_local_hostname(hostname: str | None) -> bool:
     if not hostname:
         return False
     h = hostname.strip().rstrip(".").lower()
     if not h:
         return False
-    if h == "localhost" or h.endswith(".localhost"):
+    extra_exact, extra_suffixes, allow_all = _extra_allowed_hosts()
+    if allow_all or h in extra_exact or any(h.endswith(sfx) for sfx in extra_suffixes):
+        return True
+    if h in _TRUSTED_HOST_EXACT or h.endswith(_TRUSTED_HOST_SUFFIXES):
         return True
     if h in _LOCAL_HOSTNAMES:
         return True
+    ip_part = h.split("%", 1)[0]
     try:
-        return ipaddress.ip_address(h).is_loopback
+        addr = ipaddress.ip_address(ip_part)
+        if addr.is_loopback:
+            return True
+        if addr.is_unspecified:
+            return False
+        return bool(
+            addr.is_private
+            or addr.is_link_local
+            or (addr.version == 4 and addr in _CGNAT_NET)
+        )
     except ValueError:
         pass
     return bool(_SINGLE_LABEL_HOST_RE.fullmatch(h))
+
+
+def _is_syntactically_valid_host(host_raw: str | None) -> tuple[bool, str | None]:
+    if not host_raw:
+        return False, None
+    raw = host_raw.strip()
+    if not raw or any(ord(ch) < 33 or ord(ch) == 127 for ch in raw):
+        return False, None
+    if any(ch in raw for ch in ("@", "\\", "?", "#")):
+        return False, None
+    if raw == "::1":
+        return True, "::1"
+    if "/" in raw and not raw.startswith("["):
+        base, _, port_str = raw.partition(":")
+        if ":" in port_str:
+            return False, None
+        if port_str:
+            if not port_str.isdigit():
+                return False, None
+            port_num = int(port_str)
+            if not (1 <= port_num <= 65535):
+                return False, None
+        lowered = base.lower()
+        if _SIDECAR_PATH_HOST_RE.fullmatch(lowered):
+            return True, lowered
+        return False, None
+    try:
+        u = urllib.parse.urlsplit(f"//{raw}")
+        port = u.port
+    except ValueError:
+        return False, None
+    if port is not None and not (1 <= port <= 65535):
+        return False, None
+    if (
+        u.path != ""
+        or u.query != ""
+        or u.fragment != ""
+        or u.username is not None
+        or u.password is not None
+        or not u.hostname
+    ):
+        return False, None
+    return True, u.hostname
 
 
 def _safe_log(msg: str) -> None:
@@ -233,8 +331,9 @@ class SSEHub:
                     window=window,
                     refresh=False,
                 )
+                etag = engine.get_state_etag(conv_id, window=window, refresh=False)
                 cache[target] = json.dumps(
-                    {"conversations": convs, "metrics": metrics},
+                    {"etag": etag, "conversations": convs, "metrics": metrics},
                     separators=(",", ":"),
                 )
             payload = cache[target]
@@ -268,11 +367,20 @@ class MetricsHTTPServer(ThreadingHTTPServer):
         engine: MetricsEngine,
         hub: SSEHub,
         keepalive_s: float = 15.0,
+        managed_sidecar: bool | None = None,
     ) -> None:
         self.engine = engine
         self.hub = hub
         self.keepalive_s = max(0.05, float(keepalive_s))
         self.csrf_token = secrets.token_urlsafe(24)
+        self.managed_sidecar = (
+            bool(
+                os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT")
+                or os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+            )
+            if managed_sidecar is None
+            else bool(managed_sidecar)
+        )
         self._html_lock = threading.Lock()
         self._html_cache_sig: tuple[tuple[str, int, int], ...] | None = None
         self._html_cache_bytes: bytes | None = None
@@ -333,19 +441,58 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
         status: int,
         content_type: str,
         body: bytes,
+        *,
+        send_body: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.close_connection = True
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
+        if content_type:
+            self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if send_body and body:
+            self.wfile.write(body)
 
-    def _send_json(self, status: int, data: Any) -> None:
+    def _send_json(
+        self,
+        status: int,
+        data: Any,
+        *,
+        send_body: bool = True,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(data, separators=(",", ":")).encode("utf-8")
-        self._send_bytes(status, "application/json; charset=utf-8", body)
+        self._send_bytes(
+            status,
+            "application/json; charset=utf-8",
+            body,
+            send_body=send_body,
+            extra_headers=extra_headers,
+        )
+
+    def _cors_headers(self) -> dict[str, str] | None:
+        origin = self.headers.get("Origin")
+        if origin and self._is_allowed_origin(origin):
+            return {
+                "Access-Control-Allow-Origin": origin.strip(),
+                "Vary": "Origin",
+            }
+        return None
+
+    @staticmethod
+    def _has_path_traversal(path: str) -> bool:
+        unquoted = urllib.parse.unquote(path)
+        return (
+            "\\" in unquoted
+            or "\x00" in unquoted
+            or any(part in (".", "..") for part in unquoted.split("/") if part)
+        )
 
     def _is_client_disconnected(self) -> bool:
         sock = getattr(self, "connection", None)
@@ -374,38 +521,101 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
         except OSError:
             return True
 
+    def do_HEAD(self) -> None:
+        self._handle_get_or_head(send_body=False)
+
     def do_GET(self) -> None:
+        self._handle_get_or_head(send_body=True)
+
+    def do_OPTIONS(self) -> None:
         try:
             srv: MetricsHTTPServer = self.server  # type: ignore[assignment]
             host_hdr = self.headers.get("Host")
-            if not self._is_allowed_host(host_hdr, srv.server_port):
+            if not self._is_allowed_host(
+                host_hdr, srv.server_port, allow_proxied_any=srv.managed_sidecar
+            ):
                 _safe_log(
-                    f"[agy-metrics] 403 forbidden host on GET {self.path}: {host_hdr!r}\n"
+                    f"[agy-metrics] 403 forbidden host on OPTIONS {self.path}: {host_hdr!r}\n"
                 )
-                self._send_json(403, {"error": "forbidden host"})
+                self._send_json(403, {"error": "forbidden host"}, send_body=False)
                 return
 
+            extra_headers: dict[str, str] = {"Allow": "GET, HEAD, POST, OPTIONS"}
+            origin = self.headers.get("Origin")
+            if origin and self._is_allowed_origin(origin):
+                extra_headers["Access-Control-Allow-Origin"] = origin.strip()
+                extra_headers["Access-Control-Allow-Methods"] = "GET, HEAD, POST, OPTIONS"
+                extra_headers["Access-Control-Allow-Headers"] = "Content-Type"
+                extra_headers["Vary"] = "Origin"
+            self._send_bytes(
+                204,
+                "",
+                b"",
+                send_body=False,
+                extra_headers=extra_headers,
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _handle_get_or_head(self, *, send_body: bool) -> None:
+        try:
+            srv: MetricsHTTPServer = self.server  # type: ignore[assignment]
+            host_hdr = self.headers.get("Host")
+            if not self._is_allowed_host(
+                host_hdr, srv.server_port, allow_proxied_any=srv.managed_sidecar
+            ):
+                _safe_log(
+                    f"[agy-metrics] 403 forbidden host on {self.command} {self.path}: {host_hdr!r}\n"
+                )
+                self._send_json(403, {"error": "forbidden host"}, send_body=send_body)
+                return
+
+            cors_hdrs = self._cors_headers()
             parsed = urllib.parse.urlsplit(self.path)
-            path = parsed.path
+            path = parsed.path or "/"
             params = urllib.parse.parse_qs(parsed.query)
             conv_id = params.get("conversation_id", [None])[0] or None
             window = params.get("window", ["all"])[0] or "all"
             sub_id_param = params.get("sub_id", [""])[0] or ""
-
-            if path in ("/", "/index.html"):
-                try:
-                    html_bytes = srv.get_index_html_bytes()
-                except (OSError, RuntimeError) as exc:
-                    self._send_json(500, {"error": f"index.html unreadable: {exc}"})
-                    return
-                self._send_bytes(200, "text/html; charset=utf-8", html_bytes)
-                return
+            etag_param = params.get("etag", [""])[0] or ""
 
             if path.startswith("/static/"):
-                self._serve_static(path[len("/static/") :], path)
+                self._serve_static(
+                    path[len("/static/") :],
+                    path,
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
+                )
                 return
 
-            if path in ("/healthz", "/health"):
+            has_traversal = self._has_path_traversal(path)
+
+            if not has_traversal and "/static/" in path:
+                rel_static = path.rsplit("/static/", 1)[1]
+                self._serve_static(
+                    rel_static,
+                    path,
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
+                )
+                return
+
+            if not has_traversal and (
+                path == "/preload.js" or path.endswith("/preload.js")
+            ):
+                self._send_bytes(
+                    200,
+                    "application/javascript; charset=utf-8",
+                    _PRELOAD_STUB,
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
+                )
+                return
+
+            if not has_traversal and (
+                path in ("/healthz", "/health")
+                or path.endswith(("/healthz", "/health"))
+            ):
                 self._send_json(
                     200,
                     {
@@ -413,62 +623,177 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
                         "pid": os.getpid(),
                         "sse_subscribers": srv.hub.subscriber_count(),
                     },
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
                 )
                 return
 
-            if path == "/api/conversations":
-                self._send_json(200, srv.engine.list_conversations())
+            if not has_traversal and (
+                path == "/api/conversations" or path.endswith("/api/conversations")
+            ):
+                self._send_json(
+                    200,
+                    srv.engine.list_conversations(),
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
+                )
                 return
 
-            if path == "/api/metrics":
-                self._send_json(200, srv.engine.get_metrics(conv_id, window=window))
+            if not has_traversal and (
+                path == "/api/metrics" or path.endswith("/api/metrics")
+            ):
+                self._send_json(
+                    200,
+                    srv.engine.get_metrics(conv_id, window=window),
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
+                )
                 return
 
-            if path == "/api/snapshot":
+            if not has_traversal and (
+                path == "/api/snapshot" or path.endswith("/api/snapshot")
+            ):
                 retargeted = (
                     srv.hub.update_target(sub_id_param, (conv_id, window))
                     if sub_id_param
                     else False
                 )
-                snap = srv.engine.get_snapshot(conv_id, window=window)
+                cur_etag = srv.engine.get_state_etag(conv_id, window=window)
+                if etag_param and etag_param == cur_etag:
+                    self._send_json(
+                        200,
+                        {
+                            "unchanged": True,
+                            "etag": cur_etag,
+                            "retargeted": retargeted,
+                        },
+                        send_body=send_body,
+                        extra_headers=cors_hdrs,
+                    )
+                    return
+                snap = srv.engine.get_snapshot(
+                    conv_id, window=window, refresh=False
+                )
+                snap["etag"] = cur_etag
                 snap["retargeted"] = retargeted
-                self._send_json(200, snap)
+                self._send_json(
+                    200, snap, send_body=send_body, extra_headers=cors_hdrs
+                )
                 return
 
-            if path == "/api/pricing":
-                self._send_json(200, srv.engine.get_pricing_config())
+            if not has_traversal and (
+                path == "/api/pricing" or path.endswith("/api/pricing")
+            ):
+                self._send_json(
+                    200,
+                    srv.engine.get_pricing_config(),
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
+                )
                 return
 
-            if path == "/events":
-                self._handle_sse(srv, conv_id, window)
+            if not has_traversal and (path == "/events" or path.endswith("/events")):
+                if not send_body:
+                    self._send_bytes(
+                        200,
+                        "text/event-stream; charset=utf-8",
+                        b"",
+                        send_body=False,
+                        extra_headers=cors_hdrs,
+                    )
+                    return
+                self._handle_sse(srv, conv_id, window, extra_headers=cors_hdrs)
                 return
 
-            self._send_json(404, {"error": "not found", "path": path})
+            accept_hdr = (self.headers.get("Accept") or "").lower()
+            is_root_or_subpath_page = path in ("/", "/index.html") or (
+                not has_traversal
+                and not path.startswith("/api/")
+                and "/api/" not in path
+                and (
+                    path.endswith("/index.html")
+                    or path.endswith("/")
+                    or "text/html" in accept_hdr
+                )
+            )
+            if is_root_or_subpath_page:
+                try:
+                    html_bytes = srv.get_index_html_bytes()
+                except (OSError, RuntimeError) as exc:
+                    self._send_json(
+                        500,
+                        {"error": f"index.html unreadable: {exc}"},
+                        send_body=send_body,
+                        extra_headers=cors_hdrs,
+                    )
+                    return
+                self._send_bytes(
+                    200,
+                    "text/html; charset=utf-8",
+                    html_bytes,
+                    send_body=send_body,
+                    extra_headers=cors_hdrs,
+                )
+                return
+
+            self._send_json(
+                404,
+                {"error": "not found", "path": path},
+                send_body=send_body,
+                extra_headers=cors_hdrs,
+            )
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
-            _safe_log(f"[agy-metrics] GET {self.path} error: {exc}\n")
+            _safe_log(f"[agy-metrics] {self.command} {self.path} error: {exc}\n")
             try:
-                self._send_json(500, {"error": str(exc)})
+                self._send_json(500, {"error": str(exc)}, send_body=send_body)
             except OSError:
                 pass
 
-    def _serve_static(self, rel_raw: str, full_path: str) -> None:
+    def _serve_static(
+        self,
+        rel_raw: str,
+        full_path: str,
+        *,
+        send_body: bool = True,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         rel_unquoted = urllib.parse.unquote(rel_raw)
         if not rel_unquoted or "\\" in rel_unquoted or "\x00" in rel_unquoted:
-            self._send_json(403, {"error": "forbidden static path"})
+            self._send_json(
+                403,
+                {"error": "forbidden static path"},
+                send_body=send_body,
+                extra_headers=extra_headers,
+            )
             return
         parts = [p for p in rel_unquoted.split("/") if p]
         if not parts or any(part.startswith(".") for part in parts):
-            self._send_json(403, {"error": "forbidden static path"})
+            self._send_json(
+                403,
+                {"error": "forbidden static path"},
+                send_body=send_body,
+                extra_headers=extra_headers,
+            )
             return
         static_root = _STATIC_DIR.resolve()
         candidate = (_STATIC_DIR.joinpath(*parts)).resolve()
         if not candidate.is_relative_to(static_root):
-            self._send_json(403, {"error": "forbidden static path"})
+            self._send_json(
+                403,
+                {"error": "forbidden static path"},
+                send_body=send_body,
+                extra_headers=extra_headers,
+            )
             return
         if not candidate.is_file():
-            self._send_json(404, {"error": "not found", "path": full_path})
+            self._send_json(
+                404,
+                {"error": "not found", "path": full_path},
+                send_body=send_body,
+                extra_headers=extra_headers,
+            )
             return
         ctype = _STATIC_MIME_TYPES.get(
             candidate.suffix.lower(), "application/octet-stream"
@@ -476,36 +801,35 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
         try:
             data = candidate.read_bytes()
         except OSError as exc:
-            self._send_json(500, {"error": f"static asset unreadable: {exc}"})
+            self._send_json(
+                500,
+                {"error": f"static asset unreadable: {exc}"},
+                send_body=send_body,
+                extra_headers=extra_headers,
+            )
             return
-        self._send_bytes(200, ctype, data)
+        self._send_bytes(
+            200, ctype, data, send_body=send_body, extra_headers=extra_headers
+        )
 
     @staticmethod
-    def _is_allowed_host(host_raw: str | None, server_port: int = 0) -> bool:
+    def _is_allowed_host(
+        host_raw: str | None,
+        server_port: int = 0,
+        *,
+        allow_proxied_any: bool = False,
+    ) -> bool:
         _ = server_port  # Reverse proxies may forward a separate loopback or sidecar port.
         if not host_raw:
+            return bool(allow_proxied_any)
+        ok, hostname = _is_syntactically_valid_host(host_raw)
+        if not ok or not hostname:
             return False
-        raw = host_raw.strip()
-        if not raw or any(ch.isspace() for ch in raw):
-            return False
-        if raw == "::1":
+        if _SIDECAR_PATH_HOST_RE.fullmatch(hostname):
             return True
-        try:
-            u = urllib.parse.urlsplit(f"//{raw}")
-            port = u.port
-        except ValueError:
-            return False
-        if (
-            u.path != ""
-            or u.query != ""
-            or u.fragment != ""
-            or u.username is not None
-            or u.password is not None
-        ):
-            return False
-        return _is_trusted_local_hostname(u.hostname) and (
-            port is None or 1 <= port <= 65535
-        )
+        if _is_trusted_local_hostname(hostname):
+            return True
+        return bool(allow_proxied_any)
 
     @staticmethod
     def _is_allowed_origin(origin_raw: str) -> bool:
@@ -519,36 +843,63 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
             return False
         if port is not None and not (1 <= port <= 65535):
             return False
-        return (
-            u.scheme in ("http", "https", "sidecar", "vscode-webview", "app")
-            and _is_trusted_local_hostname(u.hostname)
-            and u.path == ""
-            and u.query == ""
-            and u.fragment == ""
-            and u.username is None
-            and u.password is None
-        )
+        if (
+            u.scheme not in ("http", "https", "sidecar", "vscode-webview", "app")
+            or u.query != ""
+            or u.fragment != ""
+            or u.username is not None
+            or u.password is not None
+        ):
+            return False
+        if u.scheme == "sidecar":
+            host_ok = bool(
+                u.hostname and _SINGLE_LABEL_HOST_RE.fullmatch(u.hostname.lower())
+            )
+            if not host_ok:
+                return _is_trusted_local_hostname(u.hostname) and u.path == ""
+            if u.path == "":
+                return True
+            if u.path.startswith("/") and u.path.count("/") == 1:
+                seg = u.path[1:].lower()
+                return bool(_SINGLE_LABEL_HOST_RE.fullmatch(seg))
+            return False
+        if u.scheme in ("vscode-webview", "app"):
+            return bool(u.hostname) and u.path == ""
+        return u.path == "" and _is_trusted_local_hostname(u.hostname)
 
     def do_POST(self) -> None:
         try:
             srv: MetricsHTTPServer = self.server  # type: ignore[assignment]
             host_hdr = self.headers.get("Host")
-            if not self._is_allowed_host(host_hdr, srv.server_port):
+            if not self._is_allowed_host(
+                host_hdr, srv.server_port, allow_proxied_any=srv.managed_sidecar
+            ):
                 _safe_log(
                     f"[agy-metrics] 403 forbidden host on POST {self.path}: {host_hdr!r}\n"
                 )
                 self._send_json(403, {"error": "forbidden host"})
                 return
 
+            cors_hdrs = self._cors_headers()
             parsed = urllib.parse.urlsplit(self.path)
-            path = parsed.path
-            if path != "/api/pricing":
-                self._send_json(404, {"error": "not found", "path": path})
+            path = parsed.path or "/"
+            if self._has_path_traversal(path) or not (
+                path == "/api/pricing" or path.endswith("/api/pricing")
+            ):
+                self._send_json(
+                    404,
+                    {"error": "not found", "path": path},
+                    extra_headers=cors_hdrs,
+                )
                 return
 
             ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             if ctype != "application/json":
-                self._send_json(415, {"error": "Content-Type must be application/json"})
+                self._send_json(
+                    415,
+                    {"error": "Content-Type must be application/json"},
+                    extra_headers=cors_hdrs,
+                )
                 return
 
             raw_len = self.headers.get("Content-Length")
@@ -557,21 +908,35 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
             except ValueError:
                 content_len = 0
             if content_len <= 0:
-                self._send_json(400, {"error": "invalid Content-Length"})
+                self._send_json(
+                    400,
+                    {"error": "invalid Content-Length"},
+                    extra_headers=cors_hdrs,
+                )
                 return
             if content_len > 65536:
-                self._send_json(413, {"error": "payload too large"})
+                self._send_json(
+                    413, {"error": "payload too large"}, extra_headers=cors_hdrs
+                )
                 return
 
             try:
                 raw_body = self.rfile.read(content_len)
                 body = json.loads(raw_body.decode("utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                self._send_json(400, {"error": f"invalid JSON body: {exc}"})
+                self._send_json(
+                    400,
+                    {"error": f"invalid JSON body: {exc}"},
+                    extra_headers=cors_hdrs,
+                )
                 return
 
             if not isinstance(body, dict):
-                self._send_json(400, {"error": "JSON body must be an object"})
+                self._send_json(
+                    400,
+                    {"error": "JSON body must be an object"},
+                    extra_headers=cors_hdrs,
+                )
                 return
 
             req_csrf = body.pop("_csrf_token", None)
@@ -581,6 +946,15 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
                 and secrets.compare_digest(req_csrf, srv.csrf_token)
             )
             if not has_valid_csrf:
+                if not self._is_allowed_host(
+                    host_hdr, srv.server_port, allow_proxied_any=False
+                ):
+                    _safe_log(
+                        f"[agy-metrics] 403 forbidden host on POST {self.path}: {host_hdr!r}\n"
+                    )
+                    self._send_json(403, {"error": "forbidden host"})
+                    return
+
                 sec_fetch_site = (
                     (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
                 )
@@ -599,11 +973,11 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
             try:
                 updated = srv.engine.update_pricing_config(body)
             except ValueError as exc:
-                self._send_json(400, {"error": str(exc)})
+                self._send_json(400, {"error": str(exc)}, extra_headers=cors_hdrs)
                 return
 
             srv.hub.notify_all(srv.engine)
-            self._send_json(200, updated)
+            self._send_json(200, updated, extra_headers=cors_hdrs)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
@@ -618,6 +992,8 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
         srv: MetricsHTTPServer,
         conv_id: str | None,
         window: str = "all",
+        *,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.close_connection = True
         sub_id, q = srv.hub.register((conv_id, window))
@@ -629,13 +1005,20 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
                     separators=(",", ":"),
                 )
             except Exception as exc:
-                self._send_json(500, {"error": f"metrics snapshot failed: {exc}"})
+                self._send_json(
+                    500,
+                    {"error": f"metrics snapshot failed: {exc}"},
+                    extra_headers=extra_headers,
+                )
                 return
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self.end_headers()
 
             self.wfile.write(f"event: snapshot\ndata: {initial}\n\n".encode("utf-8"))
@@ -690,6 +1073,7 @@ def create_server(
     engine: MetricsEngine | None = None,
     poll_interval_s: float = 0.4,
     keepalive_s: float = 15.0,
+    managed_sidecar: bool | None = None,
 ) -> tuple[MetricsHTTPServer, threading.Event, threading.Thread]:
     eng = engine or MetricsEngine()
     try:
@@ -698,7 +1082,12 @@ def create_server(
         _safe_log(f"[agy-metrics] initial refresh warning: {exc}\n")
     hub = SSEHub()
     server = MetricsHTTPServer(
-        (host, port), MetricsRequestHandler, eng, hub, keepalive_s=keepalive_s
+        (host, port),
+        MetricsRequestHandler,
+        eng,
+        hub,
+        keepalive_s=keepalive_s,
+        managed_sidecar=managed_sidecar,
     )
     stop_event = threading.Event()
     watcher = threading.Thread(

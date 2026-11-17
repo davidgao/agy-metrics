@@ -30,11 +30,16 @@ export const state = {
   es: null,
   sseSubId: null,
   fetchAbort: null,
+  lastEtag: null,
   lastSseActivityMs: 0,
   lastSnapshotAtMs: 0,
   healthFailCount: 0,
+  sseFailCount: 0,
+  sseDisabled: false,
   sseRetryTimer: null,
   sseWatchdogTimer: null,
+  pollTimer: null,
+  initFallbackTimer: null,
   sseRetryCount: 0,
   lastPayload: null,
   ratesOpen: false,
@@ -72,15 +77,28 @@ export function syncModeControls() {
   });
 }
 
+export function hasSidecarFetch() {
+  return Boolean(typeof window !== 'undefined' && window.sidecar && typeof window.sidecar.fetch === 'function');
+}
+
+export function canUseEventSource() {
+  if (hasSidecarFetch()) return false;
+  if (typeof EventSource !== 'function') return false;
+  const proto = (typeof window !== 'undefined' && window.location) ? (window.location.protocol || '') : '';
+  if (proto === 'about:' || proto === 'blob:' || proto === 'data:') return false;
+  return true;
+}
+
 export function sidecarFetch(url, init) {
-  const f = (typeof window !== 'undefined' && window.sidecar && typeof window.sidecar.fetch === 'function')
+  const f = hasSidecarFetch()
     ? window.sidecar.fetch.bind(window.sidecar)
     : fetch;
   return f(url, init);
 }
 
-export function buildUrl(path, convId, win, subId) {
-  const params = new URLSearchParams(window.location.search);
+export function buildUrl(path, convId, win, subId, etag, forBrowserDirect) {
+  const rawSearch = (typeof window !== 'undefined' && window.location && window.location.search) || '';
+  const params = new URLSearchParams(rawSearch);
   if (convId) {
     params.set('conversation_id', convId);
   } else {
@@ -96,12 +114,26 @@ export function buildUrl(path, convId, win, subId) {
   } else {
     params.delete('sub_id');
   }
+  if (etag) {
+    params.set('etag', etag);
+  } else {
+    params.delete('etag');
+  }
   let basePath = '';
-  const rawLocPath = (typeof window !== 'undefined' && window.location && window.location.protocol !== 'about:')
-    ? (window.location.pathname || '')
-    : '';
-  if (rawLocPath && rawLocPath !== '/') {
-    basePath = rawLocPath.replace(/\/index\.html$/, '').replace(/\/+$/, '');
+  const loc = (typeof window !== 'undefined' && window.location) ? window.location : null;
+  const proto = loc ? (loc.protocol || '') : '';
+  const isHttpLikeProto = (
+    proto === 'http:' ||
+    proto === 'https:' ||
+    proto === 'sidecar:' ||
+    proto === 'vscode-webview:' ||
+    proto === 'app:'
+  );
+  if ((forBrowserDirect || !hasSidecarFetch()) && isHttpLikeProto) {
+    const rawLocPath = loc.pathname || '';
+    if (rawLocPath && rawLocPath !== '/') {
+      basePath = rawLocPath.replace(/\/index\.html$/, '').replace(/\/+$/, '');
+    }
   }
   const rel = path.charAt(0) === '/' ? path : ('/' + path);
   const fullPath = basePath ? (basePath + rel) : rel;
