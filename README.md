@@ -2,6 +2,12 @@
 
 A local telemetry dashboard plugin for **Antigravity Desktop**. It runs in the Auxiliary Pane with zero external dependencies (Python 3.10+ stdlib only) and 100% offline operation.
 
+> Using **antigravity-cli**? Check out [**agystats**](https://github.com/Jamesits/agystats), a port of this project for `antigravity-cli`.
+
+| Live Session Telemetry | Cross-Session Rollup & Speed Roofline |
+| :---: | :---: |
+| [![Live session telemetry in AGY Metrics](assets/screenshot-session.png)](assets/screenshot-session.png) | [![Cross-session rollup and speed roofline in AGY Metrics](assets/screenshot-roofline.png)](assets/screenshot-roofline.png) |
+
 ## Features
 
 - **Tokens & Context Window** — Tracks uncached vs. cached input tokens, cache hit %, estimated thinking vs. visible output, subagent rollups, and live context breakdown across compactions.
