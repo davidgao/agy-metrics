@@ -27,6 +27,7 @@ from .models import (
     _WINDOW_SECONDS,
     _is_unattributed_model,
     _safe_int,
+    normalize_step_model,
 )
 from . import parser as _parser
 from .paths import get_app_data_dir, get_brain_dir, get_projects_dir, get_state_dir
@@ -1847,7 +1848,9 @@ class MetricsEngine:
         for sub_id, sub_role, model_hint in descendants:
             sub_conv = self._conversations.get(sub_id)
             if sub_conv is None:
-                missing_model = model_hint or "unknown"
+                missing_model = normalize_step_model(
+                    model_hint or "unknown", is_subagent=True
+                )
                 res_missing = self._pricing.resolve_model(missing_model)
                 is_priced_empty = res_missing.status == "priced"
                 sub_items.append(

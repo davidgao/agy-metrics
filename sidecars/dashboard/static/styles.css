@@ -749,7 +749,7 @@ label.follow {
   border: 1px solid var(--m-border);
   background: var(--m-surface);
   font-size: 11px;
-  max-width: 190px;
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -896,7 +896,7 @@ tr.steps-fold-row td {
 tr.steps-fold-row:hover td { background: var(--m-hover); }
 .val-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(142px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
   gap: 8px;
 }
 .val-box {
@@ -941,6 +941,17 @@ tr.steps-fold-row:hover td { background: var(--m-hover); }
 }
 .val-grid[data-count="3"] .kv-line {
   font-size: 11.5px;
+}
+.val-box .kv-line {
+  align-items: baseline;
+}
+.val-box .kv-line > span {
+  white-space: nowrap;
+}
+.val-box .kv-line > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .val-callouts {
   display: none;

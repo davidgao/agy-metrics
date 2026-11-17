@@ -218,8 +218,8 @@
               <th title="Attributed model or Orchestrator phase (↱ Model Switch)">Model</th>
               <th title="Total context window size (Uncached + Cached) and KV-cache hit percentage">Context (Cache%)</th>
               <th title="Total output tokens and estimated thinking tokens">Out (~Think)</th>
-              <th title="Model inference wall time (excluded on internal system compaction calls)">Time</th>
-              <th title="Effective post-step throughput (Output tokens / Model inference time)">tok/s</th>
+              <th title="Model wait time (completed inference + retry wait) and estimated excess delay beyond the speed roofline">Time (~Delay)</th>
+              <th title="Estimated step Paygo cost using current pricing rates — hover cells for AI Credits equivalent">Paygo</th>
               <th title="Tool calls invoked in this step, reply, or compaction call">Tools</th>
             </tr>
           </thead>

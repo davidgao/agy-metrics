@@ -14,7 +14,8 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 from helpers import write_jsonl  # noqa: E402
-from agy_metrics.engine import MetricsEngine  # noqa: E402
+from agy_metrics.engine import ALL_CONVERSATIONS_ID, MetricsEngine  # noqa: E402
+from agy_metrics.models import humanize_model_name, normalize_step_model  # noqa: E402
 
 
 class TestParserAndSubagents(unittest.TestCase):
@@ -398,7 +399,7 @@ class TestParserAndSubagents(unittest.TestCase):
                 )
 
                 self.assertEqual(metrics["subagents"]["count"], 1)
-                self.assertEqual(metrics["subagents"]["items"][0]["model_name"], "Subagent · flash")
+                self.assertEqual(metrics["subagents"]["items"][0]["model_name"], "Subagent · Gemini Flash")
 
                 by_model = {bm["model_name"]: bm for bm in metrics["by_model"]}
                 self.assertEqual(
@@ -840,7 +841,7 @@ class TestParserAndSubagents(unittest.TestCase):
                 engine.close()
 
     def test_orchestrator_inherit_subagent_uses_base_model_without_inflating_savings(self) -> None:
-        """Orchestrator invoking Model='inherit' passes Subagent · Carbon / Hydrogen, not Orchestrator."""
+        """Orchestrator invoking Model='inherit' passes Subagent · Gemini 4 Carbon / Hydrogen, not Orchestrator."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             brain = root / "brain"
@@ -937,8 +938,8 @@ class TestParserAndSubagents(unittest.TestCase):
             try:
                 m = engine.get_metrics(cid_parent)
                 sub_by_id = {it["conversation_id"]: it for it in m["subagents"]["items"]}
-                self.assertEqual(sub_by_id[cid_plan_sub]["model_name"], "Subagent · Carbon")
-                self.assertEqual(sub_by_id[cid_exec_sub]["model_name"], "Subagent · Hydrogen")
+                self.assertEqual(sub_by_id[cid_plan_sub]["model_name"], "Subagent · Gemini 4 Carbon")
+                self.assertEqual(sub_by_id[cid_exec_sub]["model_name"], "Subagent · Gemini 4 Hydrogen")
                 # Subagents must NOT increment parent's Orchestrator executor_steps or savings
                 orch = m["valuation"]["orchestrator"]
                 self.assertEqual(orch["planner_steps"], 1)
@@ -1049,7 +1050,7 @@ class TestParserAndSubagents(unittest.TestCase):
                 by_id = {it["conversation_id"]: it for it in m["subagents"]["items"]}
                 self.assertEqual(set(by_id), {cid_child, cid_wf, cid_grand})
                 self.assertEqual(by_id[cid_grand]["role"], "worker")
-                self.assertEqual(by_id[cid_grand]["model_name"], "Subagent · flash_lite")
+                self.assertEqual(by_id[cid_grand]["model_name"], "Subagent · Gemini Flash-Lite")
                 self.assertEqual(by_id[cid_wf]["role"], "Audit files")
                 self.assertEqual(m["subagents"]["totals"]["output_tokens"], 50 + 30 + 40)
                 self.assertEqual(m["grand_totals"]["output_tokens"], 100 + 50 + 30 + 40)
@@ -1171,6 +1172,158 @@ class TestParserAndSubagents(unittest.TestCase):
                 self.assertEqual(s_canceled["tool_names"], [])
             finally:
                 engine.close()
+
+    def test_humanize_and_normalize_model_names(self) -> None:
+        cases = [
+            ("gemini-4-hydrogen-tiered-high", "Gemini 4 Hydrogen (High)"),
+            ("gemini-4-carbon-tiered-high", "Gemini 4 Carbon (High)"),
+            ("gemini-3.1-pro-tiered-high", "Gemini 3.1 Pro (High)"),
+            ("gemini-3-flash-tiered-low", "Gemini 3 Flash (Low)"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+            ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
+            ("flash_lite", "Gemini Flash-Lite"),
+            ("pro", "Gemini Pro"),
+            ("Gemini 4 Carbon (High)", "Gemini 4 Carbon (High)"),
+            ("Orchestrator (Carbon) · Planner", "Orchestrator (Carbon) · Planner"),
+            ("unknown", "unknown"),
+            ("auto", "auto"),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(humanize_model_name(raw), expected, raw)
+
+        self.assertEqual(
+            normalize_step_model("gemini-4-hydrogen-tiered-high", is_subagent=True),
+            "Subagent · Gemini 4 Hydrogen (High)",
+        )
+        self.assertEqual(
+            normalize_step_model("Orchestrator (Carbon) · Executor", is_subagent=True),
+            "Subagent · Gemini 4 Hydrogen",
+        )
+        self.assertEqual(
+            normalize_step_model("Subagent · gemini-4-hydrogen-tiered-high", is_subagent=True),
+            "Subagent · Gemini 4 Hydrogen (High)",
+        )
+        self.assertEqual(normalize_step_model("unknown", is_subagent=True), "unknown")
+        self.assertEqual(normalize_step_model("auto", is_subagent=True), "auto")
+
+    def test_subagent_hook_model_slug_normalized_and_warm_restarted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            state = root / "state"
+            cid_parent = "11111111-cccc-0000-0000-000000000001"
+            cid_sub = "22222222-cccc-0000-0000-000000000002"
+
+            t0 = int(datetime(2026, 11, 16, 10, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+            write_jsonl(
+                brain / cid_parent / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-16T10:00:00Z",
+                        "content": "<USER_REQUEST>\nDelegate work\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Carbon (High). No need to comment.\n</USER_SETTINGS_CHANGE>",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-16T10:00:01Z",
+                        "input_tokens": 10000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 100,
+                        "content": "",
+                        "tool_calls": [
+                            {"name": "invoke_subagent", "args": {"Role": '"Helper"'}}
+                        ],
+                    },
+                    {
+                        "step_index": 2,
+                        "type": "GENERIC",
+                        "created_at": "2026-11-16T10:00:02Z",
+                        "content": f"Spawned {cid_sub}",
+                    },
+                ],
+            )
+            write_jsonl(
+                brain / cid_sub / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-16T10:00:02Z",
+                        "content": "Execute subtask",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-16T10:00:03Z",
+                        "input_tokens": 5000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 200,
+                        "content": "Subtask complete.",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+            write_jsonl(
+                state / "conversations" / f"{cid_sub}.hooks.jsonl",
+                [
+                    {
+                        "ts_ms": t0 + 3000,
+                        "event": "PreInvocation",
+                        "conversation_id": cid_sub,
+                        "model_name": "gemini-4-hydrogen-tiered-high",
+                    },
+                    {
+                        "ts_ms": t0 + 5000,
+                        "event": "PostInvocation",
+                        "conversation_id": cid_sub,
+                        "model_name": "gemini-4-hydrogen-tiered-high",
+                    },
+                ],
+            )
+
+            eng1 = MetricsEngine(brain_dir=brain, state_dir=state)
+            try:
+                sub_m = eng1.get_metrics(cid_sub)
+                self.assertEqual(sub_m["model_name"], "Subagent · Gemini 4 Hydrogen (High)")
+                self.assertEqual(
+                    sub_m["steps"][0]["model_name"],
+                    "Subagent · Gemini 4 Hydrogen (High)",
+                )
+                self.assertEqual(
+                    [bm["model_name"] for bm in sub_m["by_model"]],
+                    ["Subagent · Gemini 4 Hydrogen (High)"],
+                )
+                self.assertEqual(sub_m["by_model"][0]["valuation"]["status"], "priced")
+
+                parent_m = eng1.get_metrics(cid_parent)
+                self.assertEqual(
+                    parent_m["subagents"]["items"][0]["model_name"],
+                    "Subagent · Gemini 4 Hydrogen (High)",
+                )
+
+                all_m = eng1.get_metrics(ALL_CONVERSATIONS_ID, window="all")
+                self.assertEqual(
+                    {bm["model_name"] for bm in all_m["by_model"]},
+                    {"Gemini 4 Carbon (High)", "Subagent · Gemini 4 Hydrogen (High)"},
+                )
+            finally:
+                eng1.close()
+
+            eng2 = MetricsEngine(brain_dir=brain, state_dir=state)
+            try:
+                all_m2 = eng2.get_metrics(ALL_CONVERSATIONS_ID, window="all")
+                self.assertEqual(eng2._transcript_open_count, 0)
+                self.assertEqual(
+                    {bm["model_name"] for bm in all_m2["by_model"]},
+                    {"Gemini 4 Carbon (High)", "Subagent · Gemini 4 Hydrogen (High)"},
+                )
+            finally:
+                eng2.close()
 
 
 if __name__ == "__main__":

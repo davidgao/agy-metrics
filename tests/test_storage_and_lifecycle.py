@@ -172,7 +172,8 @@ class TestStorageAndLifecycle(unittest.TestCase):
                     self.assertEqual(m24["latest_step"]["conv_id"], cid_many)
 
                     by24 = {bm["model_name"]: bm for bm in m24["by_model"]}
-                    self.assertEqual(by24["Model Alpha"]["steps_count"], 4)
+                    self.assertEqual(by24["Model Alpha"]["steps_count"], 1)
+                    self.assertEqual(by24["Subagent · Model Alpha"]["steps_count"], 3)
                     self.assertTrue(by24["Model Alpha"]["latency_fit"]["available"])
                     self.assertFalse(by24["unknown"]["latency_fit"]["available"])
                     self.assertEqual(by24["unknown"]["latency_fit"]["reason"], "unattributed")
@@ -182,9 +183,15 @@ class TestStorageAndLifecycle(unittest.TestCase):
                     m7 = engine.get_metrics(ALL_CONVERSATIONS_ID, window="7d")
                     m30 = engine.get_metrics(ALL_CONVERSATIONS_ID, window="30d")
                     mall = engine.get_metrics(ALL_CONVERSATIONS_ID, window="all")
-                    self.assertEqual({bm["model_name"]: bm for bm in m7["by_model"]}["Model Alpha"]["steps_count"], 6)
-                    self.assertEqual({bm["model_name"]: bm for bm in m30["by_model"]}["Model Alpha"]["steps_count"], 7)
-                    self.assertEqual({bm["model_name"]: bm for bm in mall["by_model"]}["Model Alpha"]["steps_count"], 8)
+                    by7 = {bm["model_name"]: bm for bm in m7["by_model"]}
+                    by30 = {bm["model_name"]: bm for bm in m30["by_model"]}
+                    by_all = {bm["model_name"]: bm for bm in mall["by_model"]}
+                    self.assertEqual(by7["Model Alpha"]["steps_count"], 3)
+                    self.assertEqual(by7["Subagent · Model Alpha"]["steps_count"], 3)
+                    self.assertEqual(by30["Model Alpha"]["steps_count"], 4)
+                    self.assertEqual(by30["Subagent · Model Alpha"]["steps_count"], 3)
+                    self.assertEqual(by_all["Model Alpha"]["steps_count"], 5)
+                    self.assertEqual(by_all["Subagent · Model Alpha"]["steps_count"], 3)
 
                     import urllib.request
 
@@ -195,10 +202,9 @@ class TestStorageAndLifecycle(unittest.TestCase):
                         ) as r:
                             api_m7 = json.loads(r.read())
                             self.assertEqual(api_m7["window"], "7d")
-                            self.assertEqual(
-                                {bm["model_name"]: bm for bm in api_m7["by_model"]}["Model Alpha"]["steps_count"],
-                                6,
-                            )
+                            api_by7 = {bm["model_name"]: bm for bm in api_m7["by_model"]}
+                            self.assertEqual(api_by7["Model Alpha"]["steps_count"], 3)
+                            self.assertEqual(api_by7["Subagent · Model Alpha"]["steps_count"], 3)
                 finally:
                     engine.close()
 
@@ -351,8 +357,8 @@ class TestStorageAndLifecycle(unittest.TestCase):
             finally:
                 eng1.close()
 
-            # 2. Legacy v3, v4 & v5 SQLite schemas upgrade cleanly to current version
-            for old_ver in (3, 4, 5):
+            # 2. Legacy v3, v4, v5 & v6 SQLite schemas upgrade cleanly to current version
+            for old_ver in (3, 4, 5, 6):
                 db_path.unlink(missing_ok=True)
                 old_conn = sqlite3.connect(str(db_path))
                 old_conn.execute(f"PRAGMA user_version = {old_ver}")

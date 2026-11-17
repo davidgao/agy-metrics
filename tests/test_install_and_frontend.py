@@ -387,6 +387,33 @@ class TestInstallAndFrontend(unittest.TestCase):
         self.assertIn("agy-csrf-token", pricing_js)
         self.assertIn("_csrf_token", pricing_js)
 
+        # Per-Step Telemetry upgraded from tok/s to Time (~Delay) + Paygo
+        steps_thead_match = re.search(
+            r'<div class="card" id="stepsCard">.*?<thead>(.*?)</thead>',
+            html,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(steps_thead_match)
+        steps_thead = steps_thead_match.group(1) if steps_thead_match else ""
+        self.assertIn(">Time (~Delay)<", steps_thead)
+        self.assertIn(">Paygo<", steps_thead)
+        self.assertNotIn(">tok/s<", steps_thead)
+
+        # Scheduled future price row keeps USD + % inline and puts future credits in tooltip
+        self.assertIn("futureValTitle", charts_js)
+        self.assertIn("futText = fmtUsd(mv.future_cost_usd) + mPctTag;", charts_js)
+        self.assertIn("pFutText = fmtUsd(pv.future_cost_usd) + futPctTag;", charts_js)
+        self.assertIn(
+            "futValTitle = 'Scheduled rates (' + mv.future_effective_date + '): ' + fmtUsd(mv.future_cost_usd) + ' · ' + fmtCredits(mv.future_credits) + mPctTag;",
+            charts_js,
+        )
+        self.assertIn(
+            "pFutValTitle = 'Scheduled rates' + (dates.length ? (' (' + dates.join(', ') + ')') : '') + ': ' + fmtUsd(pv.future_cost_usd) + ' · ' + fmtCredits(pv.future_credits) + futPctTag;",
+            charts_js,
+        )
+        self.assertNotIn("futText = fmtUsd(mv.future_cost_usd) + ' · '", charts_js)
+        self.assertNotIn("pFutText = fmtUsd(pv.future_cost_usd) + ' · '", charts_js)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ A local telemetry dashboard plugin for **Antigravity Desktop**. It runs in the A
 
 - **Tokens & Context Window** — Tracks uncached vs. cached input tokens, cache hit %, estimated thinking vs. visible output, subagent rollups, and live context breakdown across compactions.
 - **Model & Orchestrator Attribution** — Breaks down steps, tokens, and timing per model and across Orchestrator `Planner` / `Executor` phases. Click any model row to filter the view.
-- **Latency & Speed Roofline** — Measures per-step inference time, `tok/s`, and retry wait, with an on-demand scatter plot estimating uncongested TTFT, nominal throughput, and serving delay.
+- **Latency & Speed Roofline** — Measures per-step wait time, roofline delay, retry wait, and Paygo cost, with an on-demand scatter plot estimating uncongested TTFT, nominal throughput, and serving delay.
 - **Offline Cost & AI Credits** — Estimates Paygo `$` and AI Credits across `5h`, `7d`, and total windows, including `Google` / `3rd-Party` pool filters, Orchestrator savings, and editable local rates (`⚙ Rates`).
 - **Project, Session & Cross-Session Views** — Navigate by project, conversation, or subagent, follow the active session in real time, or aggregate across a project or **All Conversations** (`5h`, `24h`, `7d`, `30d`, `All time`).
 - **Theme Sync** — Matches Antigravity's theme automatically (`Auto` / `Dark` / `Light`).

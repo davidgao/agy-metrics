@@ -1108,6 +1108,7 @@ function renderValBox(card) {
     const fVal = document.createElement('span');
     fVal.className = 'mono';
     fVal.textContent = card.futureText;
+    if (card.futureValTitle) fVal.title = card.futureValTitle;
     fRow.appendChild(fLbl);
     fRow.appendChild(fVal);
     box.appendChild(fRow);
@@ -1243,7 +1244,8 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
           hasFuture: false,
           futureLbl: '',
           futureTitle: '',
-          futureText: ''
+          futureText: '',
+          futureValTitle: ''
         };
       }
       const ratesObj = (mv && mv.rates) || baseMv.rates || {};
@@ -1255,6 +1257,7 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
       const hasFut = Boolean(mv && mv.has_future_change && mv.future_effective_date && stepsCount > 0);
       let futLbl = '';
       let futText = '';
+      let futValTitle = '';
       if (hasFut) {
         let mPctTag = '';
         if (cUsd > 0 && mv.future_cost_usd !== cUsd) {
@@ -1262,7 +1265,8 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
           mPctTag = ' (' + (mDiff >= 0 ? '+' : '') + mDiff + '%)';
         }
         futLbl = 'From ' + mv.future_effective_date;
-        futText = fmtUsd(mv.future_cost_usd) + ' · ' + fmtCredits(mv.future_credits) + mPctTag;
+        futText = fmtUsd(mv.future_cost_usd) + mPctTag;
+        futValTitle = 'Scheduled rates (' + mv.future_effective_date + '): ' + fmtUsd(mv.future_cost_usd) + ' · ' + fmtCredits(mv.future_credits) + mPctTag;
       }
       return {
         label: label,
@@ -1281,7 +1285,8 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
         hasFuture: hasFut,
         futureLbl: futLbl,
         futureTitle: futLbl ? ('Scheduled rate change: ' + mv.future_effective_date) : '',
-        futureText: futText
+        futureText: futText,
+        futureValTitle: futValTitle
       };
     }
 
@@ -1300,6 +1305,7 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
     let pFutLbl = '';
     let pFutTitle = '';
     let pFutText = '';
+    let pFutValTitle = '';
     if (pHasFut) {
       const dates = pv.future_effective_dates || [];
       pFutLbl = dates.length === 1 ? ('From ' + dates[0]) : 'Scheduled std.';
@@ -1309,7 +1315,8 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
         const gDiff = Math.round(((pv.future_cost_usd - pv.cost_usd) / pv.cost_usd) * 100);
         futPctTag = ' (' + (gDiff >= 0 ? '+' : '') + gDiff + '%)';
       }
-      pFutText = fmtUsd(pv.future_cost_usd) + ' · ' + fmtCredits(pv.future_credits) + futPctTag;
+      pFutText = fmtUsd(pv.future_cost_usd) + futPctTag;
+      pFutValTitle = 'Scheduled rates' + (dates.length ? (' (' + dates.join(', ') + ')') : '') + ': ' + fmtUsd(pv.future_cost_usd) + ' · ' + fmtCredits(pv.future_credits) + futPctTag;
     }
 
     return {
@@ -1337,7 +1344,8 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
       hasFuture: pHasFut,
       futureLbl: pFutLbl,
       futureTitle: pFutTitle,
-      futureText: pFutText
+      futureText: pFutText,
+      futureValTitle: pFutValTitle
     };
   }
 

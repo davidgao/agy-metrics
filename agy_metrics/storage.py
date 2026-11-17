@@ -136,7 +136,8 @@ class MetricsStore:
                 own_think INT NOT NULL,
                 own_vis INT NOT NULL,
                 prompt_title TEXT NOT NULL,
-                hook_workspace_paths_json TEXT NOT NULL
+                hook_workspace_paths_json TEXT NOT NULL,
+                is_subagent INT NOT NULL DEFAULT 0
             ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS conv_model_totals (
@@ -334,7 +335,7 @@ class MetricsStore:
                    updated_at_ms, compacted_count,
                    child_subagents_json, child_subagent_models_json,
                    own_in, own_cache, own_out, own_think, own_vis,
-                   prompt_title, hook_workspace_paths_json
+                   prompt_title, hook_workspace_paths_json, is_subagent
             FROM conv_meta
             """
         ).fetchall()
@@ -387,6 +388,7 @@ class MetricsStore:
                     conv.hook_workspace_paths = [str(w) for w in ws_list if isinstance(w, str) and w]
             except json.JSONDecodeError:
                 pass
+            conv.is_subagent = bool(_safe_int(row[26]))
             conversations[cid] = conv
         return conversations
 
@@ -535,6 +537,7 @@ class MetricsStore:
             conv.own_est_visible_tokens,
             conv.prompt_title,
             json.dumps(conv.hook_workspace_paths, separators=(",", ":")),
+            1 if conv.is_subagent else 0,
         )
 
         try:
@@ -543,7 +546,7 @@ class MetricsStore:
                     self.db.execute(
                         """
                         INSERT OR REPLACE INTO conv_meta VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         """,
                         conv_meta_params,
@@ -589,6 +592,11 @@ class MetricsStore:
                             saved_delay, saved_fin = prev
                     step_rows.append((*row, saved_delay, saved_fin))
 
+                for old_m_row in self.db.execute(
+                    "SELECT model_name FROM conv_model_totals WHERE conv_id = ?",
+                    (cid,),
+                ).fetchall():
+                    touched_models.add(str(old_m_row[0]))
                 for m_name in touched_models:
                     self.synced_delay_sig.pop(m_name, None)
 
@@ -598,7 +606,7 @@ class MetricsStore:
                     self.db.execute(
                         """
                         INSERT OR REPLACE INTO conv_meta VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         """,
                         conv_meta_params,

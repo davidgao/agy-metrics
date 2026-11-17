@@ -22,7 +22,7 @@ _WINDOW_SECONDS = {
     "30d": 30.0 * 86400.0,
 }
 _MAX_HYDRATED_CONVS = 16
-_ROLLUP_SCHEMA_VERSION = 6
+_ROLLUP_SCHEMA_VERSION = 7
 
 _CHARS_PER_TOKEN = 3.8
 _FIT_MIN_WARM_STEPS = 4
@@ -52,6 +52,34 @@ _UUID_RE = re.compile(
 )
 _SAFE_CONV_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _ORCH_PAREN_RE = re.compile(r"\(([^)]+)\)")
+_SUBAGENT_PREFIX_RE = re.compile(r"^subagent\s*·\s*(.+)$", re.IGNORECASE)
+_DATE_STAMP_TOKEN_RE = re.compile(r"^20\d{6}$")
+_PARAM_SIZE_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)?[bBmMkK]$")
+
+_SHORT_MODEL_ALIASES = {
+    "flash_lite": "Gemini Flash-Lite",
+    "flash-lite": "Gemini Flash-Lite",
+    "flash lite": "Gemini Flash-Lite",
+    "flash": "Gemini Flash",
+    "pro": "Gemini Pro",
+    "carbon": "Gemini 4 Carbon",
+    "argon": "Gemini 4 Argon",
+    "hydrogen": "Gemini 4 Hydrogen",
+    "opus": "Claude Opus",
+    "sonnet": "Claude Sonnet",
+    "haiku": "Claude Haiku",
+    "gpt-oss": "GPT-OSS",
+    "gpt_oss": "GPT-OSS",
+    "gpt oss": "GPT-OSS",
+}
+
+_EFFORT_QUALIFIERS = {
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
+    "minimal": "Minimal",
+    "thinking": "Thinking",
+}
 
 
 def _parse_iso_epoch(raw: str | None) -> float | None:
@@ -145,6 +173,132 @@ def _extract_base_model_from_orchestrator(
     m_hint = _ORCH_PAREN_RE.search(transcript_model or "")
     hint = m_hint.group(1).strip() if m_hint else ""
     return hint or "Carbon"
+
+
+def humanize_model_name(raw: str) -> str:
+    """Normalize a raw backend slug or shorthand alias into a clean display label."""
+    s = (raw or "").strip()
+    if not s or _is_unattributed_model(s):
+        return s
+
+    m_sub = _SUBAGENT_PREFIX_RE.match(s)
+    if m_sub:
+        inner_clean = humanize_model_name(m_sub.group(1).strip())
+        if not inner_clean or _is_unattributed_model(inner_clean):
+            return inner_clean or "unknown"
+        if inner_clean.startswith("Subagent · "):
+            return inner_clean
+        return f"Subagent · {inner_clean}"
+
+    if _is_orchestrator_name(s):
+        return s
+
+    alias = _SHORT_MODEL_ALIASES.get(s.lower())
+    if alias is not None:
+        return alias
+
+    if " " in s and any(ch.isupper() for ch in s):
+        return s
+    if (
+        "-" not in s
+        and "_" not in s
+        and " " not in s
+        and any(ch.isupper() for ch in s)
+        and any(ch.islower() for ch in s)
+    ):
+        return s
+
+    raw_tokens = [t for t in re.split(r"[-_\s]+", s) if t]
+    if not raw_tokens:
+        return s
+
+    tokens = [
+        t
+        for t in raw_tokens
+        if t.lower() != "tiered" and not _DATE_STAMP_TOKEN_RE.fullmatch(t)
+    ]
+    if not tokens:
+        tokens = list(raw_tokens)
+    while len(tokens) > 1 and tokens[-1].lower() == "latest":
+        tokens.pop()
+
+    qualifiers: list[str] = []
+    while len(tokens) > 1 and tokens[-1].lower() in _EFFORT_QUALIFIERS:
+        qualifiers.append(_EFFORT_QUALIFIERS[tokens.pop().lower()])
+    qualifiers.reverse()
+
+    merged: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        if idx + 1 < len(tokens):
+            a, b = tokens[idx], tokens[idx + 1]
+            al, bl = a.lower(), b.lower()
+            if (al, bl) == ("gpt", "oss"):
+                merged.append("GPT-OSS")
+                idx += 2
+                continue
+            if (al, bl) == ("flash", "lite"):
+                merged.append("Flash-Lite")
+                idx += 2
+                continue
+            if (
+                len(a) == 1
+                and len(b) == 1
+                and a.isdigit()
+                and a != "0"
+                and b.isdigit()
+            ):
+                merged.append(f"{a}.{b}")
+                idx += 2
+                continue
+        merged.append(tokens[idx])
+        idx += 1
+
+    formatted: list[str] = []
+    for tok in merged:
+        if tok in ("GPT-OSS", "Flash-Lite") or re.fullmatch(r"\d+(?:\.\d+)?", tok):
+            formatted.append(tok)
+        elif tok.lower() == "gpt":
+            formatted.append("GPT")
+        elif tok.lower() == "oss":
+            formatted.append("OSS")
+        elif _PARAM_SIZE_TOKEN_RE.fullmatch(tok):
+            formatted.append(tok.upper())
+        else:
+            formatted.append(tok.capitalize())
+
+    base_str = " ".join(formatted)
+    base_alias = _SHORT_MODEL_ALIASES.get(base_str.lower())
+    if base_alias is not None:
+        base_str = base_alias
+    if qualifiers:
+        return f"{base_str} ({', '.join(qualifiers)})"
+    return base_str
+
+
+def normalize_step_model(raw: str, *, is_subagent: bool = False) -> str:
+    """Format a step or hook model name and prefix subagent steps consistently."""
+    s = (raw or "").strip()
+    if not s or _is_unattributed_model(s):
+        return s or "unknown"
+
+    if is_subagent:
+        m_sub = _SUBAGENT_PREFIX_RE.match(s)
+        inner = m_sub.group(1).strip() if m_sub else s
+        if not inner or _is_unattributed_model(inner):
+            return inner or "unknown"
+        if _is_orchestrator_name(inner):
+            phase = "Executor" if "executor" in inner.lower() else "Planner"
+            base = _extract_base_model_from_orchestrator(inner, phase)
+            clean = humanize_model_name(base)
+        else:
+            clean = humanize_model_name(inner)
+        if not clean or _is_unattributed_model(clean):
+            return clean or "unknown"
+        return clean if clean.startswith("Subagent · ") else f"Subagent · {clean}"
+
+    clean = humanize_model_name(s)
+    return clean or "unknown"
 
 
 @dataclass
@@ -283,6 +437,7 @@ class ConversationState:
     child_subagents: dict[str, str] = field(default_factory=dict)
     child_subagent_models: dict[str, str] = field(default_factory=dict)
     parent_id: str | None = None
+    is_subagent: bool = False
     steps: list[StepMetrics] = field(default_factory=list)
     hook_reported_transcript: str = ""
     hook_reported_model: str = ""

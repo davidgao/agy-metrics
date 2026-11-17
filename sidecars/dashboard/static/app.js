@@ -422,7 +422,8 @@ function renderMetrics(m) {
       const agentNote = it.agent_name && (!it.role || it.role.toLowerCase().indexOf(it.agent_name.toLowerCase()) === -1)
         ? (' · ' + it.agent_name)
         : '';
-      const modelNote = it.model_name ? (' [' + it.model_name + ']') : '';
+      const cleanSubModel = it.model_name ? String(it.model_name).replace(/^Subagent\s*·\s*/i, '') : '';
+      const modelNote = cleanSubModel ? (' [' + cleanSubModel + ']') : '';
       ch.textContent = (it.role || 'Subagent') + agentNote + modelNote + ' (' + it.planner_steps_count + ' steps · ' + fmtCompact((it.input_tokens || 0) + (it.cache_read_tokens || 0) + (it.output_tokens || 0)) + ' tok)';
       const tipParts = ['Click to inspect subagent'];
       if (it.cost_usd != null) {
@@ -487,6 +488,11 @@ function renderMetrics(m) {
     tbody.appendChild(noStepsTr);
   }
 
+  const fitByModel = Object.create(null);
+  byModel.forEach(function (bm) {
+    if (bm && bm.model_name) fitByModel[bm.model_name] = bm.latency_fit || null;
+  });
+
   visibleSteps.forEach(function (s) {
     const tr = document.createElement('tr');
     tr.className = 'step-row';
@@ -523,21 +529,75 @@ function renderMetrics(m) {
     const outTitle = fmtInt(s.output_tokens) + ' output tokens (~' +
       fmtInt(s.est_thinking_tokens) + ' est. thinking, ~' +
       fmtInt(s.est_visible_tokens) + (isCheckpoint ? ' est. summary)' : ' est. visible + tools)');
-    const retryDurNote = s.retry_wait_s > 0
-      ? (' · +' + fmtDuration(s.retry_wait_s) + fmtExactSecNote(s.retry_wait_s) + ' retry wait')
-      : '';
-    const durTitle = isCheckpoint
-      ? 'No hook timing for internal system compaction calls; excluded from avg tok/s'
-      : (s.duration_s != null
-        ? ('Model inference: ' + s.duration_s + 's (' + srcLabel(s.duration_source) + ') · Tool exec: ' + s.tool_exec_s + 's' + retryDurNote)
-        : ('Duration unavailable (historical step without lifecycle hooks or tool-start timestamps; excluded from avg tok/s)' + retryDurNote));
-    const durCellHtml = esc(s.duration_s != null ? s.duration_s + 's' : '—') +
-      (s.retry_wait_s > 0 ? (' <span class="muted">(+' + esc(fmtDuration(s.retry_wait_s)) + ')</span>') : '');
-    const tpsTitle = isCheckpoint
-      ? 'Throughput unavailable on system compaction calls (excluded from avg tok/s)'
-      : (s.effective_tps != null
-        ? (fmtInt(s.output_tokens) + ' out / ' + s.duration_s + 's = ' + s.effective_tps + ' tok/s')
-        : 'Throughput unavailable (missing step duration)');
+
+    const retryS = Number(s.retry_wait_s || 0);
+    const stepFit = fitByModel[s.model_name] || null;
+    let durCellHtml;
+    let durTitle;
+    if (isCheckpoint) {
+      durCellHtml = '—';
+      durTitle = 'System compaction call (CHECKPOINT; untimed and excluded from roofline delay)';
+    } else if (s.duration_s == null) {
+      if (retryS > 0) {
+        durCellHtml = '— <span class="muted">(+' + esc(fmtDuration(retryS)) + ')</span>';
+        durTitle = 'Duration unavailable · +' + fmtDuration(retryS) + fmtExactSecNote(retryS) + ' retry wait · Tool exec: ' + s.tool_exec_s + 's';
+      } else {
+        durCellHtml = '—';
+        durTitle = 'Duration unavailable (historical step without lifecycle hooks or tool-start timestamps)';
+      }
+    } else {
+      const infS = Number(s.duration_s);
+      const totalWaitS = infS + retryS;
+      const retryPart = retryS > 0
+        ? (' · +' + fmtDuration(retryS) + fmtExactSecNote(retryS) + ' retry wait')
+        : '';
+      if (s.est_delay_s != null) {
+        const roofDelayS = Number(s.est_delay_s);
+        const stepDelayS = roofDelayS + retryS;
+        durCellHtml = esc(fmtDuration(totalWaitS)) + ' <span class="muted">(' + esc(fmtApproxDuration(stepDelayS)) + ')</span>';
+        let roofNote = '~' + roofDelayS.toFixed(2) + 's roofline delay';
+        if (stepFit && stepFit.available) {
+          const expS = Number(stepFit.inferred_ttft_s) + Number(stepFit.slope_s_per_tok) * (s.output_tokens || 0);
+          roofNote = '~' + roofDelayS.toFixed(2) + 's roofline delay (vs ~' + expS.toFixed(2) + 's roofline)';
+        }
+        durTitle = 'Model inference: ' + infS + 's (' + srcLabel(s.duration_source) + ')' +
+          retryPart + ' · ' + roofNote + ' · Tool exec: ' + s.tool_exec_s + 's';
+      } else {
+        let noDelayNote = 'speed roofline not yet available';
+        if (s.cold_cache_spike) {
+          noDelayNote = 'cold prefill excluded from warm roofline';
+        } else if (!stepFit || stepFit.reason === 'min_steps') {
+          noDelayNote = 'needs ≥4 warm steps for roofline (' + ((stepFit && stepFit.warm_count) || 0) + '/4)';
+        } else if (stepFit.reason === 'min_spread') {
+          noDelayNote = 'needs ≥200 tok output spread for roofline';
+        } else if (stepFit.reason === 'unattributed') {
+          noDelayNote = 'roofline disabled for unattributed model';
+        }
+        if (retryS > 0) {
+          durCellHtml = esc(fmtDuration(totalWaitS)) + ' <span class="muted">(' + esc(fmtApproxDuration(retryS)) + '*)</span>';
+        } else {
+          durCellHtml = esc(fmtDuration(infS));
+        }
+        durTitle = 'Model inference: ' + infS + 's (' + srcLabel(s.duration_source) + ')' +
+          retryPart + ' · ' + noDelayNote + ' · Tool exec: ' + s.tool_exec_s + 's';
+      }
+    }
+
+    let paygoCellHtml;
+    let paygoTitle;
+    if (s.pricing_status === 'priced' && s.cost_usd != null) {
+      paygoCellHtml = esc(fmtUsd(s.cost_usd));
+      const futStepNote = (s.future_cost_usd != null && Math.abs(s.future_cost_usd - s.cost_usd) > 1e-9)
+        ? (' · Scheduled std.: ' + fmtUsd(s.future_cost_usd))
+        : '';
+      paygoTitle = 'Step Paygo (current rates): ' + fmtUsd(s.cost_usd) + ' (' + fmtCredits(s.credits) + ')' + futStepNote;
+    } else if (s.pricing_status === 'unattributed') {
+      paygoCellHtml = '—';
+      paygoTitle = 'Unattributed ("unknown" / "auto") step — excluded from Paygo';
+    } else {
+      paygoCellHtml = '—';
+      paygoTitle = 'Unpriced model (' + (s.model_name || 'unknown') + ') — click "⚙ Rates" to set a rate';
+    }
 
     const toolsList = s.tool_names || [];
     let toolsCellHtml;
@@ -559,7 +619,7 @@ function renderMetrics(m) {
       '<td class="mono" title="' + esc(ctxTitle) + '">' + esc(fmtCompact(s.total_context)) + ' <span class="muted">(' + esc(s.cache_hit_pct) + '%)</span></td>' +
       '<td class="mono" title="' + esc(outTitle) + '">' + esc(fmtInt(s.output_tokens)) + ' <span class="muted">(~' + esc(fmtInt(s.est_thinking_tokens)) + ')</span></td>' +
       '<td class="mono" title="' + esc(durTitle) + '">' + durCellHtml + '</td>' +
-      '<td class="mono" title="' + esc(tpsTitle) + '">' + esc(s.effective_tps != null ? s.effective_tps : '—') + '</td>' +
+      '<td class="mono" title="' + esc(paygoTitle) + '">' + paygoCellHtml + '</td>' +
       '<td class="muted tools-cell" title="' + esc(toolsTitle) + '">' + toolsCellHtml + '</td>';
 
     tr.addEventListener('click', function () {
@@ -578,6 +638,8 @@ function renderMetrics(m) {
         ' · Model: <span class="mono">' + esc(s.model_name) + '</span>' +
         (s.model_switched ? ' <span class="pill info">Model Switch</span>' : '') + ' · ' +
         (s.cost_usd != null ? ('Paygo: <span class="mono">' + esc(fmtUsd(s.cost_usd)) + ' (' + esc(fmtCredits(s.credits)) + ')</span> · ') : '') +
+        (s.duration_s != null ? ('Inference: <span class="mono">' + esc(s.duration_s) + 's</span> · ') : '') +
+        (s.est_delay_s != null ? ('Est. delay: <span class="mono">~' + esc(Number(s.est_delay_s).toFixed(2)) + 's</span> · ') : '') +
         'Uncached: <span class="mono">' + esc(fmtInt(s.input_tokens)) + '</span> · ' +
         'Cached: <span class="mono">' + esc(fmtInt(s.cache_read_tokens)) + '</span> · ' +
         (isCheckpoint ? 'Summary est: ' : 'Visible est: ') + '<span class="mono">' + esc(fmtInt(s.est_visible_tokens)) + '</span> · ' +
