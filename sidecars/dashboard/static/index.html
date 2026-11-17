@@ -22,14 +22,21 @@
         </div>
       </div>
       <div class="controls">
-        <div class="mode-toggle" role="group" aria-label="View Scope">
-          <button id="modeConvBtn" type="button" class="mode-btn active" aria-pressed="true">Conversation</button>
-          <button id="modeAllBtn" type="button" class="mode-btn" aria-pressed="false">All</button>
+        <div class="scope-picker" id="scopePicker">
+          <button type="button" class="scope-trigger" id="scopeTriggerBtn" aria-haspopup="dialog" aria-expanded="false" aria-label="Select project, conversation, or subagent">
+            <span class="scope-trigger-text" id="scopeTriggerText">Loading…</span>
+            <span class="scope-trigger-meta mono" id="scopeTriggerMeta"></span>
+            <span class="scope-trigger-caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="scope-menu hidden" id="scopeMenu" role="dialog" aria-label="Scope selector">
+            <div class="scope-search-wrap">
+              <input type="search" class="scope-search" id="scopeSearchInput" placeholder="Filter projects, conversations, subagents…" autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="scope-tree" id="scopeTreeList" role="listbox"></div>
+          </div>
         </div>
-        <div class="conv-controls" id="convControls">
-          <select id="convSelect" aria-label="Conversation"></select>
-          <label class="follow"><input type="checkbox" id="followToggle" checked /> Follow active</label>
-        </div>
+        <button type="button" class="filter-pill" id="parentConvBtn" style="display:none" title="Jump to parent conversation"></button>
+        <label class="follow"><input type="checkbox" id="followToggle" checked /> Follow active</label>
         <div class="all-controls hidden" id="allControls">
           <button type="button" class="filter-pill" data-window="5h">5h</button>
           <button type="button" class="filter-pill" data-window="24h">24h</button>

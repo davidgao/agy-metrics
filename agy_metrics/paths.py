@@ -48,6 +48,19 @@ def get_brain_dir() -> Path:
     return get_app_data_dir() / "brain"
 
 
+def get_projects_dir(app_data_dir: Path | None = None) -> Path:
+    explicit = os.environ.get("AGY_METRICS_PROJECTS_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    base = app_data_dir if app_data_dir is not None else get_app_data_dir()
+    cand = base.parent / "config" / "projects"
+    if cand.is_dir():
+        return cand
+    if app_data_dir is None:
+        return Path.home() / ".gemini" / "config" / "projects"
+    return cand
+
+
 def get_state_dir() -> Path:
     explicit = os.environ.get("AGY_METRICS_STATE_DIR")
     if explicit:

@@ -1,20 +1,37 @@
 // Shared dashboard client state, URL helpers, and demand-driven generation timer.
 
 export const ALL_CONVERSATIONS_ID = '__all__';
+export const PROJECT_SCOPE_PREFIX = 'project:';
+export const UNASSIGNED_PROJECT_ID = '__unassigned__';
 export const RECENT_STEPS_LIMIT = 5;
 export const HISTORY_AREA_THRESHOLD = 60;
 export const SCATTER_MAX_STEPS = 100;
+
+export function isProjectScopeId(id) {
+  return Boolean(typeof id === 'string' && id.indexOf(PROJECT_SCOPE_PREFIX) === 0);
+}
+
+export function isAggregateScopeId(id) {
+  return id === ALL_CONVERSATIONS_ID || isProjectScopeId(id);
+}
+
+export function isAggregateMode(mode) {
+  return mode === 'all' || mode === 'project';
+}
 
 const initParams = new URLSearchParams(window.location.search);
 const initConvParam = initParams.get('conversation_id');
 const initWinParam = initParams.get('window');
 
 export const state = {
-  viewMode: initConvParam === ALL_CONVERSATIONS_ID ? 'all' : 'conversation',
+  viewMode: initConvParam === ALL_CONVERSATIONS_ID
+    ? 'all'
+    : (isProjectScopeId(initConvParam) ? 'project' : 'conversation'),
   timeWindow: (initWinParam === '5h' || initWinParam === '24h' || initWinParam === '7d' || initWinParam === '30d' || initWinParam === 'all') ? initWinParam : 'all',
   valPool: 'all',
-  followActive: !(initConvParam && initConvParam !== ALL_CONVERSATIONS_ID),
-  selectedConvId: (initConvParam && initConvParam !== ALL_CONVERSATIONS_ID) ? initConvParam : null,
+  followActive: !initConvParam,
+  selectedConvId: (initConvParam && !isAggregateScopeId(initConvParam)) ? initConvParam : null,
+  selectedProjectScopeId: isProjectScopeId(initConvParam) ? initConvParam : null,
   activeConvId: null,
   renderedConvId: null,
   renderedViewKey: null,
@@ -43,32 +60,28 @@ export const state = {
   sseRetryCount: 0,
   lastPayload: null,
   ratesOpen: false,
-  pricingConfig: null
+  pricingConfig: null,
+  scopeMenuOpen: false,
+  scopeFilterQuery: '',
+  collapsedProjects: new Set(),
+  convsDataCache: null,
+  lastScopeTreeSig: null
 };
 
 let genTimerId = null;
 
 export function currentRequestedConvId() {
   if (state.viewMode === 'all') return ALL_CONVERSATIONS_ID;
+  if (state.viewMode === 'project') return state.selectedProjectScopeId || ALL_CONVERSATIONS_ID;
   return state.followActive ? null : state.selectedConvId;
 }
 
 export function syncModeControls() {
-  const isAll = state.viewMode === 'all';
-  const convBtn = document.getElementById('modeConvBtn');
-  const allBtn = document.getElementById('modeAllBtn');
-  const convCtrl = document.getElementById('convControls');
+  const isAgg = isAggregateMode(state.viewMode);
   const allCtrl = document.getElementById('allControls');
-  if (convBtn) {
-    convBtn.classList.toggle('active', !isAll);
-    convBtn.setAttribute('aria-pressed', !isAll ? 'true' : 'false');
-  }
-  if (allBtn) {
-    allBtn.classList.toggle('active', isAll);
-    allBtn.setAttribute('aria-pressed', isAll ? 'true' : 'false');
-  }
-  if (convCtrl) convCtrl.classList.toggle('hidden', isAll);
-  if (allCtrl) allCtrl.classList.toggle('hidden', !isAll);
+  const followEl = document.getElementById('followToggle');
+  if (allCtrl) allCtrl.classList.toggle('hidden', !isAgg);
+  if (followEl) followEl.checked = Boolean(state.followActive);
   const winBtns = document.querySelectorAll('.filter-pill[data-window]');
   winBtns.forEach(function (btn) {
     const active = btn.getAttribute('data-window') === state.timeWindow;
@@ -104,7 +117,7 @@ export function buildUrl(path, convId, win, subId, etag, forBrowserDirect) {
   } else {
     params.delete('conversation_id');
   }
-  if (convId === ALL_CONVERSATIONS_ID) {
+  if (isAggregateScopeId(convId)) {
     params.set('window', win || state.timeWindow || 'all');
   } else {
     params.delete('window');

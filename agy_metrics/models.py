@@ -11,6 +11,9 @@ import re
 from typing import Any
 
 ALL_CONVERSATIONS_ID = "__all__"
+PROJECT_SCOPE_PREFIX = "project:"
+UNASSIGNED_PROJECT_ID = "__unassigned__"
+UNASSIGNED_PROJECT_NAME = "No Project"
 VALID_WINDOWS = ("5h", "24h", "7d", "30d", "all")
 _WINDOW_SECONDS = {
     "5h": 5.0 * 3600.0,
@@ -19,7 +22,7 @@ _WINDOW_SECONDS = {
     "30d": 30.0 * 86400.0,
 }
 _MAX_HYDRATED_CONVS = 16
-_ROLLUP_SCHEMA_VERSION = 5
+_ROLLUP_SCHEMA_VERSION = 6
 
 _CHARS_PER_TOKEN = 3.8
 _FIT_MIN_WARM_STEPS = 4
@@ -308,6 +311,16 @@ class ConversationState:
     canceled_epochs: list[float] = field(default_factory=list)
     failed_turns: list[_RawFailedTurn] = field(default_factory=list)
     last_user_input_epoch: float | None = None
+    prompt_title: str = ""
+    external_title: str = ""
+    agent_name: str = ""
+    external_parent_id: str = ""
+    external_project_id: str = ""
+    external_workspace_paths: list[str] = field(default_factory=list)
+    hook_workspace_paths: list[str] = field(default_factory=list)
+    project_id: str = ""
+    project_name: str = ""
+    nesting_depth: int = 0
 
     def dehydrate(self) -> None:
         """Drop heavyweight step lists while keeping summary and cache metadata."""
@@ -368,7 +381,8 @@ class ConversationState:
         self.transcript_model = ""
         self.orchestrator_active = False
         self.orchestrator_phase = ""
-        self.title = ""
+        self.prompt_title = ""
+        self.title = self.external_title
         self.last_checkpoint_epoch = None
         self.pending_error_steps = 0
         self.raw_error_events.clear()
@@ -383,3 +397,4 @@ class ConversationState:
         self.hook_events.clear()
         self.hook_reported_transcript = ""
         self.hook_reported_model = ""
+        self.hook_workspace_paths.clear()

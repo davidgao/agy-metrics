@@ -26,11 +26,20 @@ import {
 import {
   ALL_CONVERSATIONS_ID,
   HISTORY_AREA_THRESHOLD,
+  PROJECT_SCOPE_PREFIX,
   RECENT_STEPS_LIMIT,
   SCATTER_MAX_STEPS,
   state,
   syncModeControls
 } from './state.js';
+
+function isRenderedViewAggregate() {
+  const key = state.renderedViewKey || '';
+  return (
+    key.indexOf(ALL_CONVERSATIONS_ID + ':') === 0 ||
+    key.indexOf(PROJECT_SCOPE_PREFIX) === 0
+  );
+}
 
 export function renderByModel(byModel, totals, colorMap, callbacks) {
   const { onToggleModel, onClearFilter } = callbacks || {};
@@ -774,7 +783,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   const hover = document.getElementById('scatterHover');
   const leg = document.getElementById('scatterLegend');
   svg.innerHTML = '';
-  const isAllScatter = (state.renderedViewKey || '').indexOf(ALL_CONVERSATIONS_ID + ':') === 0;
+  const isAllScatter = isRenderedViewAggregate();
   hover.textContent = isAllScatter
     ? 'Hover a point to inspect · Click to open conversation'
     : 'Hover a point to inspect · Click to view step details';
@@ -1010,12 +1019,14 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
       hover.textContent = ptSummary;
     });
     g.addEventListener('click', function () {
-      if (s.conv_id && (state.renderedViewKey || '').indexOf(ALL_CONVERSATIONS_ID + ':') === 0) {
+      if (s.conv_id && isRenderedViewAggregate()) {
         state.viewMode = 'conversation';
         state.followActive = false;
+        state.selectedProjectScopeId = null;
         state.selectedConvId = s.conv_id;
         state.pendingJump = { convId: s.conv_id, stepIndex: s.step_index, modelName: modelName };
-        document.getElementById('followToggle').checked = false;
+        const ft = document.getElementById('followToggle');
+        if (ft) ft.checked = false;
         syncModeControls();
         if (onSwitchTarget) onSwitchTarget(s.conv_id);
         return;

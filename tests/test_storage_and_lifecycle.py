@@ -23,6 +23,7 @@ from agy_metrics.engine import (  # noqa: E402
     MetricsEngine,
     _MAX_HYDRATED_CONVS,
 )
+from agy_metrics.models import _ROLLUP_SCHEMA_VERSION  # noqa: E402
 
 
 class TestStorageAndLifecycle(unittest.TestCase):
@@ -350,8 +351,8 @@ class TestStorageAndLifecycle(unittest.TestCase):
             finally:
                 eng1.close()
 
-            # 2. Legacy v3 & v4 SQLite schemas upgrade cleanly to v5
-            for old_ver in (3, 4):
+            # 2. Legacy v3, v4 & v5 SQLite schemas upgrade cleanly to current version
+            for old_ver in (3, 4, 5):
                 db_path.unlink(missing_ok=True)
                 old_conn = sqlite3.connect(str(db_path))
                 old_conn.execute(f"PRAGMA user_version = {old_ver}")
@@ -364,7 +365,10 @@ class TestStorageAndLifecycle(unittest.TestCase):
                 try:
                     m_all = eng_mig.get_metrics(ALL_CONVERSATIONS_ID, window="all")
                     self.assertEqual(m_all["totals"]["output_tokens"], 150)
-                    self.assertEqual(eng_mig._db.execute("PRAGMA user_version").fetchone()[0], 5)
+                    self.assertEqual(
+                        eng_mig._db.execute("PRAGMA user_version").fetchone()[0],
+                        _ROLLUP_SCHEMA_VERSION,
+                    )
                 finally:
                     eng_mig.close()
 

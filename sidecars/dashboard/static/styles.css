@@ -303,16 +303,268 @@ button.pill:hover {
   background: var(--m-selected);
   font-weight: 600;
 }
-.conv-controls, .all-controls {
+.all-controls {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
-  flex: 1 1 200px;
+  flex: 0 1 auto;
   min-width: 0;
 }
-.conv-controls.hidden, .all-controls.hidden {
+.all-controls.hidden {
   display: none;
+}
+.scope-picker {
+  position: relative;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.scope-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--m-border);
+  background-color: var(--m-select-bg);
+  color: var(--m-select-fg);
+  font-size: 12px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+.scope-trigger:hover {
+  border-color: color-mix(in srgb, var(--m-primary) 65%, var(--m-border));
+}
+.scope-trigger:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--m-primary) 70%, transparent);
+  outline-offset: 1px;
+  border-color: var(--m-primary);
+}
+.scope-trigger-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scope-trigger-proj {
+  color: var(--m-muted);
+}
+.scope-trigger-meta {
+  flex: 0 0 auto;
+  color: var(--m-muted);
+  font-size: 11px;
+}
+.scope-trigger-caret {
+  flex: 0 0 auto;
+  color: var(--m-muted);
+  font-size: 10px;
+  line-height: 1;
+}
+.scope-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 100%;
+  width: max(100%, min(360px, calc(100vw - 24px)));
+  max-width: calc(100vw - 24px);
+  max-height: min(400px, 70vh);
+  display: flex;
+  flex-direction: column;
+  z-index: 60;
+  background: var(--m-card);
+  border: 1px solid var(--m-border);
+  border-radius: 9px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
+  overflow: hidden;
+}
+.scope-menu.hidden {
+  display: none;
+}
+.scope-search-wrap {
+  padding: 6px;
+  border-bottom: 1px solid var(--m-border);
+  background: var(--m-surface);
+  flex: 0 0 auto;
+}
+.scope-search {
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--m-border);
+  background: var(--m-card);
+  color: var(--m-fg);
+  font-size: 12px;
+  font-family: inherit;
+}
+.scope-search:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--m-primary) 70%, transparent);
+  outline-offset: 0;
+  border-color: var(--m-primary);
+}
+.scope-tree {
+  overflow-y: auto;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.scope-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--m-fg);
+  min-width: 0;
+}
+.scope-all-row {
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  border-bottom: 1px solid color-mix(in srgb, var(--m-border) 55%, transparent);
+  margin-bottom: 2px;
+}
+.scope-all-row:hover,
+.scope-project-row:hover,
+.scope-conv-row:hover,
+.scope-sub-row:hover {
+  background: var(--m-hover);
+}
+.scope-row.active {
+  background: var(--m-selected);
+}
+.scope-project-row {
+  margin-top: 2px;
+  padding: 0 2px;
+  gap: 2px;
+}
+.scope-conv-row {
+  padding: 0 2px 0 8px;
+  gap: 2px;
+}
+.scope-sub-row {
+  padding-right: 2px;
+}
+.scope-twisty {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--m-muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.scope-twisty:hover {
+  color: var(--m-fg);
+  background: color-mix(in srgb, var(--m-fg) 10%, transparent);
+}
+.scope-twisty-spacer {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 22px;
+}
+.scope-project-select,
+.scope-item-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 4px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.scope-project-select:focus-visible,
+.scope-item-btn:focus-visible,
+.scope-all-row:focus-visible,
+[data-scope].kb-focus {
+  outline: none;
+  background: var(--m-hover);
+  border-color: color-mix(in srgb, var(--m-primary) 70%, transparent);
+}
+.scope-project-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scope-folder-icon {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  color: var(--m-muted);
+}
+.scope-item-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.scope-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scope-item-meta {
+  flex: 0 0 auto;
+  color: var(--m-muted);
+  font-size: 11px;
+}
+.scope-branch {
+  color: var(--m-muted);
+  flex: 0 0 auto;
+  font-size: 11px;
+}
+.scope-star {
+  color: var(--m-primary);
+  flex: 0 0 auto;
+  font-size: 11px;
+}
+.scope-agent-tag {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid var(--m-border);
+  background: var(--m-surface);
+  color: var(--m-muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.scope-empty {
+  padding: 10px 8px;
+  text-align: center;
+}
+#parentConvBtn {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 select {
   flex: 1 1 180px;
@@ -455,6 +707,16 @@ label.follow {
   background: var(--m-surface);
   border: 1px solid var(--m-border);
   font-size: 12px;
+  color: var(--m-fg);
+  font-family: inherit;
+}
+.chip.chip-btn {
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.chip.chip-btn:hover {
+  background: var(--m-hover);
+  border-color: var(--m-primary);
 }
 .filter-pill {
   display: inline-flex;

@@ -23,6 +23,7 @@ import {
   srcLabel
 } from './format.js';
 import { initPricingModal } from './pricing-modal.js';
+import { initScopeSelector, renderScopeSelector } from './selector.js';
 import {
   ALL_CONVERSATIONS_ID,
   RECENT_STEPS_LIMIT,
@@ -30,6 +31,8 @@ import {
   canUseEventSource,
   currentRequestedConvId,
   hasSidecarFetch,
+  isAggregateMode,
+  isProjectScopeId,
   sidecarFetch,
   state,
   syncGeneratingTimer,
@@ -42,31 +45,34 @@ const POLL_IDLE_MS = 1500;
 const POLL_GENERATING_MS = 600;
 const INIT_SNAPSHOT_FALLBACK_MS = 900;
 
-function renderConversations(convsData) {
-  if (!convsData) return;
-  state.activeConvId = convsData.active_conversation_id || null;
-  const sel = document.getElementById('convSelect');
-  const list = convsData.conversations || [];
-  const currentVal = state.followActive ? state.activeConvId : state.selectedConvId;
-  sel.innerHTML = '';
-  if (list.length === 0) {
-    const emptyOpt = document.createElement('option');
-    emptyOpt.value = '';
-    emptyOpt.textContent = 'No conversations found';
-    sel.appendChild(emptyOpt);
-    return;
+function selectScope(scopeId) {
+  if (!scopeId) return;
+  state.modelFilter = null;
+  state.expandedStep = null;
+  state.showAllSteps = false;
+  state.showColdPrefills = false;
+  state.lastScatterKey = null;
+  state.followActive = false;
+
+  if (scopeId === ALL_CONVERSATIONS_ID) {
+    state.viewMode = 'all';
+    state.selectedProjectScopeId = null;
+    state.selectedConvId = null;
+  } else if (isProjectScopeId(scopeId)) {
+    state.viewMode = 'project';
+    state.selectedProjectScopeId = scopeId;
+    state.selectedConvId = null;
+  } else {
+    state.viewMode = 'conversation';
+    state.selectedProjectScopeId = null;
+    state.selectedConvId = scopeId;
   }
-  list.forEach(function (c) {
-    const opt = document.createElement('option');
-    opt.value = c.conversation_id;
-    const prefix = c.is_subagent ? '↳ ' : '';
-    const activeMark = c.conversation_id === state.activeConvId ? '★ ' : '';
-    opt.textContent = activeMark + prefix + (c.title || c.conversation_id.slice(0, 8)) + ' (' + fmtCompact(c.current_tokens) + ')';
-    if (c.conversation_id === currentVal) {
-      opt.selected = true;
-    }
-    sel.appendChild(opt);
-  });
+
+  const followEl = document.getElementById('followToggle');
+  if (followEl) followEl.checked = false;
+  syncModeControls();
+  if (state.convsDataCache) renderScopeSelector(state.convsDataCache, selectScope);
+  switchTarget(scopeId);
 }
 
 function toggleModelFilter(modelName) {
@@ -82,12 +88,17 @@ function clearModelFilter() {
 
 function renderMetrics(m) {
   if (!m) return;
-  const isAllMode = (m.mode === 'all');
+  const mMode = (m.mode === 'all' || m.mode === 'project') ? m.mode : 'conversation';
+  const isAllMode = isAggregateMode(mMode);
   const viewKey = isAllMode
-    ? (ALL_CONVERSATIONS_ID + ':' + (m.window || state.timeWindow || 'all'))
+    ? ((m.conversation_id || ALL_CONVERSATIONS_ID) + ':' + (m.window || state.timeWindow || 'all'))
     : (m.conversation_id || '');
   if (viewKey && viewKey !== state.renderedViewKey) {
-    const prevWasAll = state.renderedViewKey && state.renderedViewKey.indexOf(ALL_CONVERSATIONS_ID + ':') === 0;
+    const prevScopePrefix = state.renderedViewKey
+      ? state.renderedViewKey.split(':').slice(0, -1).join(':')
+      : '';
+    const curScopePrefix = isAllMode ? (m.conversation_id || ALL_CONVERSATIONS_ID) : '';
+    const prevWasSameAgg = Boolean(isAllMode && prevScopePrefix && prevScopePrefix === curScopePrefix);
     state.renderedViewKey = viewKey;
     state.renderedConvId = m.conversation_id || null;
     state.showColdPrefills = false;
@@ -101,7 +112,7 @@ function renderMetrics(m) {
     } else {
       state.showAllSteps = false;
       state.expandedStep = null;
-      if (!(isAllMode && prevWasAll)) {
+      if (!prevWasSameAgg) {
         state.modelFilter = null;
       }
     }
@@ -112,6 +123,19 @@ function renderMetrics(m) {
     state.pendingJump = null;
   }
   syncModeControls();
+
+  const parentBtn = document.getElementById('parentConvBtn');
+  if (parentBtn) {
+    if (!isAllMode && m.is_subagent && m.parent_id) {
+      parentBtn.style.display = '';
+      parentBtn.textContent = '↑ ' + (m.parent_title || 'Parent');
+      parentBtn.title = 'Back to parent conversation: ' + (m.parent_title || m.parent_id);
+      parentBtn.setAttribute('data-parent-id', m.parent_id);
+    } else {
+      parentBtn.style.display = 'none';
+      parentBtn.removeAttribute('data-parent-id');
+    }
+  }
 
   const ctxCard = document.getElementById('ctxCard');
   const histCard = document.getElementById('historyCard');
@@ -246,7 +270,7 @@ function renderMetrics(m) {
   const kpiLastTitleEl = document.getElementById('kpiLastTitle');
   kpiLastTitleEl.textContent = 'Latest Step' + stepTag + scopeTag;
   kpiLastTitleEl.title = lastConvNote ? ('Global latest step in ' + scopedLast.conv_title) : '';
-  document.getElementById('kpiTimingTitle').textContent = (selectedModelEntry ? 'Model Timing' : (isAllMode ? 'Total Timing' : 'Session Timing')) + scopeTag;
+  document.getElementById('kpiTimingTitle').textContent = (selectedModelEntry ? 'Model Timing' : (m.mode === 'project' ? 'Project Timing' : (isAllMode ? 'Total Timing' : 'Session Timing'))) + scopeTag;
 
   document.getElementById('totGrossIn').textContent = fmtCompact(scopedTot.gross_input_tokens);
   document.getElementById('totIn').textContent = fmtInt(scopedTot.input_tokens);
@@ -392,13 +416,22 @@ function renderMetrics(m) {
     const subChips = document.getElementById('subChips');
     subChips.innerHTML = '';
     subs.items.forEach(function (it) {
-      const ch = document.createElement('span');
-      ch.className = 'chip';
+      const ch = document.createElement('button');
+      ch.type = 'button';
+      ch.className = 'chip chip-btn';
+      const agentNote = it.agent_name && (!it.role || it.role.toLowerCase().indexOf(it.agent_name.toLowerCase()) === -1)
+        ? (' · ' + it.agent_name)
+        : '';
       const modelNote = it.model_name ? (' [' + it.model_name + ']') : '';
-      ch.textContent = (it.role || 'Subagent') + modelNote + ' (' + it.planner_steps_count + ' steps · ' + fmtCompact((it.input_tokens || 0) + (it.cache_read_tokens || 0) + (it.output_tokens || 0)) + ' tok)';
+      ch.textContent = (it.role || 'Subagent') + agentNote + modelNote + ' (' + it.planner_steps_count + ' steps · ' + fmtCompact((it.input_tokens || 0) + (it.cache_read_tokens || 0) + (it.output_tokens || 0)) + ' tok)';
+      const tipParts = ['Click to inspect subagent'];
       if (it.cost_usd != null) {
-        ch.title = 'Paygo: ' + fmtUsd(it.cost_usd) + ' (' + fmtCredits(it.credits) + ')';
+        tipParts.push('Paygo: ' + fmtUsd(it.cost_usd) + ' (' + fmtCredits(it.credits) + ')');
       }
+      ch.title = tipParts.join(' · ');
+      ch.addEventListener('click', function () {
+        if (it.conversation_id) selectScope(it.conversation_id);
+      });
       subChips.appendChild(ch);
     });
   } else {
@@ -589,14 +622,21 @@ function applyCombined(data) {
     state.lastSnapshotAtMs = Date.now();
     return true;
   }
-  if (data.conversations) renderConversations(data.conversations);
+  if (data.conversations) renderScopeSelector(data.conversations, selectScope);
   let matched = true;
   if (data.metrics) {
     const m = data.metrics;
-    const mMode = m.mode === 'all' ? 'all' : 'conversation';
+    const mMode = (m.mode === 'all' || m.mode === 'project') ? m.mode : 'conversation';
     if (mMode !== state.viewMode) {
       matched = false;
-    } else if (mMode === 'all' && m.window && m.window !== state.timeWindow) {
+    } else if (isAggregateMode(mMode) && m.window && m.window !== state.timeWindow) {
+      matched = false;
+    } else if (
+      mMode === 'project' &&
+      state.selectedProjectScopeId &&
+      m.conversation_id &&
+      m.conversation_id !== state.selectedProjectScopeId
+    ) {
       matched = false;
     } else if (
       mMode === 'conversation' &&
@@ -644,7 +684,9 @@ function schedulePoll(customDelayMs) {
 function fetchOnce(convId, win, useEtag) {
   const reqConv = convId !== undefined ? convId : currentRequestedConvId();
   const reqWin = win !== undefined ? win : state.timeWindow;
-  const expectedMode = reqConv === ALL_CONVERSATIONS_ID ? 'all' : 'conversation';
+  const expectedMode = reqConv === ALL_CONVERSATIONS_ID
+    ? 'all'
+    : (isProjectScopeId(reqConv) ? 'project' : 'conversation');
   const subId = (state.es && state.es.readyState === 1 && state.sseSubId) ? state.sseSubId : null;
   abortPendingFetch();
   stopPolling();
@@ -660,7 +702,14 @@ function fetchOnce(convId, win, useEtag) {
     .then(function (data) {
       if (ctrl && state.fetchAbort === ctrl) state.fetchAbort = null;
       if (state.viewMode !== expectedMode) return;
-      if (expectedMode === 'all' && state.timeWindow !== reqWin) return;
+      if (isAggregateMode(expectedMode) && state.timeWindow !== reqWin) return;
+      if (
+        expectedMode === 'project' &&
+        state.selectedProjectScopeId &&
+        reqConv !== state.selectedProjectScopeId
+      ) {
+        return;
+      }
       if (
         expectedMode === 'conversation' &&
         !state.followActive &&
@@ -865,7 +914,7 @@ function connectSSE() {
     armSseWatchdog(es);
     if (
       !document.hidden &&
-      state.viewMode === 'all' &&
+      isAggregateMode(state.viewMode) &&
       (state.timeWindow === '5h' || state.timeWindow === '24h') &&
       (Date.now() - (state.lastSnapshotAtMs || 0)) >= 60000
     ) {
@@ -924,35 +973,23 @@ function initDashboard() {
     }
   });
 
-  document.getElementById('modeConvBtn').addEventListener('click', function () {
-    if (state.viewMode === 'conversation') return;
-    state.viewMode = 'conversation';
-    state.modelFilter = null;
-    state.expandedStep = null;
-    state.showAllSteps = false;
-    state.showColdPrefills = false;
-    state.lastScatterKey = null;
-    syncModeControls();
-    switchTarget();
-  });
+  initScopeSelector(selectScope);
 
-  document.getElementById('modeAllBtn').addEventListener('click', function () {
-    if (state.viewMode === 'all') return;
-    state.viewMode = 'all';
-    state.modelFilter = null;
-    state.expandedStep = null;
-    state.showAllSteps = false;
-    state.showColdPrefills = false;
-    state.lastScatterKey = null;
-    syncModeControls();
-    switchTarget();
-  });
+  const parentConvBtn = document.getElementById('parentConvBtn');
+  if (parentConvBtn) {
+    parentConvBtn.addEventListener('click', function () {
+      const pid = parentConvBtn.getAttribute('data-parent-id');
+      if (pid) selectScope(pid);
+    });
+  }
 
   document.querySelectorAll('.filter-pill[data-window]').forEach(function (btn) {
     btn.addEventListener('click', function () {
       const win = btn.getAttribute('data-window') || 'all';
-      if (state.viewMode === 'all' && state.timeWindow === win) return;
-      state.viewMode = 'all';
+      if (isAggregateMode(state.viewMode) && state.timeWindow === win) return;
+      if (!isAggregateMode(state.viewMode)) {
+        state.viewMode = 'all';
+      }
       state.timeWindow = win;
       state.lastScatterKey = null;
       syncModeControls();
@@ -998,23 +1035,9 @@ function initDashboard() {
     clearModelFilter();
   });
 
-  document.getElementById('convSelect').addEventListener('change', function (e) {
-    const val = e.target.value || null;
-    state.viewMode = 'conversation';
-    state.followActive = false;
-    state.selectedConvId = val;
-    state.modelFilter = null;
-    state.expandedStep = null;
-    state.showAllSteps = false;
-    state.showColdPrefills = false;
-    state.lastScatterKey = null;
-    document.getElementById('followToggle').checked = false;
-    syncModeControls();
-    switchTarget(val);
-  });
-
   document.getElementById('followToggle').addEventListener('change', function (e) {
     state.viewMode = 'conversation';
+    state.selectedProjectScopeId = null;
     state.followActive = Boolean(e.target.checked);
     if (state.followActive) {
       state.selectedConvId = null;
@@ -1023,9 +1046,14 @@ function initDashboard() {
       state.showAllSteps = false;
       state.showColdPrefills = false;
       state.lastScatterKey = null;
+      if (state.convsDataCache) renderScopeSelector(state.convsDataCache, selectScope);
       syncModeControls();
       switchTarget(null);
     } else {
+      if (!state.selectedConvId && state.activeConvId) {
+        state.selectedConvId = state.activeConvId;
+      }
+      if (state.convsDataCache) renderScopeSelector(state.convsDataCache, selectScope);
       syncModeControls();
       if (!(state.es && state.es.readyState === 1 && state.sseSubId) && !(state.sseDisabled && state.pollTimer !== null)) {
         connectSSE();

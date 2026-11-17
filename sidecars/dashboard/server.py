@@ -44,6 +44,7 @@ _JS_BUNDLE_ORDER = (
     "state.js",
     "charts.js",
     "pricing-modal.js",
+    "selector.js",
     "app.js",
 )
 _JS_IMPORT_RE = re.compile(

@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 from typing import Any
 
+from .metadata import uri_or_path_to_norm_path
 from .models import (
     ConversationState,
     StepMetrics,
@@ -183,6 +184,13 @@ def ingest_hooks(conv: ConversationState, hook_path: Path | None) -> bool:
                 m_name = ev.get("model_name")
                 if isinstance(m_name, str) and m_name:
                     conv.hook_reported_model = m_name
+                ws_paths = ev.get("workspace_paths")
+                if isinstance(ws_paths, list):
+                    for wp in ws_paths:
+                        if isinstance(wp, str):
+                            norm = uri_or_path_to_norm_path(wp)
+                            if norm and norm not in conv.hook_workspace_paths:
+                                conv.hook_workspace_paths.append(norm)
     except OSError:
         return False
 
@@ -278,6 +286,8 @@ def process_transcript_step(
             if created_at_epoch is not None:
                 conv.last_user_input_epoch = created_at_epoch
             title, clean_text = _extract_user_title_and_text(content)
+            if not conv.prompt_title and title:
+                conv.prompt_title = title
             if not conv.title and title:
                 conv.title = title
             conv.user_chars += len(clean_text)
@@ -1415,7 +1425,7 @@ def recompute_conversation(
             or "unknown"
         )
     if not conv.title:
-        conv.title = conv.conversation_id[:8]
+        conv.title = conv.external_title or conv.prompt_title or conv.conversation_id[:8]
 
     # Track bounded unrecovered failed turns (excluding user cancellations & silent aborts)
     matched_spans = [
@@ -1726,6 +1736,7 @@ def link_subagents(
     """Link direct child subagents to their parent and propagate fallback model hints."""
     for conv in conversations.values():
         conv.parent_id = None
+        conv.nesting_depth = 0
     for parent in conversations.values():
         for child_id in parent.child_subagents:
             child = conversations.get(child_id)
@@ -1741,6 +1752,37 @@ def link_subagents(
                 if hint != child.fallback_model_hint:
                     child.fallback_model_hint = hint
                     on_hint_changed(child)
+    for child in conversations.values():
+        if child.parent_id is not None or not child.external_parent_id:
+            continue
+        parent = conversations.get(child.external_parent_id)
+        if (
+            parent is not None
+            and child.external_parent_id != child.conversation_id
+            and not _would_create_parent_cycle(
+                conversations, parent.conversation_id, child.conversation_id
+            )
+        ):
+            child.parent_id = parent.conversation_id
+            fallback_role = (
+                child.external_title
+                or (f"Subagent · {child.agent_name}" if child.agent_name else "Subagent")
+            )
+            parent.child_subagents.setdefault(child.conversation_id, fallback_role)
+    for conv in conversations.values():
+        depth = 0
+        cur: ConversationState | None = conv
+        visited: set[str] = set()
+        while (
+            cur is not None
+            and cur.parent_id
+            and cur.parent_id in conversations
+            and cur.conversation_id not in visited
+        ):
+            visited.add(cur.conversation_id)
+            depth += 1
+            cur = conversations.get(cur.parent_id)
+        conv.nesting_depth = depth
 
 
 def root_ancestor_id(conversations: dict[str, ConversationState], cid: str) -> str:

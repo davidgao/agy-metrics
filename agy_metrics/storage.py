@@ -134,7 +134,9 @@ class MetricsStore:
                 own_cache INT NOT NULL,
                 own_out INT NOT NULL,
                 own_think INT NOT NULL,
-                own_vis INT NOT NULL
+                own_vis INT NOT NULL,
+                prompt_title TEXT NOT NULL,
+                hook_workspace_paths_json TEXT NOT NULL
             ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS conv_model_totals (
@@ -331,7 +333,8 @@ class MetricsStore:
                    current_model_name, planner_steps_count, current_tokens,
                    updated_at_ms, compacted_count,
                    child_subagents_json, child_subagent_models_json,
-                   own_in, own_cache, own_out, own_think, own_vis
+                   own_in, own_cache, own_out, own_think, own_vis,
+                   prompt_title, hook_workspace_paths_json
             FROM conv_meta
             """
         ).fetchall()
@@ -377,8 +380,27 @@ class MetricsStore:
             conv.own_output_tokens = _safe_int(row[21])
             conv.own_est_thinking_tokens = _safe_int(row[22])
             conv.own_est_visible_tokens = _safe_int(row[23])
+            conv.prompt_title = str(row[24] or "")
+            try:
+                ws_list = json.loads(row[25] or "[]")
+                if isinstance(ws_list, list):
+                    conv.hook_workspace_paths = [str(w) for w in ws_list if isinstance(w, str) and w]
+            except json.JSONDecodeError:
+                pass
             conversations[cid] = conv
         return conversations
+
+    def update_persisted_titles(self, updates: list[tuple[str, str]]) -> None:
+        if not updates:
+            return
+        try:
+            with self.db:
+                self.db.executemany(
+                    "UPDATE conv_meta SET title = ? WHERE conv_id = ?",
+                    updates,
+                )
+        except sqlite3.Error:
+            pass
 
     def delete_conversation_rollup(
         self, cid: str, on_error: Callable[[], None] | None = None
@@ -511,6 +533,8 @@ class MetricsStore:
             conv.own_output_tokens,
             conv.own_est_thinking_tokens,
             conv.own_est_visible_tokens,
+            conv.prompt_title,
+            json.dumps(conv.hook_workspace_paths, separators=(",", ":")),
         )
 
         try:
@@ -519,7 +543,7 @@ class MetricsStore:
                     self.db.execute(
                         """
                         INSERT OR REPLACE INTO conv_meta VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         """,
                         conv_meta_params,
@@ -574,7 +598,7 @@ class MetricsStore:
                     self.db.execute(
                         """
                         INSERT OR REPLACE INTO conv_meta VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         """,
                         conv_meta_params,
@@ -785,38 +809,92 @@ class MetricsStore:
             for r in rows
         ]
 
-    def query_window_models(self, cutoff_epoch: float | None) -> list[str]:
+    def query_window_models(
+        self,
+        cutoff_epoch: float | None,
+        conv_ids: list[str] | None = None,
+    ) -> list[str]:
         """Return distinct model names active inside the given window."""
+        if conv_ids is not None and len(conv_ids) == 0:
+            return []
         if cutoff_epoch is None:
+            if conv_ids is None:
+                return [
+                    str(r[0])
+                    for r in self.db.execute(
+                        "SELECT DISTINCT model_name FROM conv_model_totals"
+                    ).fetchall()
+                ]
+            placeholders = ",".join("?" for _ in conv_ids)
             return [
                 str(r[0])
                 for r in self.db.execute(
-                    "SELECT DISTINCT model_name FROM conv_model_totals"
+                    f"SELECT DISTINCT model_name FROM conv_model_totals WHERE conv_id IN ({placeholders})",
+                    tuple(conv_ids),
                 ).fetchall()
             ]
         boundary_hour = int(cutoff_epoch // 3600) * 3600
         ceil_hour = boundary_hour + 3600
+        if conv_ids is None:
+            return [
+                str(r[0])
+                for r in self.db.execute(
+                    """
+                    SELECT DISTINCT model_name FROM hour_model_totals WHERE hour_epoch >= ?
+                    UNION
+                    SELECT DISTINCT model_name FROM step_lite WHERE epoch_s >= ? AND epoch_s < ?
+                    UNION
+                    SELECT DISTINCT model_name FROM failed_turn_lite WHERE epoch_s >= ? AND epoch_s < ?
+                    """,
+                    (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+                ).fetchall()
+            ]
+        placeholders = ",".join("?" for _ in conv_ids)
         return [
             str(r[0])
             for r in self.db.execute(
-                """
-                SELECT DISTINCT model_name FROM hour_model_totals WHERE hour_epoch >= ?
+                f"""
+                SELECT DISTINCT model_name FROM hour_model_totals WHERE conv_id IN ({placeholders}) AND hour_epoch >= ?
                 UNION
-                SELECT DISTINCT model_name FROM step_lite WHERE epoch_s >= ? AND epoch_s < ?
+                SELECT DISTINCT model_name FROM step_lite WHERE conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?
                 UNION
-                SELECT DISTINCT model_name FROM failed_turn_lite WHERE epoch_s >= ? AND epoch_s < ?
+                SELECT DISTINCT model_name FROM failed_turn_lite WHERE conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?
                 """,
-                (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+                (*conv_ids, ceil_hour, *conv_ids, cutoff_epoch, ceil_hour, *conv_ids, cutoff_epoch, ceil_hour),
             ).fetchall()
         ]
 
     def query_all_model_aggregates(
-        self, cutoff_epoch: float | None
+        self,
+        cutoff_epoch: float | None,
+        conv_ids: list[str] | None = None,
     ) -> tuple[list[tuple[Any, ...]], list[str] | None]:
         """Return (model_agg_rows, distinct_conv_ids_or_none) after delay sync."""
+        if conv_ids is not None and len(conv_ids) == 0:
+            return [], []
         if cutoff_epoch is None:
+            if conv_ids is None:
+                agg_rows = self.db.execute(
+                    """
+                    SELECT model_name,
+                           SUM(steps_count), SUM(compaction_steps_count),
+                           SUM(input_tokens), SUM(cache_read_tokens),
+                           SUM(output_tokens), SUM(est_thinking_tokens), SUM(est_visible_tokens),
+                           SUM(model_time_s), SUM(timed_steps_count),
+                           SUM(cold_timed_steps_count), SUM(cold_model_time_s),
+                           SUM(timed_output_tokens), SUM(tool_time_s),
+                           SUM(warm_timed_steps_count), SUM(cold_excluded_count),
+                           SUM(est_delay_steps_count), SUM(est_total_delay_s),
+                           SUM(compacted_events_count),
+                           SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+                    FROM conv_model_totals
+                    GROUP BY model_name
+                    """
+                ).fetchall()
+                return agg_rows, None
+            placeholders = ",".join("?" for _ in conv_ids)
             agg_rows = self.db.execute(
-                """
+                f"""
                 SELECT model_name,
                        SUM(steps_count), SUM(compaction_steps_count),
                        SUM(input_tokens), SUM(cache_read_tokens),
@@ -829,14 +907,82 @@ class MetricsStore:
                        SUM(compacted_events_count),
                        SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
                 FROM conv_model_totals
+                WHERE conv_id IN ({placeholders})
                 GROUP BY model_name
-                """
+                """,
+                tuple(conv_ids),
             ).fetchall()
-            return agg_rows, None
+            win_conv_rows = self.db.execute(
+                f"SELECT DISTINCT conv_id FROM conv_model_totals WHERE conv_id IN ({placeholders})",
+                tuple(conv_ids),
+            ).fetchall()
+            return agg_rows, [str(r[0]) for r in win_conv_rows]
 
         boundary_hour = int(cutoff_epoch // 3600) * 3600
         ceil_hour = boundary_hour + 3600
-        union_sql = _events_union_sql("epoch_s >= ? AND epoch_s < ?")
+        if conv_ids is None:
+            union_sql = _events_union_sql("epoch_s >= ? AND epoch_s < ?")
+            agg_rows = self.db.execute(
+                f"""
+                SELECT model_name,
+                       SUM(steps_count), SUM(compaction_steps_count),
+                       SUM(input_tokens), SUM(cache_read_tokens),
+                       SUM(output_tokens), SUM(est_thinking_tokens), SUM(est_visible_tokens),
+                       SUM(model_time_s), SUM(timed_steps_count),
+                       SUM(cold_timed_steps_count), SUM(cold_model_time_s),
+                       SUM(timed_output_tokens), SUM(tool_time_s),
+                       SUM(warm_timed_steps_count), SUM(cold_excluded_count),
+                       SUM(est_delay_steps_count), SUM(est_total_delay_s),
+                       SUM(compacted_events_count),
+                       SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+                FROM (
+                    SELECT model_name, steps_count, compaction_steps_count,
+                           input_tokens, cache_read_tokens,
+                           output_tokens, est_thinking_tokens, est_visible_tokens,
+                           model_time_s, timed_steps_count,
+                           cold_timed_steps_count, cold_model_time_s,
+                           timed_output_tokens, tool_time_s,
+                           warm_timed_steps_count, cold_excluded_count,
+                           est_delay_steps_count, est_total_delay_s,
+                           compacted_events_count,
+                           wasted_time_s, retry_steps_count, failed_turns_count
+                    FROM hour_model_totals
+                    WHERE hour_epoch >= ?
+                    UNION ALL
+                    SELECT model_name, {_ROLLUP_AGG_COLS_SQL}
+                    FROM ({union_sql})
+                    GROUP BY model_name
+                )
+                GROUP BY model_name
+                """,
+                (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+            ).fetchall()
+            win_conv_rows = self.db.execute(
+                """
+                SELECT DISTINCT conv_id FROM hour_model_totals WHERE hour_epoch >= ?
+                UNION
+                SELECT DISTINCT conv_id FROM step_lite WHERE epoch_s >= ? AND epoch_s < ?
+                UNION
+                SELECT DISTINCT conv_id FROM failed_turn_lite WHERE epoch_s >= ? AND epoch_s < ?
+                """,
+                (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+            ).fetchall()
+            return agg_rows, [str(r[0]) for r in win_conv_rows]
+
+        placeholders = ",".join("?" for _ in conv_ids)
+        union_sql = _events_union_sql(
+            f"conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?"
+        )
+        params = (
+            *conv_ids,
+            ceil_hour,
+            *conv_ids,
+            cutoff_epoch,
+            ceil_hour,
+            *conv_ids,
+            cutoff_epoch,
+            ceil_hour,
+        )
         agg_rows = self.db.execute(
             f"""
             SELECT model_name,
@@ -862,7 +1008,7 @@ class MetricsStore:
                        compacted_events_count,
                        wasted_time_s, retry_steps_count, failed_turns_count
                 FROM hour_model_totals
-                WHERE hour_epoch >= ?
+                WHERE conv_id IN ({placeholders}) AND hour_epoch >= ?
                 UNION ALL
                 SELECT model_name, {_ROLLUP_AGG_COLS_SQL}
                 FROM ({union_sql})
@@ -870,16 +1016,16 @@ class MetricsStore:
             )
             GROUP BY model_name
             """,
-            (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+            params,
         ).fetchall()
         win_conv_rows = self.db.execute(
-            """
-            SELECT DISTINCT conv_id FROM hour_model_totals WHERE hour_epoch >= ?
+            f"""
+            SELECT DISTINCT conv_id FROM hour_model_totals WHERE conv_id IN ({placeholders}) AND hour_epoch >= ?
             UNION
-            SELECT DISTINCT conv_id FROM step_lite WHERE epoch_s >= ? AND epoch_s < ?
+            SELECT DISTINCT conv_id FROM step_lite WHERE conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?
             UNION
-            SELECT DISTINCT conv_id FROM failed_turn_lite WHERE epoch_s >= ? AND epoch_s < ?
+            SELECT DISTINCT conv_id FROM failed_turn_lite WHERE conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?
             """,
-            (ceil_hour, cutoff_epoch, ceil_hour, cutoff_epoch, ceil_hour),
+            params,
         ).fetchall()
         return agg_rows, [str(r[0]) for r in win_conv_rows]
