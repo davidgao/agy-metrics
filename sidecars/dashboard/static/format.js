@@ -100,6 +100,49 @@ export function fmtNomTps(tps) {
   return v >= 100 ? String(Math.round(v)) : v.toFixed(1);
 }
 
+export function fmtBulkTps(tps) {
+  const v = Number(tps || 0);
+  if (!(v > 0)) return '—';
+  if (v >= 100000) return Math.round(v / 1000) + 'k';
+  if (v >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+  return fmtNomTps(v);
+}
+
+export function computeStepRooflineParts(step, fit) {
+  if (!step || !fit || !fit.available || step.step_kind === 'checkpoint') {
+    return null;
+  }
+  const baseS = Number(fit.inferred_ttft_s || 0);
+  const inTok = Number(step.input_tokens || 0);
+  const cacTok = Number(step.cache_read_tokens || 0);
+  const outTok = Number(step.output_tokens || 0);
+  const preS = (fit.prefill_available && fit.prefill_slope_s_per_tok != null)
+    ? Number(fit.prefill_slope_s_per_tok) * inTok
+    : 0;
+  const cacS = (fit.cache_available && fit.cache_slope_s_per_tok != null)
+    ? Number(fit.cache_slope_s_per_tok) * cacTok
+    : 0;
+  const decS = Number(fit.slope_s_per_tok || 0) * outTok;
+  const expectedS = baseS + preS + cacS + decS;
+  const parts = ['~' + baseS.toFixed(2) + 's base'];
+  if (fit.prefill_available && inTok > 0) {
+    parts.push('~' + preS.toFixed(2) + 's prefill');
+  }
+  if (fit.cache_available && cacTok > 0) {
+    parts.push('~' + cacS.toFixed(2) + 's cache');
+  }
+  parts.push('~' + decS.toFixed(2) + 's decode');
+  return {
+    baseS: baseS,
+    preS: preS,
+    cacS: cacS,
+    decS: decS,
+    expectedS: expectedS,
+    partsText: parts.join(' + '),
+    has3Term: Boolean(fit.prefill_available || fit.cache_available)
+  };
+}
+
 export function fmtDuration(sec) {
   const v = Math.max(0, Number(sec || 0));
   const s10 = Math.round(v * 10);

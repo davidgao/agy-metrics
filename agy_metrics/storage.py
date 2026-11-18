@@ -11,7 +11,21 @@ from typing import Any
 from .models import (
     ConversationState,
     _DELAY_FREEZE_MIN_WARM,
+    _FIT_CACHE_HIGH_TOK,
+    _FIT_CACHE_MAX_IN_TOK,
+    _FIT_CACHE_MIN_HIGH_STEPS,
+    _FIT_CACHE_MIN_SPREAD,
+    _FIT_CACHE_MIN_STEPS,
+    _FIT_MAX_HIGH_CACHE_STEPS,
+    _FIT_MAX_HIGH_PREFILL_STEPS,
+    _FIT_MAX_ORIGIN_STEPS,
     _FIT_MAX_RECENT_STEPS,
+    _FIT_ORIGIN_MAX_CACHE_TOK,
+    _FIT_ORIGIN_MAX_IN_TOK,
+    _FIT_PREFILL_HIGH_TOK,
+    _FIT_PREFILL_MIN_HIGH_STEPS,
+    _FIT_PREFILL_MIN_SPREAD,
+    _FIT_PREFILL_MIN_STEPS,
     _ROLLUP_SCHEMA_VERSION,
     _is_unattributed_model,
     _parse_iso_epoch,
@@ -40,7 +54,9 @@ _ROLLUP_AGG_COLS_SQL = """
     COALESCE(SUM(compaction_event), 0),
     COALESCE(SUM(wasted_s), 0.0),
     COALESCE(SUM(is_retry), 0),
-    COALESCE(SUM(is_failed_turn), 0)
+    COALESCE(SUM(is_failed_turn), 0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND cold_cache_spike = 1 AND est_delay_s IS NOT NULL THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN is_step = 1 AND cold_cache_spike = 1 AND est_delay_s IS NOT NULL THEN est_delay_s ELSE 0.0 END), 0.0)
 """
 
 
@@ -77,10 +93,8 @@ class MetricsStore:
         self.state_dir = state_dir
         self.closed = False
         self.wal_write_count = 0
-        self.synced_delay_sig: dict[str, tuple[int, float, float]] = {}
-        self.global_fit_cache: dict[
-            str, tuple[tuple[tuple[int, float, str], ...], dict[str, Any]]
-        ] = {}
+        self.synced_delay_sig: dict[str, tuple[Any, ...]] = {}
+        self.global_fit_cache: dict[str, tuple[Any, dict[str, Any]]] = {}
         self.db: sqlite3.Connection = self.init_rollup_db()
 
     def close(self) -> None:
@@ -164,6 +178,8 @@ class MetricsStore:
                 wasted_time_s REAL NOT NULL,
                 retry_steps_count INT NOT NULL,
                 failed_turns_count INT NOT NULL,
+                cold_delay_steps_count INT NOT NULL,
+                est_cold_delay_s REAL NOT NULL,
                 PRIMARY KEY (conv_id, model_name)
             ) WITHOUT ROWID;
 
@@ -192,6 +208,8 @@ class MetricsStore:
                 wasted_time_s REAL NOT NULL,
                 retry_steps_count INT NOT NULL,
                 failed_turns_count INT NOT NULL,
+                cold_delay_steps_count INT NOT NULL,
+                est_cold_delay_s REAL NOT NULL,
                 PRIMARY KEY (hour_epoch, conv_id, model_name)
             ) WITHOUT ROWID;
 
@@ -246,7 +264,6 @@ class MetricsStore:
                 ON step_lite(model_name, conv_id, ordinal)
                 WHERE delay_finalized = 0
                   AND is_checkpoint = 0
-                  AND cold_cache_spike = 0
                   AND duration_s IS NOT NULL
                   AND duration_s > 0
                   AND output_tokens > 0;
@@ -552,10 +569,11 @@ class MetricsStore:
                         conv_meta_params,
                     )
             else:
-                prev_delays: dict[tuple[int, str, int, float], tuple[float, int]] = {}
+                prev_delays: dict[tuple[int, str, int, int, int, float], tuple[float, int]] = {}
                 for row in self.db.execute(
                     """
-                    SELECT ordinal, model_name, output_tokens, duration_s, est_delay_s, delay_finalized
+                    SELECT ordinal, model_name, input_tokens, cache_read_tokens,
+                           output_tokens, duration_s, est_delay_s, delay_finalized
                     FROM step_lite
                     WHERE conv_id = ? AND est_delay_s IS NOT NULL AND duration_s IS NOT NULL
                     """,
@@ -566,27 +584,36 @@ class MetricsStore:
                             _safe_int(row[0]),
                             str(row[1]),
                             _safe_int(row[2]),
-                            round(float(row[3]), 6),
+                            _safe_int(row[3]),
+                            _safe_int(row[4]),
+                            round(float(row[5]), 6),
                         )
-                    ] = (float(row[4]), _safe_int(row[5]))
+                    ] = (float(row[6]), _safe_int(row[7]))
 
                 step_rows: list[tuple[Any, ...]] = []
                 for row in core_rows:
                     is_ckpt = row[6]
+                    in_tok = row[7]
+                    cache_tok = row[8]
                     out_tok = row[9]
                     dur_s = row[12]
-                    cold = row[15]
                     saved_delay: float | None = None
                     saved_fin = 0
                     if (
                         not is_ckpt
-                        and not cold
                         and dur_s is not None
                         and dur_s > 0.0
                         and out_tok > 0
                     ):
                         prev = prev_delays.get(
-                            (row[1], row[5], out_tok, round(float(dur_s), 6))
+                            (
+                                row[1],
+                                row[5],
+                                in_tok,
+                                cache_tok,
+                                out_tok,
+                                round(float(dur_s), 6),
+                            )
                         )
                         if prev is not None:
                             saved_delay, saved_fin = prev
@@ -640,7 +667,7 @@ class MetricsStore:
         model_name: str,
         on_fit_computed: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        """Compute global roofline per model over recent <=100 warm steps & sync delays."""
+        """Compute global staged 3-speed roofline per model & sync step delays."""
         cnt_row = self.db.execute(
             """
             SELECT COALESCE(SUM(warm_timed_steps_count), 0),
@@ -658,90 +685,325 @@ class MetricsStore:
                 "available": False,
                 "reason": "unattributed",
                 "warm_count": g_warm,
+                "cold_count": g_cold,
                 "used_count": 0,
                 "token_spread": 0,
                 "quantile_pct": None,
                 "inferred_ttft_s": None,
+                "inferred_base_s": None,
                 "inferred_decode_tps": None,
                 "slope_s_per_tok": None,
                 "avg_delay_s": None,
                 "median_delay_s": None,
                 "cold_excluded_count": g_cold,
+                "prefill_available": False,
+                "prefill_reason": "unattributed",
+                "inferred_prefill_tps": None,
+                "prefill_slope_s_per_tok": None,
+                "prefill_quantile_pct": None,
+                "prefill_spread": 0,
+                "high_prefill_count": 0,
+                "cache_available": False,
+                "cache_reason": "unattributed",
+                "inferred_cache_tps": None,
+                "cache_slope_s_per_tok": None,
+                "cache_quantile_pct": None,
+                "cache_spread": 0,
+                "high_cache_count": 0,
             }
 
-        warm_rows_desc = self.db.execute(
+        elig_row = self.db.execute(
             """
-            SELECT output_tokens, duration_s, duration_source
+            SELECT COUNT(*),
+                   COALESCE(MIN(input_tokens), 0),
+                   COALESCE(MAX(input_tokens), 0),
+                   COALESCE(SUM(CASE WHEN input_tokens >= ? THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN input_tokens < ? THEN 1 ELSE 0 END), 0),
+                   COALESCE(MIN(CASE WHEN input_tokens < ? THEN cache_read_tokens END), 0),
+                   COALESCE(MAX(CASE WHEN input_tokens < ? THEN cache_read_tokens END), 0),
+                   COALESCE(SUM(CASE WHEN input_tokens < ? AND cache_read_tokens >= ? THEN 1 ELSE 0 END), 0)
             FROM step_lite
             WHERE model_name = ?
               AND is_checkpoint = 0
-              AND cold_cache_spike = 0
               AND duration_s IS NOT NULL
               AND duration_s > 0
               AND output_tokens > 0
+            """,
+            (
+                _FIT_PREFILL_HIGH_TOK,
+                _FIT_CACHE_MAX_IN_TOK,
+                _FIT_CACHE_MAX_IN_TOK,
+                _FIT_CACHE_MAX_IN_TOK,
+                _FIT_CACHE_MAX_IN_TOK,
+                _FIT_CACHE_HIGH_TOK,
+                model_name,
+            ),
+        ).fetchone()
+        g_all = int(elig_row[0] or 0) if elig_row else 0
+        g_p_spread = (
+            max(0, int(elig_row[2] or 0) - int(elig_row[1] or 0))
+            if (elig_row and g_all > 0)
+            else 0
+        )
+        g_hi_p = int(elig_row[3] or 0) if elig_row else 0
+        g_low_p_cnt = int(elig_row[4] or 0) if elig_row else 0
+        g_c_spread = (
+            max(0, int(elig_row[6] or 0) - int(elig_row[5] or 0))
+            if (elig_row and g_low_p_cnt > 0)
+            else 0
+        )
+        g_hi_c = int(elig_row[7] or 0) if elig_row else 0
+
+        cac_cand_ok = (
+            g_low_p_cnt >= _FIT_CACHE_MIN_STEPS
+            and g_c_spread >= _FIT_CACHE_MIN_SPREAD
+            and g_hi_c >= _FIT_CACHE_MIN_HIGH_STEPS
+        )
+        pre_cand_ok = (
+            g_all >= _FIT_PREFILL_MIN_STEPS
+            and g_p_spread >= _FIT_PREFILL_MIN_SPREAD
+            and g_hi_p >= _FIT_PREFILL_MIN_HIGH_STEPS
+        )
+
+        q_timed = """
+            SELECT conv_id, ordinal, epoch_s, input_tokens, cache_read_tokens,
+                   output_tokens, duration_s, duration_source, cold_cache_spike
+            FROM step_lite
+            WHERE model_name = ?
+              AND is_checkpoint = 0
+              AND duration_s IS NOT NULL
+              AND duration_s > 0
+              AND output_tokens > 0
+        """
+        warm_rows_desc = self.db.execute(
+            q_timed
+            + """
+              AND cold_cache_spike = 0
             ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
             LIMIT ?
             """,
             (model_name, _FIT_MAX_RECENT_STEPS),
         ).fetchall()
         warm_key = tuple(
-            (int(r[0]), float(r[1]), str(r[2] or ""))
+            (
+                int(r[3]),
+                int(r[4]),
+                int(r[5]),
+                float(r[6]),
+                str(r[7] or ""),
+                int(r[8]),
+            )
             for r in reversed(warm_rows_desc)
         )
 
+        all_points_arg: tuple[tuple[int, int, int, float, str, int], ...] | None = None
+        if not (cac_cand_ok or pre_cand_ok):
+            cache_key: Any = warm_key
+        else:
+            r_orig = self.db.execute(
+                q_timed
+                + """
+                  AND input_tokens < ?
+                  AND cache_read_tokens < ?
+                ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                LIMIT ?
+                """,
+                (
+                    model_name,
+                    _FIT_ORIGIN_MAX_IN_TOK,
+                    _FIT_ORIGIN_MAX_CACHE_TOK,
+                    _FIT_MAX_ORIGIN_STEPS,
+                ),
+            ).fetchall()
+            r_hic = self.db.execute(
+                q_timed
+                + """
+                  AND input_tokens < ?
+                  AND cache_read_tokens >= ?
+                ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                LIMIT ?
+                """,
+                (
+                    model_name,
+                    _FIT_CACHE_MAX_IN_TOK,
+                    _FIT_CACHE_HIGH_TOK,
+                    _FIT_MAX_HIGH_CACHE_STEPS,
+                ),
+            ).fetchall()
+            r_hip = self.db.execute(
+                q_timed
+                + """
+                  AND input_tokens >= ?
+                ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                LIMIT ?
+                """,
+                (model_name, _FIT_PREFILL_HIGH_TOK, _FIT_MAX_HIGH_PREFILL_STEPS),
+            ).fetchall()
+            dedup: dict[tuple[str, int], tuple[Any, ...]] = {}
+            for r in (*warm_rows_desc, *r_orig, *r_hic, *r_hip):
+                dedup[(str(r[0]), int(r[1]))] = r
+            ordered = sorted(
+                dedup.values(),
+                key=lambda r: (float(r[2]), str(r[0]), int(r[1])),
+            )
+            all_points_arg = tuple(
+                (
+                    int(r[3]),
+                    int(r[4]),
+                    int(r[5]),
+                    float(r[6]),
+                    str(r[7] or ""),
+                    int(r[8]),
+                )
+                for r in ordered
+            )
+            cache_key = (warm_key, all_points_arg)
+
         cached = self.global_fit_cache.get(model_name)
-        if cached is not None and cached[0] == warm_key:
+        if cached is not None and cached[0] == cache_key:
             base_fit = cached[1]
         else:
             if on_fit_computed is not None:
                 on_fit_computed()
-            base_fit = compute_roofline_fit(warm_key)
-            self.global_fit_cache[model_name] = (warm_key, base_fit)
+            base_fit = compute_roofline_fit(warm_key, all_points=all_points_arg)
+            self.global_fit_cache[model_name] = (cache_key, base_fit)
+
+        pre_avail = bool(base_fit.get("prefill_available"))
+        if not pre_cand_ok:
+            if g_all < _FIT_PREFILL_MIN_STEPS:
+                g_pre_reason = "min_steps"
+            elif g_p_spread < _FIT_PREFILL_MIN_SPREAD:
+                g_pre_reason = "min_spread"
+            else:
+                g_pre_reason = "min_high_steps"
+        else:
+            g_pre_reason = str(base_fit.get("prefill_reason") or "ok")
+
+        if not cac_cand_ok:
+            if g_low_p_cnt < _FIT_CACHE_MIN_STEPS:
+                g_cac_reason = "min_steps"
+            elif g_c_spread < _FIT_CACHE_MIN_SPREAD:
+                g_cac_reason = "min_spread"
+            else:
+                g_cac_reason = "min_high_steps"
+        else:
+            g_cac_reason = str(base_fit.get("cache_reason") or "ok")
 
         fit: dict[str, Any] = {
             **base_fit,
             "warm_count": g_warm,
-            "cold_excluded_count": g_cold,
+            "cold_count": g_cold,
+            "cold_excluded_count": 0 if pre_avail else g_cold,
+            "prefill_reason": g_pre_reason,
+            "prefill_spread": g_p_spread,
+            "high_prefill_count": g_hi_p,
+            "cache_reason": g_cac_reason,
+            "cache_spread": g_c_spread,
+            "high_cache_count": g_hi_c,
         }
         if fit["available"]:
             b_val = float(fit["inferred_ttft_s"])
-            s_val = float(fit["slope_s_per_tok"])
-            sig = (g_warm, b_val, s_val)
+            s_dec_val = float(fit["slope_s_per_tok"])
+            s_pre_val = float(fit.get("prefill_slope_s_per_tok") or 0.0)
+            s_cac_val = float(fit.get("cache_slope_s_per_tok") or 0.0)
+            sig = (
+                g_warm,
+                g_cold if pre_avail else 0,
+                b_val,
+                s_dec_val,
+                s_pre_val,
+                s_cac_val,
+                pre_avail,
+            )
             if self.synced_delay_sig.get(model_name) != sig:
-                affected_rows = self.db.execute(
-                    """
-                    SELECT DISTINCT conv_id
-                    FROM step_lite
-                    WHERE model_name = ?
-                      AND delay_finalized = 0
-                      AND is_checkpoint = 0
-                      AND cold_cache_spike = 0
-                      AND duration_s IS NOT NULL
-                      AND duration_s > 0
-                      AND output_tokens > 0
-                    """,
-                    (model_name,),
-                ).fetchall()
-                if affected_rows:
-                    affected_cids = [str(r[0]) for r in affected_rows]
-                    new_fin = 1 if g_warm >= _DELAY_FREEZE_MIN_WARM else 0
-                    with self.db:
-                        self.db.execute(
-                            """
-                            UPDATE step_lite
-                            SET est_delay_s = ROUND(MAX(0.0, duration_s - (? + ? * output_tokens)), 2),
-                                delay_finalized = ?
-                            WHERE model_name = ?
-                              AND delay_finalized = 0
-                              AND is_checkpoint = 0
-                              AND cold_cache_spike = 0
-                              AND duration_s IS NOT NULL
-                              AND duration_s > 0
-                              AND output_tokens > 0
-                            """,
-                            (b_val, s_val, new_fin, model_name),
+                if pre_avail:
+                    affected_rows = self.db.execute(
+                        """
+                        SELECT DISTINCT conv_id
+                        FROM step_lite
+                        WHERE model_name = ?
+                          AND delay_finalized = 0
+                          AND is_checkpoint = 0
+                          AND duration_s IS NOT NULL
+                          AND duration_s > 0
+                          AND output_tokens > 0
+                        """,
+                        (model_name,),
+                    ).fetchall()
+                    if affected_rows:
+                        affected_cids = [str(r[0]) for r in affected_rows]
+                        warm_fin = 1 if g_warm >= _DELAY_FREEZE_MIN_WARM else 0
+                        cold_fin = (
+                            1
+                            if (g_warm >= _DELAY_FREEZE_MIN_WARM and g_hi_p >= 10)
+                            else 0
                         )
-                        self.refresh_conv_rollup_tables(affected_cids)
+                        with self.db:
+                            self.db.execute(
+                                """
+                                UPDATE step_lite
+                                SET est_delay_s = ROUND(MAX(0.0, duration_s - (? + ? * input_tokens + ? * cache_read_tokens + ? * output_tokens)), 2),
+                                    delay_finalized = (CASE WHEN cold_cache_spike = 1 THEN ? ELSE ? END)
+                                WHERE model_name = ?
+                                  AND delay_finalized = 0
+                                  AND is_checkpoint = 0
+                                  AND duration_s IS NOT NULL
+                                  AND duration_s > 0
+                                  AND output_tokens > 0
+                                """,
+                                (
+                                    b_val,
+                                    s_pre_val,
+                                    s_cac_val,
+                                    s_dec_val,
+                                    cold_fin,
+                                    warm_fin,
+                                    model_name,
+                                ),
+                            )
+                            self.refresh_conv_rollup_tables(affected_cids)
+                else:
+                    affected_rows = self.db.execute(
+                        """
+                        SELECT DISTINCT conv_id
+                        FROM step_lite
+                        WHERE model_name = ?
+                          AND delay_finalized = 0
+                          AND is_checkpoint = 0
+                          AND cold_cache_spike = 0
+                          AND duration_s IS NOT NULL
+                          AND duration_s > 0
+                          AND output_tokens > 0
+                        """,
+                        (model_name,),
+                    ).fetchall()
+                    if affected_rows:
+                        affected_cids = [str(r[0]) for r in affected_rows]
+                        new_fin = 1 if g_warm >= _DELAY_FREEZE_MIN_WARM else 0
+                        with self.db:
+                            self.db.execute(
+                                """
+                                UPDATE step_lite
+                                SET est_delay_s = ROUND(MAX(0.0, duration_s - (? + ? * input_tokens + ? * cache_read_tokens + ? * output_tokens)), 2),
+                                    delay_finalized = ?
+                                WHERE model_name = ?
+                                  AND delay_finalized = 0
+                                  AND is_checkpoint = 0
+                                  AND cold_cache_spike = 0
+                                  AND duration_s IS NOT NULL
+                                  AND duration_s > 0
+                                  AND output_tokens > 0
+                                """,
+                                (
+                                    b_val,
+                                    s_pre_val,
+                                    s_cac_val,
+                                    s_dec_val,
+                                    new_fin,
+                                    model_name,
+                                ),
+                            )
+                            self.refresh_conv_rollup_tables(affected_cids)
                 self.synced_delay_sig[model_name] = sig
 
         return fit
@@ -894,7 +1156,8 @@ class MetricsStore:
                            SUM(warm_timed_steps_count), SUM(cold_excluded_count),
                            SUM(est_delay_steps_count), SUM(est_total_delay_s),
                            SUM(compacted_events_count),
-                           SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+                           SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count),
+                           SUM(cold_delay_steps_count), SUM(est_cold_delay_s)
                     FROM conv_model_totals
                     GROUP BY model_name
                     """
@@ -913,7 +1176,8 @@ class MetricsStore:
                        SUM(warm_timed_steps_count), SUM(cold_excluded_count),
                        SUM(est_delay_steps_count), SUM(est_total_delay_s),
                        SUM(compacted_events_count),
-                       SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+                       SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count),
+                       SUM(cold_delay_steps_count), SUM(est_cold_delay_s)
                 FROM conv_model_totals
                 WHERE conv_id IN ({placeholders})
                 GROUP BY model_name
@@ -942,7 +1206,8 @@ class MetricsStore:
                        SUM(warm_timed_steps_count), SUM(cold_excluded_count),
                        SUM(est_delay_steps_count), SUM(est_total_delay_s),
                        SUM(compacted_events_count),
-                       SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+                       SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count),
+                       SUM(cold_delay_steps_count), SUM(est_cold_delay_s)
                 FROM (
                     SELECT model_name, steps_count, compaction_steps_count,
                            input_tokens, cache_read_tokens,
@@ -953,7 +1218,8 @@ class MetricsStore:
                            warm_timed_steps_count, cold_excluded_count,
                            est_delay_steps_count, est_total_delay_s,
                            compacted_events_count,
-                           wasted_time_s, retry_steps_count, failed_turns_count
+                           wasted_time_s, retry_steps_count, failed_turns_count,
+                           cold_delay_steps_count, est_cold_delay_s
                     FROM hour_model_totals
                     WHERE hour_epoch >= ?
                     UNION ALL
@@ -1003,7 +1269,8 @@ class MetricsStore:
                    SUM(warm_timed_steps_count), SUM(cold_excluded_count),
                    SUM(est_delay_steps_count), SUM(est_total_delay_s),
                    SUM(compacted_events_count),
-                   SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count)
+                   SUM(wasted_time_s), SUM(retry_steps_count), SUM(failed_turns_count),
+                   SUM(cold_delay_steps_count), SUM(est_cold_delay_s)
             FROM (
                 SELECT model_name, steps_count, compaction_steps_count,
                        input_tokens, cache_read_tokens,
@@ -1014,7 +1281,8 @@ class MetricsStore:
                        warm_timed_steps_count, cold_excluded_count,
                        est_delay_steps_count, est_total_delay_s,
                        compacted_events_count,
-                       wasted_time_s, retry_steps_count, failed_turns_count
+                       wasted_time_s, retry_steps_count, failed_turns_count,
+                       cold_delay_steps_count, est_cold_delay_s
                 FROM hour_model_totals
                 WHERE conv_id IN ({placeholders}) AND hour_epoch >= ?
                 UNION ALL

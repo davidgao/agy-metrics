@@ -1456,6 +1456,258 @@ class TestRooflineAndTiming(unittest.TestCase):
                 finally:
                     eng2.close()
 
+    def test_three_term_prefill_and_cache_roofline_peeling_and_cold_delays(self) -> None:
+        """Progressive decode -> cache recovery -> true prefill unlocking with cold-step delay backfill."""
+        t0_ep = datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+
+        def _iso(ep: float) -> str:
+            return datetime.fromtimestamp(ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            state = root / "state"
+            cid = "conv-3term-roofline"
+            tr_path = brain / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+            hk_path = state / "conversations" / f"{cid}.hooks.jsonl"
+
+            tr_recs: list[dict] = [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": _iso(t0_ep),
+                    "content": (
+                        "<USER_REQUEST>\nThree-term roofline test\n</USER_REQUEST>\n"
+                        "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Model ThreeTerm. No need to comment.\n</USER_SETTINGS_CHANGE>"
+                    ),
+                }
+            ]
+            hk_recs: list[dict] = []
+            idx = 1
+            cur = t0_ep + 2.0
+
+            def add_step(in_tok: int, cac_tok: int, out_tok: int, dur_s: float) -> None:
+                nonlocal idx, cur
+                tr_recs.append(
+                    {
+                        "step_index": idx,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": _iso(cur),
+                        "input_tokens": in_tok,
+                        "cache_read_tokens": cac_tok,
+                        "output_tokens": out_tok,
+                        "thinking": "",
+                        "content": f"Step {idx}",
+                        "tool_calls": [],
+                    }
+                )
+                hk_recs.extend(
+                    [
+                        {"ts_ms": int(cur * 1000), "event": "PreInvocation", "conversation_id": cid},
+                        {"ts_ms": int((cur + dur_s) * 1000), "event": "PostInvocation", "conversation_id": cid},
+                    ]
+                )
+                idx += 1
+                cur += dur_s + 2.0
+
+            # Ground truth: base=1.0s, decode=200 tok/s (5ms/tok), cache=100k tok/s (10us/tok), prefill=20k tok/s (50us/tok)
+            def gt_dur(in_tok: int, cac_tok: int, out_tok: int, delay: float = 0.0) -> float:
+                return round(1.0 + in_tok / 20000.0 + cac_tok / 100000.0 + out_tok / 200.0 + delay, 2)
+
+            # Phase 1: 6 warm steps + 2 cold spikes -> only decode available, cold steps excluded from est_delay_s
+            for out_tok, dly in ((200, 0.0), (500, 0.1), (900, 0.0), (1400, 0.2), (2000, 0.0), (1100, 0.4)):
+                add_step(1000, 5000, out_tok, gt_dur(1000, 5000, out_tok, dly))
+            add_step(80000, 0, 300, gt_dur(80000, 0, 300, 0.5))
+            add_step(90000, 0, 400, gt_dur(90000, 0, 400, 0.2))
+
+            write_jsonl(tr_path, tr_recs)
+            write_jsonl(hk_path, hk_recs)
+
+            eng = MetricsEngine(brain_dir=brain, state_dir=state)
+            try:
+                m1 = eng.get_metrics(cid)
+                fit1 = m1["by_model"][0]["latency_fit"]
+                self.assertTrue(fit1["available"])
+                self.assertFalse(fit1["cache_available"])
+                self.assertFalse(fit1["prefill_available"])
+                self.assertEqual(fit1["cold_excluded_count"], 2)
+                self.assertIsNone(m1["steps"][6]["est_delay_s"])
+                self.assertIsNone(m1["steps"][7]["est_delay_s"])
+                self.assertIsNone(m1["totals"]["est_cold_delay_s"])
+                self.assertEqual(m1["totals"]["cold_delay_steps_count"], 0)
+
+                # Phase 2: Add low-P cache spread (including two fast-decode 15k-output points to test w_clean)
+                tr_recs_p2: list[dict] = []
+                hk_recs_p2: list[dict] = []
+                phase2_specs = [
+                    (1200, 15000, 200, 0.0),
+                    (1200, 30000, 250, 0.1),
+                    (1200, 50000, 180, 0.0),
+                    (1200, 90000, 220, 0.0),
+                    (1200, 120000, 300, 0.2),
+                    (1200, 160000, 240, 0.0),
+                    (1200, 190000, 200, 0.0),
+                    (1200, 220000, 260, 0.1),
+                    (1200, 140000, 210, 1.5),
+                    (1200, 180000, 280, 2.0),
+                ]
+                for in_tok, cac_tok, out_tok, dly in phase2_specs:
+                    dur_s = gt_dur(in_tok, cac_tok, out_tok, dly)
+                    tr_recs_p2.append(
+                        {
+                            "step_index": idx,
+                            "type": "PLANNER_RESPONSE",
+                            "created_at": _iso(cur),
+                            "input_tokens": in_tok,
+                            "cache_read_tokens": cac_tok,
+                            "output_tokens": out_tok,
+                            "thinking": "",
+                            "content": f"P2 {idx}",
+                            "tool_calls": [],
+                        }
+                    )
+                    hk_recs_p2.extend(
+                        [
+                            {"ts_ms": int(cur * 1000), "event": "PreInvocation", "conversation_id": cid},
+                            {"ts_ms": int((cur + dur_s) * 1000), "event": "PostInvocation", "conversation_id": cid},
+                        ]
+                    )
+                    idx += 1
+                    cur += dur_s + 2.0
+
+                # Two long-output fast-decode steps (15k out at 225 tok/s -> negative R = -8.3s if unguarded)
+                for cac_tok in (100000, 150000):
+                    dur_s = round(1.0 + 1200 / 20000.0 + cac_tok / 100000.0 + 15000 / 225.0, 2)
+                    tr_recs_p2.append(
+                        {
+                            "step_index": idx,
+                            "type": "PLANNER_RESPONSE",
+                            "created_at": _iso(cur),
+                            "input_tokens": 1200,
+                            "cache_read_tokens": cac_tok,
+                            "output_tokens": 15000,
+                            "thinking": "",
+                            "content": f"FastOut {idx}",
+                            "tool_calls": [],
+                        }
+                    )
+                    hk_recs_p2.extend(
+                        [
+                            {"ts_ms": int(cur * 1000), "event": "PreInvocation", "conversation_id": cid},
+                            {"ts_ms": int((cur + dur_s) * 1000), "event": "PostInvocation", "conversation_id": cid},
+                        ]
+                    )
+                    idx += 1
+                    cur += dur_s + 2.0
+
+                with open(tr_path, "a", encoding="utf-8") as f:
+                    for rec in tr_recs_p2:
+                        f.write(json.dumps(rec) + "\n")
+                with open(hk_path, "a", encoding="utf-8") as f:
+                    for rec in hk_recs_p2:
+                        f.write(json.dumps(rec) + "\n")
+
+                m2 = eng.get_metrics(cid)
+                fit2 = m2["by_model"][0]["latency_fit"]
+                self.assertTrue(fit2["available"])
+                self.assertTrue(fit2["cache_available"])
+                self.assertFalse(fit2["prefill_available"])
+                self.assertGreaterEqual(fit2["inferred_cache_tps"], 65_000)
+                self.assertLessEqual(fit2["inferred_cache_tps"], 160_000)
+                self.assertGreaterEqual(fit2["inferred_decode_tps"], 175.0)
+                self.assertLessEqual(fit2["inferred_decode_tps"], 235.0)
+                self.assertEqual(fit2["cold_excluded_count"], 2)
+                self.assertIsNone(m2["steps"][6]["est_delay_s"])
+
+                # Phase 3: Add 6 more high-prefill steps -> unlocks prefill & backfills earlier cold steps
+                tr_recs_p3: list[dict] = []
+                hk_recs_p3: list[dict] = []
+                phase3_specs = [
+                    (40000, 0, 250, 0.0),
+                    (75000, 0, 300, 0.1),
+                    (120000, 0, 280, 0.0),
+                    (180000, 0, 350, 0.2),
+                    (240000, 0, 260, 0.0),
+                    (300000, 0, 400, 2.0),
+                ]
+                for in_tok, cac_tok, out_tok, dly in phase3_specs:
+                    dur_s = gt_dur(in_tok, cac_tok, out_tok, dly)
+                    tr_recs_p3.append(
+                        {
+                            "step_index": idx,
+                            "type": "PLANNER_RESPONSE",
+                            "created_at": _iso(cur),
+                            "input_tokens": in_tok,
+                            "cache_read_tokens": cac_tok,
+                            "output_tokens": out_tok,
+                            "thinking": "",
+                            "content": f"P3 {idx}",
+                            "tool_calls": [],
+                        }
+                    )
+                    hk_recs_p3.extend(
+                        [
+                            {"ts_ms": int(cur * 1000), "event": "PreInvocation", "conversation_id": cid},
+                            {"ts_ms": int((cur + dur_s) * 1000), "event": "PostInvocation", "conversation_id": cid},
+                        ]
+                    )
+                    idx += 1
+                    cur += dur_s + 2.0
+
+                with open(tr_path, "a", encoding="utf-8") as f:
+                    for rec in tr_recs_p3:
+                        f.write(json.dumps(rec) + "\n")
+                with open(hk_path, "a", encoding="utf-8") as f:
+                    for rec in hk_recs_p3:
+                        f.write(json.dumps(rec) + "\n")
+
+                m3 = eng.get_metrics(cid)
+                fit3 = m3["by_model"][0]["latency_fit"]
+                self.assertTrue(fit3["available"])
+                self.assertTrue(fit3["cache_available"])
+                self.assertTrue(fit3["prefill_available"])
+                self.assertEqual(fit3["cold_excluded_count"], 0)
+                self.assertEqual(fit3["cold_count"], 8)
+                self.assertGreaterEqual(fit3["inferred_ttft_s"], 0.6)
+                self.assertLessEqual(fit3["inferred_ttft_s"], 1.5)
+                self.assertGreaterEqual(fit3["inferred_decode_tps"], 175.0)
+                self.assertLessEqual(fit3["inferred_decode_tps"], 235.0)
+                self.assertGreaterEqual(fit3["inferred_cache_tps"], 65_000)
+                self.assertLessEqual(fit3["inferred_cache_tps"], 160_000)
+                self.assertGreaterEqual(fit3["inferred_prefill_tps"], 15_000)
+                self.assertLessEqual(fit3["inferred_prefill_tps"], 26_000)
+
+                # Earlier cold steps (ordinal 7, 8 -> indices 6, 7) are now backfilled with est_delay_s
+                self.assertIsNotNone(m3["steps"][6]["est_delay_s"])
+                self.assertIsNotNone(m3["steps"][7]["est_delay_s"])
+                self.assertLessEqual(abs(m3["steps"][6]["est_delay_s"] - 0.5), 0.7)
+                self.assertLessEqual(abs(m3["steps"][7]["est_delay_s"] - 0.2), 0.7)
+
+                tot3 = m3["totals"]
+                self.assertEqual(tot3["cold_delay_steps_count"], 8)
+                self.assertIsNotNone(tot3["est_cold_delay_s"])
+                self.assertGreater(tot3["est_cold_delay_s"], 1.5)
+                self.assertAlmostEqual(
+                    tot3["est_total_delay_s"],
+                    round((tot3["est_warm_delay_s"] or 0.0) + (tot3["est_cold_delay_s"] or 0.0) + tot3["wasted_time_s"], 2),
+                    places=2,
+                )
+
+                # Aggregate All-Conversations view matches fit, cold delay totals, and scatter_steps fields
+                mall = eng.get_metrics(ALL_CONVERSATIONS_ID)
+                bm_all = mall["by_model"][0]
+                self.assertEqual(bm_all["latency_fit"]["inferred_prefill_tps"], fit3["inferred_prefill_tps"])
+                self.assertEqual(bm_all["latency_fit"]["inferred_cache_tps"], fit3["inferred_cache_tps"])
+                self.assertEqual(mall["totals"]["cold_delay_steps_count"], 8)
+                self.assertAlmostEqual(mall["totals"]["est_cold_delay_s"], tot3["est_cold_delay_s"], places=2)
+                self.assertAlmostEqual(mall["totals"]["est_total_delay_s"], tot3["est_total_delay_s"], places=2)
+                self.assertGreater(len(bm_all["scatter_steps"]), 0)
+                for ss in bm_all["scatter_steps"]:
+                    self.assertIn("input_tokens", ss)
+                    self.assertIn("cache_read_tokens", ss)
+            finally:
+                eng.close()
+
 
 if __name__ == "__main__":
     unittest.main()

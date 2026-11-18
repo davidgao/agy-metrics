@@ -76,8 +76,8 @@
               <th title="Gross input tokens (Uncached + Cached) and KV-cache hit percentage — hover cells for exact uncached / cached split">Input (Hit%)</th>
               <th title="Total output tokens and estimated thinking tokens">Output (~Think)</th>
               <th title="Total model wait time (completed inference + retry/failed wait) and cumulative estimated delay (warm serving/prefill variance + retry/failed wait; system compaction calls excluded)">Time (~Delay)</th>
-              <th title="Inferred uncongested nominal decode throughput ceiling (P95 speed roofline, tok/s)">~Nom. TPS</th>
-              <th title="Inferred uncongested warm Time to First Token and average (mean) per-step excess delay beyond the roofline — hover cells for P50 median">~TTFT (+Delay)</th>
+              <th title="Inferred uncongested nominal decode throughput ceiling (P95 speed roofline, tok/s) — hover cells for prefill &amp; cache recovery speeds">~Dec. TPS</th>
+              <th title="Inferred uncongested base latency floor (or warm TTFT before prefill/cache speeds unlock) and average per-step excess delay beyond the roofline — hover cells for P50 median">~Base (+Delay)</th>
             </tr>
           </thead>
           <tbody id="byModelTbody"></tbody>
@@ -89,6 +89,11 @@
       <div class="section-head">
         <span class="section-title" id="scatterTitle">Output vs. Time</span>
         <div class="status-row">
+          <div class="mode-toggle" id="scatterModeToggle" role="group" aria-label="Speed Roofline Axis">
+            <button type="button" class="mode-btn active" data-scatter-mode="decode" aria-pressed="true">Decode</button>
+            <button type="button" class="mode-btn" data-scatter-mode="prefill" aria-pressed="false">Prefill</button>
+            <button type="button" class="mode-btn" data-scatter-mode="cache" aria-pressed="false">Cache</button>
+          </div>
           <button type="button" class="filter-pill" id="coldToggleBtn" style="display:none"></button>
           <button type="button" class="filter-pill" id="scatterCloseBtn" title="Clear model filter and hide latency fit chart">✕ All models</button>
         </div>

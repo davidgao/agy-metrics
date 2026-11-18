@@ -357,8 +357,8 @@ class TestStorageAndLifecycle(unittest.TestCase):
             finally:
                 eng1.close()
 
-            # 2. Legacy v3, v4, v5 & v6 SQLite schemas upgrade cleanly to current version
-            for old_ver in (3, 4, 5, 6):
+            # 2. Legacy v3, v4, v5, v6 & v7 SQLite schemas upgrade cleanly to current version
+            for old_ver in (3, 4, 5, 6, 7):
                 db_path.unlink(missing_ok=True)
                 old_conn = sqlite3.connect(str(db_path))
                 old_conn.execute(f"PRAGMA user_version = {old_ver}")

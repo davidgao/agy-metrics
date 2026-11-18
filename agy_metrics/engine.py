@@ -21,6 +21,9 @@ from .models import (
     UNASSIGNED_PROJECT_NAME,
     VALID_WINDOWS,
     _FIT_MAX_RECENT_STEPS,
+    _FIT_ORIGIN_MAX_CACHE_TOK,
+    _FIT_ORIGIN_MAX_IN_TOK,
+    _FIT_PREFILL_HIGH_TOK,
     _LIVE_GENERATING_STALE_MS,
     _MAX_HYDRATED_CONVS,
     _SAFE_CONV_RE,
@@ -1098,6 +1101,8 @@ class MetricsEngine:
         total_warm_timed = 0
         total_est_delay_steps = 0
         total_est_delay_sum = 0.0
+        total_cold_delay_steps = 0
+        total_cold_delay_sum = 0.0
 
         for row in agg_rows:
             m_name = str(row[0])
@@ -1121,6 +1126,10 @@ class MetricsEngine:
             m_wasted_s = float(row[19] or 0.0)
             m_retry_steps = int(row[20] or 0)
             m_failed_turns = int(row[21] or 0)
+            m_cold_delay_count = int(row[22] or 0)
+            m_cold_delay_sum = float(row[23] or 0.0)
+            m_warm_delay_count = max(0, m_est_delay_count - m_cold_delay_count)
+            m_warm_delay_sum = max(0.0, m_delay_sum - m_cold_delay_sum)
 
             total_steps += m_steps
             total_comp_steps += m_comp_steps
@@ -1142,6 +1151,9 @@ class MetricsEngine:
             total_est_delay_steps += m_est_delay_count
             if m_est_delay_count > 0:
                 total_est_delay_sum += m_delay_sum
+            total_cold_delay_steps += m_cold_delay_count
+            if m_cold_delay_count > 0:
+                total_cold_delay_sum += m_cold_delay_sum
 
             m_gross_in = m_in + m_cache
             m_hit_pct = (
@@ -1154,9 +1166,14 @@ class MetricsEngine:
                 round(m_timed_out / m_inf_round, 1) if m_inf_round > 0.0 else None
             )
 
+            global_fit = global_fits.get(
+                m_name
+            ) or self._get_global_model_fit_and_sync_delays(m_name)
+
             scatter_rows_desc = self._db.execute(
                 f"""
-                SELECT conv_id, ordinal, step_index, output_tokens, duration_s,
+                SELECT conv_id, ordinal, step_index, epoch_s,
+                       input_tokens, cache_read_tokens, output_tokens, duration_s,
                        duration_source, cold_cache_spike, est_delay_s
                 FROM step_lite
                 WHERE model_name = ?
@@ -1170,22 +1187,99 @@ class MetricsEngine:
                 """,
                 (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
             ).fetchall()
+            if len(scatter_rows_desc) == _FIT_MAX_RECENT_STEPS and (
+                global_fit.get("prefill_available")
+                or global_fit.get("cache_available")
+            ):
+                anchor_hip = self._db.execute(
+                    f"""
+                    SELECT conv_id, ordinal, step_index, epoch_s,
+                           input_tokens, cache_read_tokens, output_tokens, duration_s,
+                           duration_source, cold_cache_spike, est_delay_s
+                    FROM step_lite
+                    WHERE model_name = ?
+                      AND is_checkpoint = 0
+                      AND duration_s IS NOT NULL
+                      AND duration_s > 0
+                      AND input_tokens >= ?
+                      {win_sql}
+                      {scope_sql}
+                    ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                    LIMIT 20
+                    """,
+                    (m_name, _FIT_PREFILL_HIGH_TOK, *win_args, *scope_args),
+                ).fetchall()
+                anchor_orig = self._db.execute(
+                    f"""
+                    SELECT conv_id, ordinal, step_index, epoch_s,
+                           input_tokens, cache_read_tokens, output_tokens, duration_s,
+                           duration_source, cold_cache_spike, est_delay_s
+                    FROM step_lite
+                    WHERE model_name = ?
+                      AND is_checkpoint = 0
+                      AND duration_s IS NOT NULL
+                      AND duration_s > 0
+                      AND input_tokens < ?
+                      AND cache_read_tokens < ?
+                      {win_sql}
+                      {scope_sql}
+                    ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                    LIMIT 15
+                    """,
+                    (
+                        m_name,
+                        _FIT_ORIGIN_MAX_IN_TOK,
+                        _FIT_ORIGIN_MAX_CACHE_TOK,
+                        *win_args,
+                        *scope_args,
+                    ),
+                ).fetchall()
+                selected_map: dict[tuple[str, int], tuple[Any, ...]] = {}
+                for ar in (*anchor_hip, *anchor_orig):
+                    selected_map[(str(ar[0]), int(ar[1]))] = ar
+                for sr in scatter_rows_desc:
+                    if len(selected_map) >= _FIT_MAX_RECENT_STEPS:
+                        break
+                    k = (str(sr[0]), int(sr[1]))
+                    if k not in selected_map:
+                        selected_map[k] = sr
+                scatter_rows = sorted(
+                    selected_map.values(),
+                    key=lambda r: (float(r[3]), str(r[0]), int(r[1])),
+                )
+            else:
+                scatter_rows = list(reversed(scatter_rows_desc))
+
             scatter_steps = []
-            win_warm_delays: list[float] = []
-            for seq_i, sr in enumerate(reversed(scatter_rows_desc), start=1):
-                s_cid, s_ord, s_idx, s_out, s_dur, s_src, s_cold, s_delay = sr
+            win_modeled_delays: list[float] = []
+            for seq_i, sr in enumerate(scatter_rows, start=1):
+                (
+                    s_cid,
+                    s_ord,
+                    s_idx,
+                    _s_ep,
+                    s_in,
+                    s_cac,
+                    s_out,
+                    s_dur,
+                    s_src,
+                    s_cold,
+                    s_delay,
+                ) = sr
                 c_obj = self._conversations.get(str(s_cid))
                 s_dur_f = float(s_dur)
                 s_out_i = int(s_out)
                 s_delay_f = round(float(s_delay), 2) if s_delay is not None else None
-                if not s_cold and s_out_i > 0 and s_delay_f is not None:
-                    win_warm_delays.append(s_delay_f)
+                if s_out_i > 0 and s_delay_f is not None:
+                    win_modeled_delays.append(s_delay_f)
                 scatter_steps.append(
                     {
                         "seq": seq_i,
                         "ordinal": int(s_ord),
                         "step_index": int(s_idx),
                         "model_name": m_name,
+                        "input_tokens": int(s_in),
+                        "cache_read_tokens": int(s_cac),
                         "output_tokens": s_out_i,
                         "duration_s": s_dur_f,
                         "duration_source": s_src,
@@ -1200,14 +1294,13 @@ class MetricsEngine:
                     }
                 )
 
-            if not win_warm_delays and m_est_delay_count > 0:
+            if not win_modeled_delays and m_est_delay_count > 0:
                 fb_rows = self._db.execute(
                     f"""
                     SELECT est_delay_s
                     FROM step_lite
                     WHERE model_name = ?
                       AND is_checkpoint = 0
-                      AND cold_cache_spike = 0
                       AND est_delay_s IS NOT NULL
                       {win_sql}
                       {scope_sql}
@@ -1216,7 +1309,7 @@ class MetricsEngine:
                     """,
                     (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
                 ).fetchall()
-                win_warm_delays = [round(float(r[0]), 2) for r in fb_rows]
+                win_modeled_delays = [round(float(r[0]), 2) for r in fb_rows]
 
             m_avg_delay_s: float | None = (
                 round(m_delay_sum / m_est_delay_count, 2)
@@ -1224,23 +1317,23 @@ class MetricsEngine:
                 else None
             )
 
-            global_fit = global_fits.get(
-                m_name
-            ) or self._get_global_model_fit_and_sync_delays(m_name)
             if global_fit["available"]:
-                pooled_sample_delays.extend(win_warm_delays)
+                pooled_sample_delays.extend(win_modeled_delays)
                 fit: dict[str, Any] = {
                     **global_fit,
                     "avg_delay_s": m_avg_delay_s,
-                    "median_delay_s": round(statistics.median(win_warm_delays), 2)
-                    if win_warm_delays
+                    "median_delay_s": round(statistics.median(win_modeled_delays), 2)
+                    if win_modeled_delays
                     else None,
                 }
             else:
                 fit = global_fit
 
             m_est_warm_delay: float | None = (
-                round(m_delay_sum, 2) if m_est_delay_count > 0 else None
+                round(m_warm_delay_sum, 2) if m_warm_delay_count > 0 else None
+            )
+            m_est_cold_delay: float | None = (
+                round(m_cold_delay_sum, 2) if m_cold_delay_count > 0 else None
             )
             m_est_total_delay: float | None = (
                 round(
@@ -1279,7 +1372,9 @@ class MetricsEngine:
                     "scatter_steps": scatter_steps,
                     "warm_timed_steps_count": m_warm_timed,
                     "est_delay_steps_count": m_est_delay_count,
+                    "cold_delay_steps_count": m_cold_delay_count,
                     "est_warm_delay_s": m_est_warm_delay,
+                    "est_cold_delay_s": m_est_cold_delay,
                     "est_total_delay_s": m_est_total_delay,
                     "avg_delay_s": m_avg_delay_s,
                     "steps_count": m_steps,
@@ -1321,8 +1416,13 @@ class MetricsEngine:
         inf_time_round = round(total_inf_time, 2)
         wasted_time_round = round(total_wasted_time, 2)
         model_time_round = round(total_inf_time + total_wasted_time, 2)
+        total_warm_delay_steps = max(0, total_est_delay_steps - total_cold_delay_steps)
+        total_warm_delay_sum = max(0.0, total_est_delay_sum - total_cold_delay_sum)
         est_warm_delay_tot = (
-            round(total_est_delay_sum, 2) if total_est_delay_steps > 0 else None
+            round(total_warm_delay_sum, 2) if total_warm_delay_steps > 0 else None
+        )
+        est_cold_delay_tot = (
+            round(total_cold_delay_sum, 2) if total_cold_delay_steps > 0 else None
         )
         est_total_delay_tot = (
             round(
@@ -1367,7 +1467,9 @@ class MetricsEngine:
                 "compacted_count": compacted_count,
                 "warm_timed_steps_count": total_warm_timed,
                 "est_delay_steps_count": total_est_delay_steps,
+                "cold_delay_steps_count": total_cold_delay_steps,
                 "est_warm_delay_s": est_warm_delay_tot,
+                "est_cold_delay_s": est_cold_delay_tot,
                 "est_total_delay_s": est_total_delay_tot,
                 "avg_delay_s": (
                     round(total_est_delay_sum / total_est_delay_steps, 2)
@@ -1688,9 +1790,10 @@ class MetricsEngine:
             ).fetchall()
         }
 
-        all_warm_delays: list[float] = []
+        all_modeled_delays: list[float] = []
         total_warm_timed = 0
         total_est_delay_count = 0
+        total_cold_delay_steps = 0
         by_model: list[dict[str, Any]] = []
         for m_name in model_order:
             m_steps = grouped_steps.get(m_name, [])
@@ -1698,6 +1801,7 @@ class MetricsEngine:
             m_ft_wasted = sum(ft.wasted_s for ft in m_failed)
             m_ft_count = len(m_failed)
             global_fit = global_fits[m_name]
+            pre_avail = bool(global_fit.get("prefill_available"))
             m_warm_timed = [
                 s
                 for s in m_steps
@@ -1708,7 +1812,7 @@ class MetricsEngine:
                 and s.output_tokens > 0
             ]
             total_warm_timed += len(m_warm_timed)
-            m_cold_excl = sum(
+            m_cold_timed_cnt = sum(
                 1
                 for s in m_steps
                 if s.step_kind != "checkpoint"
@@ -1717,9 +1821,29 @@ class MetricsEngine:
                 and s.duration_s > 0
                 and s.output_tokens > 0
             )
-            m_delays = [
+            m_cold_excl = 0 if pre_avail else m_cold_timed_cnt
+            m_modeled_timed = [
+                s
+                for s in m_steps
+                if s.step_kind != "checkpoint"
+                and (pre_avail or not s.cold_cache_spike)
+                and s.duration_s is not None
+                and s.duration_s > 0
+                and s.output_tokens > 0
+            ]
+            m_warm_delays = [
                 d
                 for s in m_warm_timed
+                if (d := step_delays.get(s.ordinal)) is not None
+            ]
+            m_cold_delays = [
+                d
+                for s in m_modeled_timed
+                if s.cold_cache_spike and (d := step_delays.get(s.ordinal)) is not None
+            ]
+            m_delays = [
+                d
+                for s in m_modeled_timed
                 if (d := step_delays.get(s.ordinal)) is not None
             ]
             m_agg = aggregate_steps(
@@ -1728,14 +1852,21 @@ class MetricsEngine:
                 failed_turns_count=m_ft_count,
             )
             m_wasted_round = float(m_agg["wasted_time_s"])
+            m_est_warm_delay: float | None = (
+                round(sum(m_warm_delays), 2) if m_warm_delays else None
+            )
+            m_est_cold_delay: float | None = (
+                round(sum(m_cold_delays), 2) if m_cold_delays else None
+            )
+            m_cold_delay_count = len(m_cold_delays)
+            total_cold_delay_steps += m_cold_delay_count
             if m_delays:
-                m_est_warm_delay: float | None = round(sum(m_delays), 2)
                 m_est_delay_count = len(m_delays)
                 m_avg_delay_s: float | None = round(
                     sum(m_delays) / m_est_delay_count, 2
                 )
                 total_est_delay_count += m_est_delay_count
-                all_warm_delays.extend(m_delays)
+                all_modeled_delays.extend(m_delays)
                 fit_for_conv: dict[str, Any] = {
                     **global_fit,
                     "cold_excluded_count": m_cold_excl,
@@ -1743,7 +1874,6 @@ class MetricsEngine:
                     "median_delay_s": round(statistics.median(m_delays), 2),
                 }
             else:
-                m_est_warm_delay = None
                 m_est_delay_count = 0
                 m_avg_delay_s = None
                 fit_for_conv = (
@@ -1758,7 +1888,7 @@ class MetricsEngine:
                 )
             if m_delays or m_wasted_round > 0.0:
                 m_est_total_delay: float | None = round(
-                    (m_est_warm_delay or 0.0) + m_wasted_round, 2
+                    (sum(m_delays) if m_delays else 0.0) + m_wasted_round, 2
                 )
             else:
                 m_est_total_delay = None
@@ -1788,7 +1918,9 @@ class MetricsEngine:
                     "latency_fit": fit_for_conv,
                     "warm_timed_steps_count": len(m_warm_timed),
                     "est_delay_steps_count": m_est_delay_count,
+                    "cold_delay_steps_count": m_cold_delay_count,
                     "est_warm_delay_s": m_est_warm_delay,
+                    "est_cold_delay_s": m_est_cold_delay,
                     "est_total_delay_s": m_est_total_delay,
                     "avg_delay_s": m_avg_delay_s,
                     "valuation": self._pricing.value_model_group(
@@ -1807,26 +1939,39 @@ class MetricsEngine:
             for bm in by_model
             if bm["est_warm_delay_s"] is not None
         ]
+        fitted_cold_delays = [
+            bm["est_cold_delay_s"]
+            for bm in by_model
+            if bm["est_cold_delay_s"] is not None
+        ]
         est_warm_delay_tot = (
-            round(sum(fitted_warm_delays), 2) if total_est_delay_count > 0 else None
+            round(sum(fitted_warm_delays), 2) if fitted_warm_delays else None
+        )
+        est_cold_delay_tot = (
+            round(sum(fitted_cold_delays), 2) if fitted_cold_delays else None
         )
         wasted_tot = float(totals["wasted_time_s"])
         totals["warm_timed_steps_count"] = total_warm_timed
         totals["est_delay_steps_count"] = total_est_delay_count
+        totals["cold_delay_steps_count"] = total_cold_delay_steps
         totals["est_warm_delay_s"] = est_warm_delay_tot
+        totals["est_cold_delay_s"] = est_cold_delay_tot
         totals["est_total_delay_s"] = (
-            round((est_warm_delay_tot or 0.0) + wasted_tot, 2)
+            round(
+                (est_warm_delay_tot or 0.0) + (est_cold_delay_tot or 0.0) + wasted_tot,
+                2,
+            )
             if (total_est_delay_count > 0 or wasted_tot > 0.0)
             else None
         )
         totals["avg_delay_s"] = (
-            round(sum(all_warm_delays) / len(all_warm_delays), 2)
-            if all_warm_delays
+            round(sum(all_modeled_delays) / len(all_modeled_delays), 2)
+            if all_modeled_delays
             else None
         )
         totals["median_delay_s"] = (
-            round(statistics.median(all_warm_delays), 2)
-            if all_warm_delays
+            round(statistics.median(all_modeled_delays), 2)
+            if all_modeled_delays
             else None
         )
 

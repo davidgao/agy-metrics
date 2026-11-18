@@ -40,6 +40,7 @@ export const state = {
   expandedStep: null,
   showAllSteps: false,
   showColdPrefills: false,
+  scatterMode: 'decode',
   lastScatterKey: null,
   lastHistoryKey: null,
   modelFilter: null,

@@ -7,6 +7,7 @@ import {
   renderValuationCard
 } from './charts.js';
 import {
+  computeStepRooflineParts,
   esc,
   fmtApproxDuration,
   fmtColdTimeNote,
@@ -305,26 +306,29 @@ function renderMetrics(m) {
     lastDelayEl.title = '';
   } else if (scopedLast.est_delay_s != null) {
     const combinedLastDelay = Number(scopedLast.est_delay_s) + lastRetryS;
-    lastDelayEl.textContent = '~' + combinedLastDelay.toFixed(2) + 's' + (lastRetryS > 0 ? ' (↻)' : '');
+    const lastTagParts = [];
+    if (scopedLast.cold_cache_spike) lastTagParts.push('❄');
+    if (lastRetryS > 0) lastTagParts.push('↻');
+    lastDelayEl.textContent = '~' + combinedLastDelay.toFixed(2) + 's' + (lastTagParts.length ? (' (' + lastTagParts.join(' ') + ')') : '');
     const retryPart = lastRetryS > 0
       ? (' (~' + Number(scopedLast.est_delay_s).toFixed(2) + 's roofline + ' + fmtDuration(lastRetryS) + fmtExactSecNote(lastRetryS) + ' retry wait)')
       : '';
-    if (lastFit && lastFit.available) {
-      const expectedLastS = Number(lastFit.inferred_ttft_s) + Number(lastFit.slope_s_per_tok) * scopedLast.output_tokens;
-      lastDelayEl.title = 'Actual ' + scopedLast.duration_s + 's vs ~' + expectedLastS.toFixed(2) + 's speed roofline' + retryPart;
+    const lastParts = computeStepRooflineParts(scopedLast, lastFit);
+    if (lastParts) {
+      lastDelayEl.title = 'Actual ' + scopedLast.duration_s + 's vs ~' + lastParts.expectedS.toFixed(2) + 's speed roofline (' + lastParts.partsText + ')' + retryPart;
     } else {
       lastDelayEl.title = 'Estimated excess latency above speed roofline' + retryPart;
     }
   } else if (lastRetryS > 0) {
     lastDelayEl.textContent = '+' + fmtDuration(lastRetryS) + ' (↻)';
     lastDelayEl.title = 'Retry wait before winning attempt: ' + fmtDuration(lastRetryS) + fmtExactSecNote(lastRetryS) +
-      (scopedLast.cold_cache_spike ? ' (❄ cold prefill; excluded from warm roofline)' : '');
+      (scopedLast.cold_cache_spike ? ' (❄ cold prefill; prefill roofline gated)' : '');
   } else if (scopedLast.step_kind === 'checkpoint') {
     lastDelayEl.textContent = '—';
     lastDelayEl.title = 'System compaction call (excluded from roofline delay)';
   } else if (scopedLast.cold_cache_spike) {
     lastDelayEl.textContent = '— (❄ cold)';
-    lastDelayEl.title = 'Cold KV-cache prefill step; excluded from warm excess delay';
+    lastDelayEl.title = 'Cold KV-cache prefill step; needs ≥6 steps ≥25k uncached tokens to unlock prefill roofline';
   } else if (scopedLast.duration_s == null) {
     lastDelayEl.textContent = '—';
     lastDelayEl.title = 'Step duration unavailable';
@@ -357,11 +361,16 @@ function renderMetrics(m) {
   const scopedWastedS = Number(scopedTot.wasted_time_s || 0);
   if (scopedTot.est_total_delay_s != null) {
     const totDelay = Number(scopedTot.est_total_delay_s);
+    const totColdDelaySteps = scopedTot.cold_delay_steps_count || 0;
+    const totWarmDelaySteps = Math.max(0, (scopedTot.est_delay_steps_count || 0) - totColdDelaySteps);
     const partialScoped = (scopedTot.est_delay_steps_count || 0) < (scopedTot.warm_timed_steps_count || 0) || ((scopedTot.est_delay_steps_count || 0) === 0 && scopedWastedS > 0);
     sumDelayEl.textContent = fmtApproxDuration(totDelay) + (partialScoped ? '*' : '');
     const dParts = [];
     if (scopedTot.est_warm_delay_s != null) {
-      dParts.push('~' + fmtDuration(scopedTot.est_warm_delay_s) + fmtExactSecNote(scopedTot.est_warm_delay_s) + ' warm roofline across ' + (scopedTot.est_delay_steps_count || 0) + '/' + (scopedTot.warm_timed_steps_count || 0) + ' warm step(s)');
+      dParts.push('~' + fmtDuration(scopedTot.est_warm_delay_s) + fmtExactSecNote(scopedTot.est_warm_delay_s) + ' warm roofline across ' + totWarmDelaySteps + '/' + (scopedTot.warm_timed_steps_count || 0) + ' warm step(s)');
+    }
+    if (scopedTot.est_cold_delay_s != null) {
+      dParts.push('~' + fmtDuration(scopedTot.est_cold_delay_s) + fmtExactSecNote(scopedTot.est_cold_delay_s) + ' ❄ cold roofline across ' + totColdDelaySteps + ' step(s)');
     }
     if (scopedWastedS > 0) {
       const wSum = fmtWastedSummary(scopedTot);
@@ -551,21 +560,22 @@ function renderMetrics(m) {
       const retryPart = retryS > 0
         ? (' · +' + fmtDuration(retryS) + fmtExactSecNote(retryS) + ' retry wait')
         : '';
+      const sParts = computeStepRooflineParts(s, stepFit);
       if (s.est_delay_s != null) {
         const roofDelayS = Number(s.est_delay_s);
         const stepDelayS = roofDelayS + retryS;
-        durCellHtml = esc(fmtDuration(totalWaitS)) + ' <span class="muted">(' + esc(fmtApproxDuration(stepDelayS)) + ')</span>';
+        const coldTag = s.cold_cache_spike ? ' ❄' : '';
+        durCellHtml = esc(fmtDuration(totalWaitS)) + ' <span class="muted">(' + esc(fmtApproxDuration(stepDelayS)) + coldTag + ')</span>';
         let roofNote = '~' + roofDelayS.toFixed(2) + 's roofline delay';
-        if (stepFit && stepFit.available) {
-          const expS = Number(stepFit.inferred_ttft_s) + Number(stepFit.slope_s_per_tok) * (s.output_tokens || 0);
-          roofNote = '~' + roofDelayS.toFixed(2) + 's roofline delay (vs ~' + expS.toFixed(2) + 's roofline)';
+        if (sParts) {
+          roofNote = '~' + roofDelayS.toFixed(2) + 's roofline delay (vs ~' + sParts.expectedS.toFixed(2) + 's: ' + sParts.partsText + ')';
         }
         durTitle = 'Model inference: ' + infS + 's (' + srcLabel(s.duration_source) + ')' +
           retryPart + ' · ' + roofNote + ' · Tool exec: ' + s.tool_exec_s + 's';
       } else {
         let noDelayNote = 'speed roofline not yet available';
         if (s.cold_cache_spike) {
-          noDelayNote = 'cold prefill excluded from warm roofline';
+          noDelayNote = 'cold prefill (needs ≥6 steps ≥25k uncached to unlock prefill roofline)';
         } else if (!stepFit || stepFit.reason === 'min_steps') {
           noDelayNote = 'needs ≥4 warm steps for roofline (' + ((stepFit && stepFit.warm_count) || 0) + '/4)';
         } else if (stepFit.reason === 'min_spread') {
@@ -574,7 +584,9 @@ function renderMetrics(m) {
           noDelayNote = 'roofline disabled for unattributed model';
         }
         if (retryS > 0) {
-          durCellHtml = esc(fmtDuration(totalWaitS)) + ' <span class="muted">(' + esc(fmtApproxDuration(retryS)) + '*)</span>';
+          durCellHtml = esc(fmtDuration(totalWaitS)) + ' <span class="muted">(' + esc(fmtApproxDuration(retryS)) + '*' + (s.cold_cache_spike ? ' ❄' : '') + ')</span>';
+        } else if (s.cold_cache_spike) {
+          durCellHtml = esc(fmtDuration(infS)) + ' <span class="muted">(❄)</span>';
         } else {
           durCellHtml = esc(fmtDuration(infS));
         }
@@ -631,14 +643,17 @@ function renderMetrics(m) {
     if (state.expandedStep === s.step_index) {
       const dtr = document.createElement('tr');
       dtr.className = 'detail-row';
+      const detailParts = (s.duration_s != null) ? computeStepRooflineParts(s, stepFit) : null;
       dtr.innerHTML =
         '<td colspan="7">' +
         '<b>Step ' + esc(s.step_index) + '</b>' +
         (isCheckpoint ? ' · Kind: <span class="mono">Compaction (CHECKPOINT)</span>' : '') +
         ' · Model: <span class="mono">' + esc(s.model_name) + '</span>' +
-        (s.model_switched ? ' <span class="pill info">Model Switch</span>' : '') + ' · ' +
+        (s.model_switched ? ' <span class="pill info">Model Switch</span>' : '') +
+        (s.cold_cache_spike ? ' <span class="pill warn">❄ Cold Prefill</span>' : '') + ' · ' +
         (s.cost_usd != null ? ('Paygo: <span class="mono">' + esc(fmtUsd(s.cost_usd)) + ' (' + esc(fmtCredits(s.credits)) + ')</span> · ') : '') +
         (s.duration_s != null ? ('Inference: <span class="mono">' + esc(s.duration_s) + 's</span> · ') : '') +
+        (detailParts ? ('Roofline: <span class="mono">~' + esc(detailParts.expectedS.toFixed(2)) + 's (' + esc(detailParts.partsText) + ')</span> · ') : '') +
         (s.est_delay_s != null ? ('Est. delay: <span class="mono">~' + esc(Number(s.est_delay_s).toFixed(2)) + 's</span> · ') : '') +
         'Uncached: <span class="mono">' + esc(fmtInt(s.input_tokens)) + '</span> · ' +
         'Cached: <span class="mono">' + esc(fmtInt(s.cache_read_tokens)) + '</span> · ' +
@@ -1068,6 +1083,16 @@ function initDashboard() {
     state.showColdPrefills = !state.showColdPrefills;
     state.lastScatterKey = null;
     if (state.lastPayload) renderMetrics(state.lastPayload);
+  });
+
+  document.querySelectorAll('#scatterModeToggle [data-scatter-mode]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const mode = btn.getAttribute('data-scatter-mode') || 'decode';
+      if (state.scatterMode === mode) return;
+      state.scatterMode = mode;
+      state.lastScatterKey = null;
+      if (state.lastPayload) renderMetrics(state.lastPayload);
+    });
   });
 
   document.getElementById('scatterCloseBtn').addEventListener('click', function () {
