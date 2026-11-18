@@ -420,6 +420,41 @@ class TestInstallAndFrontend(unittest.TestCase):
         self.assertNotIn("futText = fmtUsd(mv.future_cost_usd) + ' · '", charts_js)
         self.assertNotIn("pFutText = fmtUsd(pv.future_cost_usd) + ' · '", charts_js)
 
+    def test_card_header_pills_and_toggles_uniform_height(self) -> None:
+        css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+        def parse_rule(selector: str) -> dict[str, str]:
+            match = re.search(
+                rf"^{re.escape(selector)}\s*\{{(.*?)\n\}}",
+                css,
+                re.MULTILINE | re.DOTALL,
+            )
+            self.assertIsNotNone(match, f"Missing CSS rule: {selector}")
+            decls: dict[str, str] = {}
+            for prop, val in re.findall(r"([a-z-]+)\s*:\s*([^;]+);", match.group(1)):
+                decls[prop.strip()] = val.strip()
+            return decls
+
+        pill_rule = parse_rule(".pill")
+        filter_pill_rule = parse_rule(".filter-pill")
+        mode_toggle_rule = parse_rule(".mode-toggle")
+        mode_btn_rule = parse_rule(".mode-btn")
+        section_pill_rule = parse_rule(".section-head .pill")
+        val_model_pill_rule = parse_rule(".filter-pill.val-model-pill")
+
+        self.assertEqual(pill_rule.get("height"), "24px")
+        self.assertEqual(filter_pill_rule.get("height"), "24px")
+        self.assertEqual(mode_toggle_rule.get("height"), "24px")
+
+        self.assertEqual(pill_rule.get("line-height"), "1")
+        self.assertEqual(filter_pill_rule.get("line-height"), "1")
+        self.assertEqual(mode_btn_rule.get("line-height"), "1")
+
+        self.assertEqual(mode_btn_rule.get("height"), "100%")
+        self.assertEqual(mode_btn_rule.get("display"), "inline-flex")
+        self.assertEqual(section_pill_rule.get("font-size"), "11px")
+        self.assertEqual(val_model_pill_rule.get("font-weight"), "600")
+
 
 if __name__ == "__main__":
     unittest.main()
