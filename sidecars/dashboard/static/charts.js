@@ -110,10 +110,17 @@ function buildStratifiedScatterSteps(allSteps, modelName, fit) {
 }
 
 export function renderByModel(byModel, totals, colorMap, callbacks) {
-  const { onToggleModel, onClearFilter } = callbacks || {};
+  const { onToggleModel, onClearFilter, isAllMode, subagentsCount } = callbacks || {};
   const tbody = document.getElementById('byModelTbody');
   const scopeLbl = document.getElementById('byModelScope');
+  const subLbl = document.getElementById('byModelSub');
   tbody.innerHTML = '';
+
+  if (subLbl) {
+    subLbl.textContent = (!isAllMode && (subagentsCount || 0) > 0)
+      ? ('incl. ' + subagentsCount + ' subagent' + (subagentsCount === 1 ? '' : 's'))
+      : '';
+  }
 
   const list = byModel || [];
   if (state.modelFilter) {
@@ -402,7 +409,12 @@ export function renderChart(steps, colorMap, byModel) {
     '<span class="legend-item"><span class="swatch c-cached"></span>Cached Read</span>' +
     '<span class="legend-item"><span class="swatch c-uncached"></span>Uncached Prefill</span>' +
     (hasCompaction ? '<span class="legend-item" title="Context compaction boundary: prior history replaced by <CONTEXT_SUMMARY>"><span class="divider-swatch"></span>Compaction</span>' : '');
+  const stepModelSet = new Set();
+  list.forEach(function (s) {
+    if (s && s.model_name) stepModelSet.add(s.model_name);
+  });
   (byModel || []).forEach(function (bm) {
+    if (!stepModelSet.has(bm.model_name)) return;
     const col = colorMap[bm.model_name] || 'var(--m-muted)';
     const span = document.createElement('span');
     span.className = 'legend-item';
@@ -966,15 +978,8 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   const leg = document.getElementById('scatterLegend');
   svg.innerHTML = '';
   const isAllScatter = isRenderedViewAggregate();
-  const baseHoverMsg = isAllScatter
-    ? 'Hover a point to inspect · Click to open conversation'
-    : 'Hover a point to inspect · Click to view step details';
-  if (scatterMode === 'prefill' && !fit.prefill_available) {
-    hover.textContent = prefillGateNote(fit) + ' · ' + baseHoverMsg;
-  } else if (scatterMode === 'cache' && !fit.cache_available) {
-    hover.textContent = cacheGateNote(fit) + ' · ' + baseHoverMsg;
-  } else {
-    hover.textContent = baseHoverMsg;
+  function isExternalPt(pt) {
+    return Boolean(pt && pt.conv_id && (isAllScatter || pt.conv_id !== state.renderedConvId));
   }
 
   const NS = 'http://www.w3.org/2000/svg';
@@ -990,6 +995,22 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   const plottedPts = (scatterMode === 'prefill')
     ? modelTimedSteps
     : (state.showColdPrefills ? modelTimedSteps : warmPts);
+  const hasExternalPts = plottedPts.some(isExternalPt);
+  const hasLocalPts = plottedPts.some(function (pt) { return !isExternalPt(pt); });
+  const baseHoverMsg = isAllScatter
+    ? 'Hover a point to inspect · Click to open conversation'
+    : (hasExternalPts && !hasLocalPts
+        ? 'Hover a point to inspect · Click to open subagent'
+        : (hasExternalPts
+            ? 'Hover a point to inspect · Click to view step or open subagent'
+            : 'Hover a point to inspect · Click to view step details'));
+  if (scatterMode === 'prefill' && !fit.prefill_available) {
+    hover.textContent = prefillGateNote(fit) + ' · ' + baseHoverMsg;
+  } else if (scatterMode === 'cache' && !fit.cache_available) {
+    hover.textContent = cacheGateNote(fit) + ' · ' + baseHoverMsg;
+  } else {
+    hover.textContent = baseHoverMsg;
+  }
   if (plottedPts.length === 0) {
     const emptyTxt = document.createElementNS(NS, 'text');
     emptyTxt.setAttribute('x', String(w / 2));
@@ -1191,7 +1212,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
       const delta = s.duration_s - sParts.expectedS;
       residualNote = ' · ' + (delta >= 0 ? '+' : '') + delta.toFixed(1) + 's vs roofline';
     }
-    const ptConvPrefix = s.conv_title ? ('[' + s.conv_title + '] ') : '';
+    const ptConvPrefix = (isExternalPt(s) && s.conv_title) ? ('[' + s.conv_title + '] ') : '';
     const peelNote = (scatterMode !== 'decode' || sPre > 0 || sCac > 0)
       ? (' · peeled ' + p.xSec.toFixed(2) + 's')
       : '';
@@ -1280,7 +1301,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
       hover.textContent = ptSummary;
     });
     g.addEventListener('click', function () {
-      if (s.conv_id && isRenderedViewAggregate()) {
+      if (isExternalPt(s)) {
         state.viewMode = 'conversation';
         state.followActive = false;
         state.selectedProjectScopeId = null;

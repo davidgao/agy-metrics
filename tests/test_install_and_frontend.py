@@ -327,6 +327,8 @@ class TestInstallAndFrontend(unittest.TestCase):
             'data-pool="partner"',
             "valModelOverridePill",
             "valGrid",
+            "byModelSub",
+            "isExternalPt",
             "Uncached In",
             "Cached Read",
             "Output (incl. think)",

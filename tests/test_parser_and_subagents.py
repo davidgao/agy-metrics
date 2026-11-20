@@ -408,7 +408,17 @@ class TestParserAndSubagents(unittest.TestCase):
                         "Gemini 4 Carbon (High)",
                         "Orchestrator (Carbon) · Planner",
                         "Orchestrator (Carbon) · Executor",
+                        "Subagent · Gemini Flash",
                     },
+                )
+                self.assertEqual(
+                    [bm["model_name"] for bm in metrics["by_model"]],
+                    [
+                        "Gemini 4 Carbon (High)",
+                        "Orchestrator (Carbon) · Planner",
+                        "Orchestrator (Carbon) · Executor",
+                        "Subagent · Gemini Flash",
+                    ],
                 )
                 self.assertEqual(by_model["Gemini 4 Carbon (High)"]["steps_count"], 1)
                 self.assertEqual(by_model["Orchestrator (Carbon) · Planner"]["steps_count"], 3)
@@ -424,12 +434,21 @@ class TestParserAndSubagents(unittest.TestCase):
                 self.assertEqual(by_model["Orchestrator (Carbon) · Executor"]["steps_count"], 2)
                 self.assertEqual(by_model["Orchestrator (Carbon) · Executor"]["output_tokens"], 900)
                 self.assertEqual(by_model["Orchestrator (Carbon) · Executor"]["avg_effective_tps"], 300.0)
+                self.assertEqual(by_model["Subagent · Gemini Flash"]["steps_count"], 1)
+                self.assertEqual(by_model["Subagent · Gemini Flash"]["input_tokens"], 2000)
+                self.assertEqual(by_model["Subagent · Gemini Flash"]["cache_read_tokens"], 500)
+                self.assertEqual(by_model["Subagent · Gemini Flash"]["output_tokens"], 120)
+                self.assertFalse(by_model["Subagent · Gemini Flash"]["is_active"])
                 self.assertTrue(by_model["Orchestrator (Carbon) · Planner"]["is_active"])
                 self.assertFalse(by_model["Orchestrator (Carbon) · Executor"]["is_active"])
 
                 self.assertEqual(
                     sum(bm["total_tokens"] for bm in metrics["by_model"]),
                     metrics["totals"]["total_tokens"],
+                )
+                self.assertEqual(
+                    metrics["totals"]["total_tokens"],
+                    metrics["grand_totals"]["total_tokens"],
                 )
                 self.assertEqual(
                     sum(bm["model_time_s"] for bm in metrics["by_model"]),
@@ -1328,6 +1347,290 @@ class TestParserAndSubagents(unittest.TestCase):
                 self.assertEqual(
                     {bm["model_name"] for bm in all_m2["by_model"]},
                     {"Gemini 4 Carbon (High)", "Subagent · Gemini 4 Hydrogen (High)"},
+                )
+            finally:
+                eng2.close()
+
+    def test_conversation_by_model_includes_subagent_tokens_timing_scatter_and_valuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            state = root / "state"
+            cid_parent = "11111111-dddd-0000-0000-000000000001"
+            cid_sub1 = "22222222-dddd-0000-0000-000000000002"
+            cid_sub2 = "33333333-dddd-0000-0000-000000000003"
+            cid_grand = "44444444-dddd-0000-0000-000000000004"
+
+            base_ts = int(datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+
+            def iso(offset_s: int) -> str:
+                return datetime.fromtimestamp(base_ts + offset_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            def ms(offset_s: float) -> int:
+                return int((base_ts + offset_s) * 1000)
+
+            write_jsonl(
+                brain / cid_parent / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "created_at": iso(0),
+                        "content": "<USER_REQUEST>\nCoordinate subagents\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Carbon (High). No need to comment.\n</USER_SETTINGS_CHANGE>",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": iso(1),
+                        "input_tokens": 10000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 200,
+                        "content": "",
+                        "tool_calls": [
+                            {"name": "invoke_subagent", "args": {"Role": '"Researcher A"', "Model": '"flash"'}},
+                            {"name": "invoke_subagent", "args": {"Role": '"Researcher B"', "Model": '"flash"'}},
+                        ],
+                    },
+                    {
+                        "step_index": 2,
+                        "type": "GENERIC",
+                        "created_at": iso(3),
+                        "content": f"Created At: {iso(3)}\nCompleted At: {iso(4)}\nLaunched {cid_sub1}\n",
+                    },
+                    {
+                        "step_index": 3,
+                        "type": "GENERIC",
+                        "created_at": iso(3),
+                        "content": f"Created At: {iso(3)}\nCompleted At: {iso(4)}\nLaunched {cid_sub2}\n",
+                    },
+                ],
+            )
+            write_jsonl(
+                state / "conversations" / f"{cid_parent}.hooks.jsonl",
+                [
+                    {"ts_ms": ms(1), "event": "PreInvocation", "conversation_id": cid_parent},
+                    {"ts_ms": ms(4), "event": "PostInvocation", "conversation_id": cid_parent},
+                ],
+            )
+
+            # Subagent 1: 3 warm timed steps on Flash, spawns grandchild also on Flash
+            write_jsonl(
+                brain / cid_sub1 / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": iso(5), "content": "Subtask A"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": iso(6),
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 4000,
+                        "output_tokens": 200,
+                        "content": "",
+                        "tool_calls": [{"name": "invoke_subagent", "args": {"Role": '"Nested Helper"', "Model": '"flash"'}}],
+                    },
+                    {
+                        "step_index": 2,
+                        "type": "GENERIC",
+                        "created_at": iso(8),
+                        "content": f"Created At: {iso(8)}\nCompleted At: {iso(9)}\nLaunched {cid_grand}\n",
+                    },
+                    {
+                        "step_index": 3,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": iso(12),
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 5000,
+                        "output_tokens": 600,
+                        "content": "Part 2",
+                        "tool_calls": [],
+                    },
+                    {
+                        "step_index": 4,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": iso(20),
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 6000,
+                        "output_tokens": 1000,
+                        "content": "Part 3",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+            write_jsonl(
+                state / "conversations" / f"{cid_sub1}.hooks.jsonl",
+                [
+                    {"ts_ms": ms(6), "event": "PreInvocation", "conversation_id": cid_sub1},
+                    {"ts_ms": ms(9), "event": "PostInvocation", "conversation_id": cid_sub1},
+                    {"ts_ms": ms(12), "event": "PreInvocation", "conversation_id": cid_sub1},
+                    {"ts_ms": ms(16), "event": "PostInvocation", "conversation_id": cid_sub1},
+                    {"ts_ms": ms(20), "event": "PreInvocation", "conversation_id": cid_sub1},
+                    {"ts_ms": ms(26), "event": "PostInvocation", "conversation_id": cid_sub1},
+                ],
+            )
+
+            # Subagent 2: 2 warm timed steps on Flash (gives 5+ warm steps total -> roofline available)
+            write_jsonl(
+                brain / cid_sub2 / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": iso(30), "content": "Subtask B"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": iso(31),
+                        "input_tokens": 1200,
+                        "cache_read_tokens": 4800,
+                        "output_tokens": 400,
+                        "content": "B step 1",
+                        "tool_calls": [],
+                    },
+                    {
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": iso(40),
+                        "input_tokens": 1200,
+                        "cache_read_tokens": 5200,
+                        "output_tokens": 800,
+                        "content": "B step 2",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+            write_jsonl(
+                state / "conversations" / f"{cid_sub2}.hooks.jsonl",
+                [
+                    {"ts_ms": ms(31), "event": "PreInvocation", "conversation_id": cid_sub2},
+                    {"ts_ms": ms(34), "event": "PostInvocation", "conversation_id": cid_sub2},
+                    {"ts_ms": ms(40), "event": "PreInvocation", "conversation_id": cid_sub2},
+                    {"ts_ms": ms(47), "event": "PostInvocation", "conversation_id": cid_sub2},
+                ],
+            )
+
+            # Grandchild: 1 timed step on Flash (shares exact same model name as its parent subagent)
+            write_jsonl(
+                brain / cid_grand / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": iso(50), "content": "Nested task"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": iso(51),
+                        "input_tokens": 800,
+                        "cache_read_tokens": 3200,
+                        "output_tokens": 300,
+                        "content": "Nested done",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+            write_jsonl(
+                state / "conversations" / f"{cid_grand}.hooks.jsonl",
+                [
+                    {"ts_ms": ms(51), "event": "PreInvocation", "conversation_id": cid_grand},
+                    {"ts_ms": ms(53.5), "event": "PostInvocation", "conversation_id": cid_grand},
+                ],
+            )
+
+            eng1 = MetricsEngine(brain_dir=brain, state_dir=state, as_of_date="2026-11-16")
+            try:
+                m_parent = eng1.get_metrics(cid_parent)
+                self.assertEqual(m_parent["planner_steps_count"], 1)
+                self.assertEqual(m_parent["subagents"]["count"], 3)
+
+                self.assertEqual(
+                    [bm["model_name"] for bm in m_parent["by_model"]],
+                    ["Gemini 4 Carbon (High)", "Subagent · Gemini Flash"],
+                )
+                by_m = {bm["model_name"]: bm for bm in m_parent["by_model"]}
+                flash_bm = by_m["Subagent · Gemini Flash"]
+                self.assertFalse(flash_bm["is_active"])
+                self.assertEqual(flash_bm["steps_count"], 6)
+                self.assertEqual(flash_bm["timed_steps_count"], 6)
+                self.assertEqual(flash_bm["input_tokens"], 1000 * 3 + 1200 * 2 + 800)
+                self.assertEqual(flash_bm["cache_read_tokens"], 4000 + 5000 + 6000 + 4800 + 5200 + 3200)
+                self.assertEqual(flash_bm["output_tokens"], 200 + 600 + 1000 + 400 + 800 + 300)
+                # Inference time: sub1 (2s + 4s + 6s) + sub2 (3s + 7s) + grand (2.5s) = 24.5s
+                self.assertAlmostEqual(flash_bm["inference_time_s"], 24.5, places=2)
+                self.assertAlmostEqual(flash_bm["model_time_s"], 24.5, places=2)
+                self.assertAlmostEqual(flash_bm["tool_time_s"], 1.0, places=2)
+                self.assertTrue(flash_bm["latency_fit"]["available"])
+                self.assertIsNotNone(flash_bm["est_total_delay_s"])
+                self.assertEqual(len(flash_bm["scatter_steps"]), 6)
+                self.assertEqual(
+                    {ss["conv_id"] for ss in flash_bm["scatter_steps"]},
+                    {cid_sub1, cid_sub2, cid_grand},
+                )
+                self.assertEqual(flash_bm["latest_step"]["conv_id"], cid_grand)
+                self.assertEqual(flash_bm["latest_step"]["conv_title"], "Nested Helper")
+
+                # Totals equal sum across by_model and match grand_totals without double-counting
+                self.assertEqual(m_parent["totals"]["steps_count"], 7)
+                self.assertEqual(
+                    sum(bm["total_tokens"] for bm in m_parent["by_model"]),
+                    m_parent["totals"]["total_tokens"],
+                )
+                self.assertEqual(
+                    m_parent["totals"]["total_tokens"],
+                    m_parent["grand_totals"]["total_tokens"],
+                )
+                self.assertAlmostEqual(
+                    sum(bm["model_time_s"] for bm in m_parent["by_model"]),
+                    m_parent["totals"]["model_time_s"],
+                    places=2,
+                )
+
+                # Valuation includes subagent model in by_model without double-counting own/subagents/total
+                val = m_parent["valuation"]
+                self.assertIn("Subagent · Gemini Flash", val["by_model"])
+                self.assertIn("Subagent · Gemini Flash", val["windows"]["total"]["by_model"])
+                self.assertAlmostEqual(
+                    val["own"]["cost_usd"] + val["subagents"]["cost_usd"],
+                    val["cost_usd"],
+                    places=6,
+                )
+                self.assertAlmostEqual(
+                    val["by_model"]["Subagent · Gemini Flash"]["cost_usd"],
+                    val["subagents"]["cost_usd"],
+                    places=6,
+                )
+
+                # Selecting subagent 1 directly merges its own Flash steps with grandchild's Flash steps into 1 row
+                m_sub1 = eng1.get_metrics(cid_sub1)
+                self.assertEqual(len(m_sub1["by_model"]), 1)
+                self.assertEqual(m_sub1["by_model"][0]["model_name"], "Subagent · Gemini Flash")
+                self.assertTrue(m_sub1["by_model"][0]["is_active"])
+                self.assertEqual(m_sub1["by_model"][0]["steps_count"], 4)
+                self.assertEqual(m_sub1["planner_steps_count"], 3)
+                self.assertEqual(m_sub1["totals"]["steps_count"], 4)
+                self.assertEqual(
+                    m_sub1["totals"]["total_tokens"],
+                    m_sub1["grand_totals"]["total_tokens"],
+                )
+                self.assertAlmostEqual(
+                    m_sub1["valuation"]["own"]["cost_usd"] + m_sub1["valuation"]["subagents"]["cost_usd"],
+                    m_sub1["valuation"]["cost_usd"],
+                    places=6,
+                )
+            finally:
+                eng1.close()
+
+            # Warm restart keeps subagents dehydrated while still rolling up by_model from SQLite
+            eng2 = MetricsEngine(brain_dir=brain, state_dir=state, as_of_date="2026-11-16")
+            try:
+                m_warm = eng2.get_metrics(cid_parent)
+                self.assertEqual(eng2._transcript_open_count, 1)
+                self.assertFalse(eng2._conversations[cid_sub1].hydrated)
+                self.assertFalse(eng2._conversations[cid_sub2].hydrated)
+                self.assertFalse(eng2._conversations[cid_grand].hydrated)
+                self.assertEqual(
+                    [bm["model_name"] for bm in m_warm["by_model"]],
+                    ["Gemini 4 Carbon (High)", "Subagent · Gemini Flash"],
+                )
+                self.assertEqual(m_warm["by_model"][1]["steps_count"], 6)
+                self.assertAlmostEqual(m_warm["by_model"][1]["model_time_s"], 24.5, places=2)
+                self.assertEqual(len(m_warm["by_model"][1]["scatter_steps"]), 6)
+                self.assertEqual(
+                    m_warm["totals"]["total_tokens"],
+                    m_warm["grand_totals"]["total_tokens"],
                 )
             finally:
                 eng2.close()

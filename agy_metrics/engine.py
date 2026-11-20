@@ -878,6 +878,161 @@ class MetricsEngine:
             **step_val,
         }
 
+    def _query_model_scatter_steps(
+        self,
+        m_name: str,
+        global_fit: dict[str, Any],
+        *,
+        win_sql: str = "",
+        win_args: tuple[Any, ...] = (),
+        scope_sql: str = "",
+        scope_args: tuple[Any, ...] = (),
+        est_delay_count: int = 0,
+    ) -> tuple[list[dict[str, Any]], list[float]]:
+        """Query stratified timed steps for roofline scatter plotting and median delay."""
+        scatter_rows_desc = self._db.execute(
+            f"""
+            SELECT conv_id, ordinal, step_index, epoch_s,
+                   input_tokens, cache_read_tokens, output_tokens, duration_s,
+                   duration_source, cold_cache_spike, est_delay_s
+            FROM step_lite
+            WHERE model_name = ?
+              AND is_checkpoint = 0
+              AND duration_s IS NOT NULL
+              AND duration_s > 0
+              {win_sql}
+              {scope_sql}
+            ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+            LIMIT ?
+            """,
+            (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
+        ).fetchall()
+        if len(scatter_rows_desc) == _FIT_MAX_RECENT_STEPS and (
+            global_fit.get("prefill_available")
+            or global_fit.get("cache_available")
+        ):
+            anchor_hip = self._db.execute(
+                f"""
+                SELECT conv_id, ordinal, step_index, epoch_s,
+                       input_tokens, cache_read_tokens, output_tokens, duration_s,
+                       duration_source, cold_cache_spike, est_delay_s
+                FROM step_lite
+                WHERE model_name = ?
+                  AND is_checkpoint = 0
+                  AND duration_s IS NOT NULL
+                  AND duration_s > 0
+                  AND input_tokens >= ?
+                  {win_sql}
+                  {scope_sql}
+                ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                LIMIT 20
+                """,
+                (m_name, _FIT_PREFILL_HIGH_TOK, *win_args, *scope_args),
+            ).fetchall()
+            anchor_orig = self._db.execute(
+                f"""
+                SELECT conv_id, ordinal, step_index, epoch_s,
+                       input_tokens, cache_read_tokens, output_tokens, duration_s,
+                       duration_source, cold_cache_spike, est_delay_s
+                FROM step_lite
+                WHERE model_name = ?
+                  AND is_checkpoint = 0
+                  AND duration_s IS NOT NULL
+                  AND duration_s > 0
+                  AND input_tokens < ?
+                  AND cache_read_tokens < ?
+                  {win_sql}
+                  {scope_sql}
+                ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                LIMIT 15
+                """,
+                (
+                    m_name,
+                    _FIT_ORIGIN_MAX_IN_TOK,
+                    _FIT_ORIGIN_MAX_CACHE_TOK,
+                    *win_args,
+                    *scope_args,
+                ),
+            ).fetchall()
+            selected_map: dict[tuple[str, int], tuple[Any, ...]] = {}
+            for ar in (*anchor_hip, *anchor_orig):
+                selected_map[(str(ar[0]), int(ar[1]))] = ar
+            for sr in scatter_rows_desc:
+                if len(selected_map) >= _FIT_MAX_RECENT_STEPS:
+                    break
+                k = (str(sr[0]), int(sr[1]))
+                if k not in selected_map:
+                    selected_map[k] = sr
+            scatter_rows = sorted(
+                selected_map.values(),
+                key=lambda r: (float(r[3]), str(r[0]), int(r[1])),
+            )
+        else:
+            scatter_rows = list(reversed(scatter_rows_desc))
+
+        scatter_steps: list[dict[str, Any]] = []
+        modeled_delays: list[float] = []
+        for seq_i, sr in enumerate(scatter_rows, start=1):
+            (
+                s_cid,
+                s_ord,
+                s_idx,
+                _s_ep,
+                s_in,
+                s_cac,
+                s_out,
+                s_dur,
+                s_src,
+                s_cold,
+                s_delay,
+            ) = sr
+            c_obj = self._conversations.get(str(s_cid))
+            s_dur_f = float(s_dur)
+            s_out_i = int(s_out)
+            s_delay_f = round(float(s_delay), 2) if s_delay is not None else None
+            if s_out_i > 0 and s_delay_f is not None:
+                modeled_delays.append(s_delay_f)
+            scatter_steps.append(
+                {
+                    "seq": seq_i,
+                    "ordinal": int(s_ord),
+                    "step_index": int(s_idx),
+                    "model_name": m_name,
+                    "input_tokens": int(s_in),
+                    "cache_read_tokens": int(s_cac),
+                    "output_tokens": s_out_i,
+                    "duration_s": s_dur_f,
+                    "duration_source": s_src,
+                    "effective_tps": round(s_out_i / s_dur_f, 1),
+                    "cold_cache_spike": bool(s_cold),
+                    "step_kind": "planner",
+                    "est_delay_s": s_delay_f,
+                    "conv_id": str(s_cid),
+                    "conv_title": (
+                        c_obj.title if c_obj is not None else str(s_cid)[:8]
+                    ),
+                }
+            )
+
+        if not modeled_delays and est_delay_count > 0:
+            fb_rows = self._db.execute(
+                f"""
+                SELECT est_delay_s
+                FROM step_lite
+                WHERE model_name = ?
+                  AND is_checkpoint = 0
+                  AND est_delay_s IS NOT NULL
+                  {win_sql}
+                  {scope_sql}
+                ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                LIMIT ?
+                """,
+                (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
+            ).fetchall()
+            modeled_delays = [round(float(r[0]), 2) for r in fb_rows]
+
+        return scatter_steps, modeled_delays
+
     def _get_all_conversations_metrics(
         self, window: str = "all", project_id: str | None = None
     ) -> dict[str, Any]:
@@ -1170,146 +1325,15 @@ class MetricsEngine:
                 m_name
             ) or self._get_global_model_fit_and_sync_delays(m_name)
 
-            scatter_rows_desc = self._db.execute(
-                f"""
-                SELECT conv_id, ordinal, step_index, epoch_s,
-                       input_tokens, cache_read_tokens, output_tokens, duration_s,
-                       duration_source, cold_cache_spike, est_delay_s
-                FROM step_lite
-                WHERE model_name = ?
-                  AND is_checkpoint = 0
-                  AND duration_s IS NOT NULL
-                  AND duration_s > 0
-                  {win_sql}
-                  {scope_sql}
-                ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
-                LIMIT ?
-                """,
-                (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
-            ).fetchall()
-            if len(scatter_rows_desc) == _FIT_MAX_RECENT_STEPS and (
-                global_fit.get("prefill_available")
-                or global_fit.get("cache_available")
-            ):
-                anchor_hip = self._db.execute(
-                    f"""
-                    SELECT conv_id, ordinal, step_index, epoch_s,
-                           input_tokens, cache_read_tokens, output_tokens, duration_s,
-                           duration_source, cold_cache_spike, est_delay_s
-                    FROM step_lite
-                    WHERE model_name = ?
-                      AND is_checkpoint = 0
-                      AND duration_s IS NOT NULL
-                      AND duration_s > 0
-                      AND input_tokens >= ?
-                      {win_sql}
-                      {scope_sql}
-                    ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
-                    LIMIT 20
-                    """,
-                    (m_name, _FIT_PREFILL_HIGH_TOK, *win_args, *scope_args),
-                ).fetchall()
-                anchor_orig = self._db.execute(
-                    f"""
-                    SELECT conv_id, ordinal, step_index, epoch_s,
-                           input_tokens, cache_read_tokens, output_tokens, duration_s,
-                           duration_source, cold_cache_spike, est_delay_s
-                    FROM step_lite
-                    WHERE model_name = ?
-                      AND is_checkpoint = 0
-                      AND duration_s IS NOT NULL
-                      AND duration_s > 0
-                      AND input_tokens < ?
-                      AND cache_read_tokens < ?
-                      {win_sql}
-                      {scope_sql}
-                    ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
-                    LIMIT 15
-                    """,
-                    (
-                        m_name,
-                        _FIT_ORIGIN_MAX_IN_TOK,
-                        _FIT_ORIGIN_MAX_CACHE_TOK,
-                        *win_args,
-                        *scope_args,
-                    ),
-                ).fetchall()
-                selected_map: dict[tuple[str, int], tuple[Any, ...]] = {}
-                for ar in (*anchor_hip, *anchor_orig):
-                    selected_map[(str(ar[0]), int(ar[1]))] = ar
-                for sr in scatter_rows_desc:
-                    if len(selected_map) >= _FIT_MAX_RECENT_STEPS:
-                        break
-                    k = (str(sr[0]), int(sr[1]))
-                    if k not in selected_map:
-                        selected_map[k] = sr
-                scatter_rows = sorted(
-                    selected_map.values(),
-                    key=lambda r: (float(r[3]), str(r[0]), int(r[1])),
-                )
-            else:
-                scatter_rows = list(reversed(scatter_rows_desc))
-
-            scatter_steps = []
-            win_modeled_delays: list[float] = []
-            for seq_i, sr in enumerate(scatter_rows, start=1):
-                (
-                    s_cid,
-                    s_ord,
-                    s_idx,
-                    _s_ep,
-                    s_in,
-                    s_cac,
-                    s_out,
-                    s_dur,
-                    s_src,
-                    s_cold,
-                    s_delay,
-                ) = sr
-                c_obj = self._conversations.get(str(s_cid))
-                s_dur_f = float(s_dur)
-                s_out_i = int(s_out)
-                s_delay_f = round(float(s_delay), 2) if s_delay is not None else None
-                if s_out_i > 0 and s_delay_f is not None:
-                    win_modeled_delays.append(s_delay_f)
-                scatter_steps.append(
-                    {
-                        "seq": seq_i,
-                        "ordinal": int(s_ord),
-                        "step_index": int(s_idx),
-                        "model_name": m_name,
-                        "input_tokens": int(s_in),
-                        "cache_read_tokens": int(s_cac),
-                        "output_tokens": s_out_i,
-                        "duration_s": s_dur_f,
-                        "duration_source": s_src,
-                        "effective_tps": round(s_out_i / s_dur_f, 1),
-                        "cold_cache_spike": bool(s_cold),
-                        "step_kind": "planner",
-                        "est_delay_s": s_delay_f,
-                        "conv_id": str(s_cid),
-                        "conv_title": (
-                            c_obj.title if c_obj is not None else str(s_cid)[:8]
-                        ),
-                    }
-                )
-
-            if not win_modeled_delays and m_est_delay_count > 0:
-                fb_rows = self._db.execute(
-                    f"""
-                    SELECT est_delay_s
-                    FROM step_lite
-                    WHERE model_name = ?
-                      AND is_checkpoint = 0
-                      AND est_delay_s IS NOT NULL
-                      {win_sql}
-                      {scope_sql}
-                    ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
-                    LIMIT ?
-                    """,
-                    (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
-                ).fetchall()
-                win_modeled_delays = [round(float(r[0]), 2) for r in fb_rows]
+            scatter_steps, win_modeled_delays = self._query_model_scatter_steps(
+                m_name,
+                global_fit,
+                win_sql=win_sql,
+                win_args=win_args,
+                scope_sql=scope_sql,
+                scope_args=scope_args,
+                est_delay_count=m_est_delay_count,
+            )
 
             m_avg_delay_s: float | None = (
                 round(m_delay_sum / m_est_delay_count, 2)
@@ -1758,6 +1782,16 @@ class MetricsEngine:
         protected.update(self._expand_related_ids(target_id))
         self._evict_idle_hydrated_convs(protected)
 
+        descendants = _parser.collect_descendant_subagents(
+            self._conversations, conv.conversation_id
+        )
+        sub_ids: list[str] = [
+            sub_id
+            for sub_id, _, _ in descendants
+            if sub_id in self._conversations
+        ]
+        scope_ids = [conv.conversation_id, *sub_ids]
+
         grouped_steps: dict[str, list[StepMetrics]] = {}
         for s in conv.steps:
             grouped_steps.setdefault(s.model_name, []).append(s)
@@ -1768,16 +1802,23 @@ class MetricsEngine:
 
         total_ft_wasted = sum(ft.wasted_s for ft in conv.failed_turns)
         total_ft_count = len(conv.failed_turns)
-        totals = aggregate_steps(
+        own_totals = aggregate_steps(
             conv.steps,
             failed_turns_wasted_s=total_ft_wasted,
             failed_turns_count=total_ft_count,
         )
-        totals["compacted_count"] = conv.compacted_count
 
-        model_order = list(
+        own_model_order = list(
             dict.fromkeys([*grouped_steps.keys(), *grouped_failed.keys()])
         )
+        own_model_set = set(own_model_order)
+        sub_models = (
+            self._store.query_window_models(None, conv_ids=sub_ids)
+            if sub_ids
+            else []
+        )
+        sub_models_set = set(sub_models)
+        model_order = list(dict.fromkeys([*own_model_order, *sub_models]))
         global_fits = {
             m_name: self._get_global_model_fit_and_sync_delays(m_name)
             for m_name in model_order
@@ -1790,126 +1831,407 @@ class MetricsEngine:
             ).fetchall()
         }
 
+        scope_agg_by_model: dict[str, tuple[Any, ...]] = {}
+        scope_sql = ""
+        scope_args: tuple[Any, ...] = ()
+        if sub_models_set:
+            scope_agg_rows, _ = self._store.query_all_model_aggregates(
+                None, conv_ids=scope_ids
+            )
+            scope_agg_by_model = {str(r[0]): r for r in scope_agg_rows}
+            scope_ph = ",".join("?" for _ in scope_ids)
+            scope_sql = f" AND conv_id IN ({scope_ph})"
+            scope_args = tuple(scope_ids)
+
         all_modeled_delays: list[float] = []
         total_warm_timed = 0
         total_est_delay_count = 0
+        total_est_delay_sum = 0.0
+        total_warm_delay_steps = 0
+        total_warm_delay_sum = 0.0
         total_cold_delay_steps = 0
-        by_model: list[dict[str, Any]] = []
+        total_cold_delay_sum = 0.0
+        sum_steps = 0
+        sum_comp_steps = 0
+        sum_in = 0
+        sum_cache = 0
+        sum_out = 0
+        sum_think = 0
+        sum_vis = 0
+        sum_inf_time = 0.0
+        sum_wasted_time = 0.0
+        sum_retry_steps = 0
+        sum_failed_turns = 0
+        sum_timed_steps = 0
+        sum_cold_timed = 0
+        sum_cold_time = 0.0
+        sum_timed_out = 0
+        sum_tool_time = 0.0
+
+        own_by_model: list[dict[str, Any]] = []
+        sub_only_by_model: list[dict[str, Any]] = []
         for m_name in model_order:
             m_steps = grouped_steps.get(m_name, [])
             m_failed = grouped_failed.get(m_name, [])
-            m_ft_wasted = sum(ft.wasted_s for ft in m_failed)
-            m_ft_count = len(m_failed)
             global_fit = global_fits[m_name]
             pre_avail = bool(global_fit.get("prefill_available"))
-            m_warm_timed = [
-                s
-                for s in m_steps
-                if s.step_kind != "checkpoint"
-                and not s.cold_cache_spike
-                and s.duration_s is not None
-                and s.duration_s > 0
-                and s.output_tokens > 0
-            ]
-            total_warm_timed += len(m_warm_timed)
-            m_cold_timed_cnt = sum(
-                1
-                for s in m_steps
-                if s.step_kind != "checkpoint"
-                and s.cold_cache_spike
-                and s.duration_s is not None
-                and s.duration_s > 0
-                and s.output_tokens > 0
-            )
-            m_cold_excl = 0 if pre_avail else m_cold_timed_cnt
-            m_modeled_timed = [
-                s
-                for s in m_steps
-                if s.step_kind != "checkpoint"
-                and (pre_avail or not s.cold_cache_spike)
-                and s.duration_s is not None
-                and s.duration_s > 0
-                and s.output_tokens > 0
-            ]
-            m_warm_delays = [
-                d
-                for s in m_warm_timed
-                if (d := step_delays.get(s.ordinal)) is not None
-            ]
-            m_cold_delays = [
-                d
-                for s in m_modeled_timed
-                if s.cold_cache_spike and (d := step_delays.get(s.ordinal)) is not None
-            ]
-            m_delays = [
-                d
-                for s in m_modeled_timed
-                if (d := step_delays.get(s.ordinal)) is not None
-            ]
-            m_agg = aggregate_steps(
-                m_steps,
-                failed_turns_wasted_s=m_ft_wasted,
-                failed_turns_count=m_ft_count,
-            )
-            m_wasted_round = float(m_agg["wasted_time_s"])
-            m_est_warm_delay: float | None = (
-                round(sum(m_warm_delays), 2) if m_warm_delays else None
-            )
-            m_est_cold_delay: float | None = (
-                round(sum(m_cold_delays), 2) if m_cold_delays else None
-            )
-            m_cold_delay_count = len(m_cold_delays)
-            total_cold_delay_steps += m_cold_delay_count
-            if m_delays:
-                m_est_delay_count = len(m_delays)
-                m_avg_delay_s: float | None = round(
-                    sum(m_delays) / m_est_delay_count, 2
+
+            if m_name in sub_models_set and m_name in scope_agg_by_model:
+                row = scope_agg_by_model[m_name]
+                m_steps_n = int(row[1] or 0)
+                m_comp_steps = int(row[2] or 0)
+                m_in = int(row[3] or 0)
+                m_cache = int(row[4] or 0)
+                m_out = int(row[5] or 0)
+                m_think = int(row[6] or 0)
+                m_vis = int(row[7] or 0)
+                m_inf_time_s = float(row[8] or 0.0)
+                m_timed_steps = int(row[9] or 0)
+                m_cold_timed = int(row[10] or 0)
+                m_cold_time_s = float(row[11] or 0.0)
+                m_timed_out = int(row[12] or 0)
+                m_tool_s = float(row[13] or 0.0)
+                m_warm_timed_cnt = int(row[14] or 0)
+                m_cold_excl_raw = int(row[15] or 0)
+                m_est_delay_count = int(row[16] or 0)
+                m_delay_sum = float(row[17] or 0.0)
+                m_wasted_s = float(row[19] or 0.0)
+                m_retry_steps = int(row[20] or 0)
+                m_failed_turns = int(row[21] or 0)
+                m_cold_delay_count = int(row[22] or 0)
+                m_cold_delay_sum = float(row[23] or 0.0)
+                m_warm_delay_count = max(0, m_est_delay_count - m_cold_delay_count)
+                m_warm_delay_sum = max(0.0, m_delay_sum - m_cold_delay_sum)
+                m_cold_excl = 0 if pre_avail else m_cold_excl_raw
+
+                m_gross_in = m_in + m_cache
+                m_hit_pct = (
+                    round(m_cache / m_gross_in * 100.0, 1)
+                    if m_gross_in > 0
+                    else 0.0
                 )
-                total_est_delay_count += m_est_delay_count
-                all_modeled_delays.extend(m_delays)
-                fit_for_conv: dict[str, Any] = {
-                    **global_fit,
-                    "cold_excluded_count": m_cold_excl,
-                    "avg_delay_s": m_avg_delay_s,
-                    "median_delay_s": round(statistics.median(m_delays), 2),
+                m_inf_round = round(m_inf_time_s, 2)
+                m_wasted_round = round(m_wasted_s, 2)
+                m_time_round = round(m_inf_round + m_wasted_round, 2)
+                m_avg_tps = (
+                    round(m_timed_out / m_inf_round, 1)
+                    if m_inf_round > 0.0
+                    else None
+                )
+                m_agg = {
+                    "steps_count": m_steps_n,
+                    "compaction_steps_count": m_comp_steps,
+                    "input_tokens": m_in,
+                    "cache_read_tokens": m_cache,
+                    "gross_input_tokens": m_gross_in,
+                    "cache_hit_pct": m_hit_pct,
+                    "output_tokens": m_out,
+                    "est_thinking_tokens": m_think,
+                    "est_visible_tokens": m_vis,
+                    "total_tokens": m_gross_in + m_out,
+                    "inference_time_s": m_inf_round,
+                    "model_time_s": m_time_round,
+                    "wasted_time_s": m_wasted_round,
+                    "retry_steps_count": m_retry_steps,
+                    "failed_turns_count": m_failed_turns,
+                    "timed_steps_count": m_timed_steps,
+                    "cold_timed_steps_count": m_cold_timed,
+                    "cold_model_time_s": round(m_cold_time_s, 2),
+                    "timed_output_tokens": m_timed_out,
+                    "avg_effective_tps": m_avg_tps,
+                    "tool_time_s": round(m_tool_s, 2),
                 }
-            else:
-                m_est_delay_count = 0
-                m_avg_delay_s = None
-                fit_for_conv = (
-                    {
+
+                scatter_steps, m_delays = self._query_model_scatter_steps(
+                    m_name,
+                    global_fit,
+                    scope_sql=scope_sql,
+                    scope_args=scope_args,
+                    est_delay_count=m_est_delay_count,
+                )
+                m_avg_delay_s: float | None = (
+                    round(m_delay_sum / m_est_delay_count, 2)
+                    if m_est_delay_count > 0
+                    else None
+                )
+                if global_fit["available"]:
+                    all_modeled_delays.extend(m_delays)
+                    fit_for_conv: dict[str, Any] = {
                         **global_fit,
                         "cold_excluded_count": m_cold_excl,
-                        "avg_delay_s": None,
-                        "median_delay_s": None,
+                        "avg_delay_s": m_avg_delay_s,
+                        "median_delay_s": (
+                            round(statistics.median(m_delays), 2)
+                            if m_delays
+                            else None
+                        ),
                     }
-                    if global_fit["available"]
-                    else {**global_fit, "cold_excluded_count": m_cold_excl}
-                )
-            if m_delays or m_wasted_round > 0.0:
-                m_est_total_delay: float | None = round(
-                    (sum(m_delays) if m_delays else 0.0) + m_wasted_round, 2
-                )
-            else:
-                m_est_total_delay = None
+                else:
+                    fit_for_conv = {
+                        **global_fit,
+                        "cold_excluded_count": m_cold_excl,
+                    }
 
-            if m_steps:
-                m_latest: dict[str, Any] | None = m_steps[-1].to_dict()
-                assert m_latest is not None
-                m_latest["est_delay_s"] = step_delays.get(m_steps[-1].ordinal)
-                m_latest.update(
-                    self._pricing.value_step(
-                        m_steps[-1].model_name,
-                        m_steps[-1].input_tokens,
-                        m_steps[-1].cache_read_tokens,
-                        m_steps[-1].output_tokens,
+                m_est_warm_delay: float | None = (
+                    round(m_warm_delay_sum, 2) if m_warm_delay_count > 0 else None
+                )
+                m_est_cold_delay: float | None = (
+                    round(m_cold_delay_sum, 2) if m_cold_delay_count > 0 else None
+                )
+                m_est_total_delay: float | None = (
+                    round(
+                        (m_delay_sum if m_est_delay_count > 0 else 0.0) + m_wasted_s,
+                        2,
                     )
+                    if (m_est_delay_count > 0 or m_wasted_round > 0.0)
+                    else None
                 )
-            else:
-                m_latest = None
 
-            by_model.append(
-                {
+                latest_m_row = self._db.execute(
+                    f"""
+                    SELECT conv_id, ordinal, step_index, created_at, epoch_s, model_name,
+                           is_checkpoint, input_tokens, cache_read_tokens, output_tokens,
+                           est_thinking_tokens, est_visible_tokens, duration_s,
+                           duration_source, tool_exec_s, cold_cache_spike, compacted,
+                           est_delay_s, retry_wait_s, retry_count
+                    FROM step_lite
+                    WHERE model_name = ? {scope_sql}
+                    ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                    LIMIT 1
+                    """,
+                    (m_name, *scope_args),
+                ).fetchone()
+                if (
+                    latest_m_row is not None
+                    and str(latest_m_row[0]) == conv.conversation_id
+                    and m_steps
+                    and int(latest_m_row[1]) == m_steps[-1].ordinal
+                ):
+                    m_latest: dict[str, Any] | None = m_steps[-1].to_dict()
+                    assert m_latest is not None
+                    m_latest["est_delay_s"] = step_delays.get(m_steps[-1].ordinal)
+                    m_latest.update(
+                        self._pricing.value_step(
+                            m_steps[-1].model_name,
+                            m_steps[-1].input_tokens,
+                            m_steps[-1].cache_read_tokens,
+                            m_steps[-1].output_tokens,
+                        )
+                    )
+                else:
+                    m_latest = (
+                        self._step_lite_row_to_dict(latest_m_row)
+                        if latest_m_row is not None
+                        else None
+                    )
+
+                total_warm_timed += m_warm_timed_cnt
+                total_est_delay_count += m_est_delay_count
+                if m_est_delay_count > 0:
+                    total_est_delay_sum += m_delay_sum
+                total_warm_delay_steps += m_warm_delay_count
+                if m_warm_delay_count > 0:
+                    total_warm_delay_sum += m_warm_delay_sum
+                total_cold_delay_steps += m_cold_delay_count
+                if m_cold_delay_count > 0:
+                    total_cold_delay_sum += m_cold_delay_sum
+
+                sum_steps += m_steps_n
+                sum_comp_steps += m_comp_steps
+                sum_in += m_in
+                sum_cache += m_cache
+                sum_out += m_out
+                sum_think += m_think
+                sum_vis += m_vis
+                sum_inf_time += m_inf_time_s
+                sum_wasted_time += m_wasted_s
+                sum_retry_steps += m_retry_steps
+                sum_failed_turns += m_failed_turns
+                sum_timed_steps += m_timed_steps
+                sum_cold_timed += m_cold_timed
+                sum_cold_time += m_cold_time_s
+                sum_timed_out += m_timed_out
+                sum_tool_time += m_tool_s
+
+                bm_entry: dict[str, Any] = {
+                    "model_name": m_name,
+                    "is_active": m_name == conv.current_model_name,
+                    "first_step_ordinal": (
+                        m_steps[0].ordinal
+                        if m_steps
+                        else (1 if m_steps_n > 0 else 0)
+                    ),
+                    "last_step_ordinal": (
+                        m_steps[-1].ordinal if m_steps else m_steps_n
+                    ),
+                    "latest_step": m_latest,
+                    "latency_fit": fit_for_conv,
+                    "scatter_steps": scatter_steps,
+                    "warm_timed_steps_count": m_warm_timed_cnt,
+                    "est_delay_steps_count": m_est_delay_count,
+                    "cold_delay_steps_count": m_cold_delay_count,
+                    "est_warm_delay_s": m_est_warm_delay,
+                    "est_cold_delay_s": m_est_cold_delay,
+                    "est_total_delay_s": m_est_total_delay,
+                    "avg_delay_s": m_avg_delay_s,
+                    "valuation": self._pricing.value_model_group(
+                        m_name,
+                        m_agg["steps_count"],
+                        m_agg["input_tokens"],
+                        m_agg["cache_read_tokens"],
+                        m_agg["output_tokens"],
+                    ),
+                    **m_agg,
+                }
+            else:
+                m_ft_wasted = sum(ft.wasted_s for ft in m_failed)
+                m_ft_count = len(m_failed)
+                m_warm_timed = [
+                    s
+                    for s in m_steps
+                    if s.step_kind != "checkpoint"
+                    and not s.cold_cache_spike
+                    and s.duration_s is not None
+                    and s.duration_s > 0
+                    and s.output_tokens > 0
+                ]
+                total_warm_timed += len(m_warm_timed)
+                m_cold_timed_cnt = sum(
+                    1
+                    for s in m_steps
+                    if s.step_kind != "checkpoint"
+                    and s.cold_cache_spike
+                    and s.duration_s is not None
+                    and s.duration_s > 0
+                    and s.output_tokens > 0
+                )
+                m_cold_excl = 0 if pre_avail else m_cold_timed_cnt
+                m_modeled_timed = [
+                    s
+                    for s in m_steps
+                    if s.step_kind != "checkpoint"
+                    and (pre_avail or not s.cold_cache_spike)
+                    and s.duration_s is not None
+                    and s.duration_s > 0
+                    and s.output_tokens > 0
+                ]
+                m_warm_delays = [
+                    d
+                    for s in m_warm_timed
+                    if (d := step_delays.get(s.ordinal)) is not None
+                ]
+                m_cold_delays = [
+                    d
+                    for s in m_modeled_timed
+                    if s.cold_cache_spike
+                    and (d := step_delays.get(s.ordinal)) is not None
+                ]
+                m_delays = [
+                    d
+                    for s in m_modeled_timed
+                    if (d := step_delays.get(s.ordinal)) is not None
+                ]
+                m_agg = aggregate_steps(
+                    m_steps,
+                    failed_turns_wasted_s=m_ft_wasted,
+                    failed_turns_count=m_ft_count,
+                )
+                m_wasted_round = float(m_agg["wasted_time_s"])
+                m_warm_delay_sum = sum(m_warm_delays)
+                m_cold_delay_sum = sum(m_cold_delays)
+                m_delay_sum = sum(m_delays)
+                m_est_warm_delay = (
+                    round(m_warm_delay_sum, 2) if m_warm_delays else None
+                )
+                m_est_cold_delay = (
+                    round(m_cold_delay_sum, 2) if m_cold_delays else None
+                )
+                m_cold_delay_count = len(m_cold_delays)
+                total_warm_delay_steps += len(m_warm_delays)
+                if m_warm_delays:
+                    total_warm_delay_sum += m_warm_delay_sum
+                total_cold_delay_steps += m_cold_delay_count
+                if m_cold_delays:
+                    total_cold_delay_sum += m_cold_delay_sum
+                if m_delays:
+                    m_est_delay_count = len(m_delays)
+                    m_avg_delay_s = round(m_delay_sum / m_est_delay_count, 2)
+                    total_est_delay_count += m_est_delay_count
+                    total_est_delay_sum += m_delay_sum
+                    all_modeled_delays.extend(m_delays)
+                    fit_for_conv = {
+                        **global_fit,
+                        "cold_excluded_count": m_cold_excl,
+                        "avg_delay_s": m_avg_delay_s,
+                        "median_delay_s": round(statistics.median(m_delays), 2),
+                    }
+                else:
+                    m_est_delay_count = 0
+                    m_avg_delay_s = None
+                    fit_for_conv = (
+                        {
+                            **global_fit,
+                            "cold_excluded_count": m_cold_excl,
+                            "avg_delay_s": None,
+                            "median_delay_s": None,
+                        }
+                        if global_fit["available"]
+                        else {**global_fit, "cold_excluded_count": m_cold_excl}
+                    )
+                if m_delays or m_wasted_round > 0.0:
+                    m_est_total_delay = round(
+                        (m_delay_sum if m_delays else 0.0) + m_wasted_round, 2
+                    )
+                else:
+                    m_est_total_delay = None
+
+                if m_steps:
+                    m_latest = m_steps[-1].to_dict()
+                    assert m_latest is not None
+                    m_latest["est_delay_s"] = step_delays.get(m_steps[-1].ordinal)
+                    m_latest.update(
+                        self._pricing.value_step(
+                            m_steps[-1].model_name,
+                            m_steps[-1].input_tokens,
+                            m_steps[-1].cache_read_tokens,
+                            m_steps[-1].output_tokens,
+                        )
+                    )
+                else:
+                    m_latest = None
+
+                sum_steps += int(m_agg["steps_count"])
+                sum_comp_steps += int(m_agg["compaction_steps_count"])
+                sum_in += int(m_agg["input_tokens"])
+                sum_cache += int(m_agg["cache_read_tokens"])
+                sum_out += int(m_agg["output_tokens"])
+                sum_think += int(m_agg["est_thinking_tokens"])
+                sum_vis += int(m_agg["est_visible_tokens"])
+                sum_inf_time += sum(
+                    float(s.duration_s)
+                    for s in m_steps
+                    if s.duration_s is not None and s.duration_s > 0
+                )
+                sum_wasted_time += (
+                    sum(float(s.retry_wait_s) for s in m_steps if s.retry_wait_s > 0.0)
+                    + float(m_ft_wasted)
+                )
+                sum_retry_steps += int(m_agg["retry_steps_count"])
+                sum_failed_turns += int(m_agg["failed_turns_count"])
+                sum_timed_steps += int(m_agg["timed_steps_count"])
+                sum_cold_timed += int(m_agg["cold_timed_steps_count"])
+                sum_cold_time += sum(
+                    float(s.duration_s)
+                    for s in m_steps
+                    if s.step_kind != "checkpoint"
+                    and s.cold_cache_spike
+                    and s.duration_s is not None
+                    and s.duration_s > 0
+                )
+                sum_timed_out += int(m_agg["timed_output_tokens"])
+                sum_tool_time += sum(float(s.tool_exec_s) for s in m_steps)
+
+                bm_entry = {
                     "model_name": m_name,
                     "is_active": m_name == conv.current_model_name,
                     "first_step_ordinal": m_steps[0].ordinal if m_steps else 0,
@@ -1932,23 +2254,65 @@ class MetricsEngine:
                     ),
                     **m_agg,
                 }
-            )
 
-        fitted_warm_delays = [
-            bm["est_warm_delay_s"]
-            for bm in by_model
-            if bm["est_warm_delay_s"] is not None
-        ]
-        fitted_cold_delays = [
-            bm["est_cold_delay_s"]
-            for bm in by_model
-            if bm["est_cold_delay_s"] is not None
-        ]
+            if m_name in own_model_set:
+                own_by_model.append(bm_entry)
+            else:
+                sub_only_by_model.append(bm_entry)
+
+        sub_only_by_model.sort(
+            key=lambda bm: (
+                1 if _is_unattributed_model(bm["model_name"]) else 0,
+                -bm["total_tokens"],
+                bm["model_name"],
+            )
+        )
+        by_model: list[dict[str, Any]] = [*own_by_model, *sub_only_by_model]
+
+        if not sub_models_set:
+            totals = dict(own_totals)
+        else:
+            tot_gross_in = sum_in + sum_cache
+            tot_inf_round = round(sum_inf_time, 2)
+            tot_wasted_round = round(sum_wasted_time, 2)
+            totals = {
+                "steps_count": sum_steps,
+                "compaction_steps_count": sum_comp_steps,
+                "input_tokens": sum_in,
+                "cache_read_tokens": sum_cache,
+                "gross_input_tokens": tot_gross_in,
+                "cache_hit_pct": (
+                    round(sum_cache / tot_gross_in * 100.0, 1)
+                    if tot_gross_in > 0
+                    else 0.0
+                ),
+                "output_tokens": sum_out,
+                "est_thinking_tokens": sum_think,
+                "est_visible_tokens": sum_vis,
+                "total_tokens": tot_gross_in + sum_out,
+                "inference_time_s": tot_inf_round,
+                "model_time_s": round(tot_inf_round + tot_wasted_round, 2),
+                "wasted_time_s": tot_wasted_round,
+                "retry_steps_count": sum_retry_steps,
+                "failed_turns_count": sum_failed_turns,
+                "timed_steps_count": sum_timed_steps,
+                "cold_timed_steps_count": sum_cold_timed,
+                "cold_model_time_s": round(sum_cold_time, 2),
+                "timed_output_tokens": sum_timed_out,
+                "avg_effective_tps": (
+                    round(sum_timed_out / tot_inf_round, 1)
+                    if tot_inf_round > 0.0
+                    else None
+                ),
+                "tool_time_s": round(sum_tool_time, 2),
+            }
+
+        totals["compacted_count"] = conv.compacted_count
         est_warm_delay_tot = (
-            round(sum(fitted_warm_delays), 2) if fitted_warm_delays else None
+            round(total_warm_delay_sum, 2) if total_warm_delay_steps > 0 else None
         )
         est_cold_delay_tot = (
-            round(sum(fitted_cold_delays), 2) if fitted_cold_delays else None
+            round(total_cold_delay_sum, 2) if total_cold_delay_steps > 0 else None
         )
         wasted_tot = float(totals["wasted_time_s"])
         totals["warm_timed_steps_count"] = total_warm_timed
@@ -1958,15 +2322,16 @@ class MetricsEngine:
         totals["est_cold_delay_s"] = est_cold_delay_tot
         totals["est_total_delay_s"] = (
             round(
-                (est_warm_delay_tot or 0.0) + (est_cold_delay_tot or 0.0) + wasted_tot,
+                (total_est_delay_sum if total_est_delay_count > 0 else 0.0)
+                + wasted_tot,
                 2,
             )
             if (total_est_delay_count > 0 or wasted_tot > 0.0)
             else None
         )
         totals["avg_delay_s"] = (
-            round(sum(all_modeled_delays) / len(all_modeled_delays), 2)
-            if all_modeled_delays
+            round(total_est_delay_sum / total_est_delay_count, 2)
+            if total_est_delay_count > 0
             else None
         )
         totals["median_delay_s"] = (
@@ -1986,10 +2351,6 @@ class MetricsEngine:
         eff_status = conv.status
         eff_gen_since = conv.generating_since_ms
 
-        descendants = _parser.collect_descendant_subagents(
-            self._conversations, conv.conversation_id
-        )
-        sub_ids: list[str] = []
         for sub_id, sub_role, model_hint in descendants:
             sub_conv = self._conversations.get(sub_id)
             if sub_conv is None:
@@ -2019,7 +2380,6 @@ class MetricsEngine:
                 )
                 continue
 
-            sub_ids.append(sub_id)
             s_in = sub_conv.own_input_tokens
             s_cache = sub_conv.own_cache_read_tokens
             s_out = sub_conv.own_output_tokens
@@ -2158,16 +2518,15 @@ class MetricsEngine:
 
         own_rows = [
             {
-                "model_name": bm["model_name"],
-                "steps_count": bm["steps_count"],
-                "input_tokens": bm["input_tokens"],
-                "cache_read_tokens": bm["cache_read_tokens"],
-                "output_tokens": bm["output_tokens"],
+                "model_name": m_name,
+                "steps_count": len(m_steps),
+                "input_tokens": sum(s.input_tokens for s in m_steps),
+                "cache_read_tokens": sum(s.cache_read_tokens for s in m_steps),
+                "output_tokens": sum(s.output_tokens for s in m_steps),
             }
-            for bm in by_model
+            for m_name, m_steps in grouped_steps.items()
         ]
         now_s = time.time()
-        scope_ids = [conv.conversation_id, *sub_ids]
         placeholders = ",".join("?" for _ in scope_ids)
         ep_row = self._db.execute(
             f"SELECT MIN(epoch_s), MAX(epoch_s) FROM step_lite WHERE conv_id IN ({placeholders}) AND epoch_s > 0",
@@ -2179,11 +2538,12 @@ class MetricsEngine:
             round(max(0.0, now_s - first_ep), 3) if first_ep is not None else 0.0
         )
 
+        combined_rows = own_rows + all_sub_rows
         total_val = self._pricing.build_scoped_valuation(
-            own_rows + all_sub_rows,
+            combined_rows,
             own_rows=own_rows,
             sub_rows=all_sub_rows,
-            model_rows=own_rows,
+            model_rows=combined_rows,
         )
         own_5h = self._store.query_window_val_rows(
             now_s - _WINDOW_SECONDS["5h"], [conv.conversation_id]
@@ -2195,7 +2555,7 @@ class MetricsEngine:
             own_5h + sub_5h,
             own_rows=own_5h,
             sub_rows=sub_5h,
-            model_rows=own_5h,
+            model_rows=own_5h + sub_5h,
         )
         own_7d = self._store.query_window_val_rows(
             now_s - _WINDOW_SECONDS["7d"], [conv.conversation_id]
@@ -2207,7 +2567,7 @@ class MetricsEngine:
             own_7d + sub_7d,
             own_rows=own_7d,
             sub_rows=sub_7d,
-            model_rows=own_7d,
+            model_rows=own_7d + sub_7d,
         )
         sub_val = total_val["subagents"]
         session_val = dict(total_val)
@@ -2260,13 +2620,13 @@ class MetricsEngine:
                 "valuation": sub_val,
             },
             "grand_totals": {
-                "input_tokens": totals["input_tokens"] + sub_in,
-                "cache_read_tokens": totals["cache_read_tokens"] + sub_cache,
-                "output_tokens": totals["output_tokens"] + sub_out,
-                "est_thinking_tokens": totals["est_thinking_tokens"] + sub_think,
-                "est_visible_tokens": totals["est_visible_tokens"] + sub_vis,
+                "input_tokens": own_totals["input_tokens"] + sub_in,
+                "cache_read_tokens": own_totals["cache_read_tokens"] + sub_cache,
+                "output_tokens": own_totals["output_tokens"] + sub_out,
+                "est_thinking_tokens": own_totals["est_thinking_tokens"] + sub_think,
+                "est_visible_tokens": own_totals["est_visible_tokens"] + sub_vis,
                 "total_tokens": (
-                    totals["total_tokens"] + sub_in + sub_cache + sub_out
+                    own_totals["total_tokens"] + sub_in + sub_cache + sub_out
                 ),
             },
             "valuation": session_val,

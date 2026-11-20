@@ -239,10 +239,13 @@ function renderMetrics(m) {
     });
   }
 
+  const subs = m.subagents || { count: 0, items: [], totals: {} };
   const globalTotals = m.totals || {};
   renderByModel(byModel, globalTotals, colorMap, {
     onToggleModel: toggleModelFilter,
-    onClearFilter: clearModelFilter
+    onClearFilter: clearModelFilter,
+    isAllMode: isAllMode,
+    subagentsCount: subs.count || 0
   });
 
   const selectedModelEntry = state.modelFilter
@@ -254,6 +257,7 @@ function renderMetrics(m) {
       if (state.lastPayload) renderMetrics(state.lastPayload);
     },
     onSwitchTarget: function (cid) {
+      if (state.convsDataCache) renderScopeSelector(state.convsDataCache, selectScope);
       switchTarget(cid);
     }
   });
@@ -261,16 +265,23 @@ function renderMetrics(m) {
 
   const scopedTot = selectedModelEntry || globalTotals;
   const scopedLast = selectedModelEntry ? selectedModelEntry.latest_step : m.latest_step;
-  const scopedStepsCount = selectedModelEntry ? selectedModelEntry.steps_count : (m.planner_steps_count || 0);
+  const scopedStepsCount = selectedModelEntry
+    ? selectedModelEntry.steps_count
+    : (globalTotals.steps_count != null ? globalTotals.steps_count : (m.planner_steps_count || 0));
   const scopeTag = selectedModelEntry ? (' · ' + shortModelName(selectedModelEntry.model_name)) : '';
 
   const stepTag = scopedLast ? (' #' + scopedLast.ordinal) : '';
-  const lastConvNote = (isAllMode && scopedLast && scopedLast.conv_title) ? ('[' + scopedLast.conv_title + '] ') : '';
+  const isExternalLast = Boolean(
+    scopedLast && scopedLast.conv_title && (isAllMode || (scopedLast.conv_id && scopedLast.conv_id !== m.conversation_id))
+  );
+  const lastConvNote = isExternalLast ? ('[' + scopedLast.conv_title + '] ') : '';
   document.getElementById('kpiInTitle').textContent = 'Input Tokens' + scopeTag;
   document.getElementById('kpiOutTitle').textContent = 'Output Tokens' + scopeTag;
   const kpiLastTitleEl = document.getElementById('kpiLastTitle');
   kpiLastTitleEl.textContent = 'Latest Step' + stepTag + scopeTag;
-  kpiLastTitleEl.title = lastConvNote ? ('Global latest step in ' + scopedLast.conv_title) : '';
+  kpiLastTitleEl.title = isExternalLast
+    ? ((isAllMode ? 'Global latest step in ' : 'Latest subagent step in ') + scopedLast.conv_title)
+    : '';
   document.getElementById('kpiTimingTitle').textContent = (selectedModelEntry ? 'Model Timing' : (m.mode === 'project' ? 'Project Timing' : (isAllMode ? 'Total Timing' : 'Session Timing'))) + scopeTag;
 
   document.getElementById('totGrossIn').textContent = fmtCompact(scopedTot.gross_input_tokens);
@@ -411,10 +422,11 @@ function renderMetrics(m) {
   sumToolEl.textContent = fmtDuration(sumToolTimeS);
   sumToolEl.title = 'Cumulative tool execution time: ' + fmtDuration(sumToolTimeS) + fmtExactSecNote(sumToolTimeS);
   const stepCountLblEl = document.getElementById('stepCountLbl');
-  if (stepCountLblEl) stepCountLblEl.textContent = isAllMode ? 'Total Steps' : 'Planner Steps';
+  if (stepCountLblEl) {
+    stepCountLblEl.textContent = (isAllMode || (!selectedModelEntry && subs.count > 0)) ? 'Total Steps' : 'Planner Steps';
+  }
   document.getElementById('stepCount').textContent = String(scopedStepsCount);
 
-  const subs = m.subagents || { count: 0, items: [], totals: {} };
   const subCard = document.getElementById('subagentCard');
   if (!isAllMode && subs.count > 0) {
     subCard.classList.add('visible');
@@ -493,7 +505,10 @@ function renderMetrics(m) {
   if (orderedSteps.length === 0) {
     const noStepsTr = document.createElement('tr');
     noStepsTr.className = 'muted';
-    noStepsTr.innerHTML = '<td colspan="7" class="muted">No steps recorded yet</td>';
+    const emptyMsg = (state.modelFilter && allSteps.length > 0)
+      ? ('No steps directly on this conversation for ' + shortModelName(state.modelFilter) + ' — click a subagent chip or scatter point to inspect its steps')
+      : 'No steps recorded yet';
+    noStepsTr.innerHTML = '<td colspan="7" class="muted">' + esc(emptyMsg) + '</td>';
     tbody.appendChild(noStepsTr);
   }
 
