@@ -695,6 +695,12 @@ class MetricsStore:
                 "slope_s_per_tok": None,
                 "avg_delay_s": None,
                 "median_delay_s": None,
+                "est_ttft_s": None,
+                "est_prefill_s": None,
+                "est_cache_s": None,
+                "est_delay_s": None,
+                "est_median_delay_s": None,
+                "est_steps_count": 0,
                 "cold_excluded_count": g_cold,
                 "prefill_available": False,
                 "prefill_reason": "unattributed",
@@ -797,6 +803,7 @@ class MetricsStore:
         )
 
         all_points_arg: tuple[tuple[int, int, int, float, str, int], ...] | None = None
+        recent_points_arg: tuple[tuple[int, int, int, float, str, int], ...] | None = None
         if not (cac_cand_ok or pre_cand_ok):
             cache_key: Any = warm_key
         else:
@@ -857,7 +864,29 @@ class MetricsStore:
                 )
                 for r in ordered
             )
-            cache_key = (warm_key, all_points_arg)
+            if pre_cand_ok:
+                recent_rows_desc = self.db.execute(
+                    q_timed
+                    + """
+                    ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
+                    LIMIT ?
+                    """,
+                    (model_name, _FIT_MAX_RECENT_STEPS),
+                ).fetchall()
+                recent_points_arg = tuple(
+                    (
+                        int(r[3]),
+                        int(r[4]),
+                        int(r[5]),
+                        float(r[6]),
+                        str(r[7] or ""),
+                        int(r[8]),
+                    )
+                    for r in reversed(recent_rows_desc)
+                )
+                cache_key = (warm_key, all_points_arg, recent_points_arg)
+            else:
+                cache_key = (warm_key, all_points_arg)
 
         cached = self.global_fit_cache.get(model_name)
         if cached is not None and cached[0] == cache_key:
@@ -865,7 +894,11 @@ class MetricsStore:
         else:
             if on_fit_computed is not None:
                 on_fit_computed()
-            base_fit = compute_roofline_fit(warm_key, all_points=all_points_arg)
+            base_fit = compute_roofline_fit(
+                warm_key,
+                all_points=all_points_arg,
+                recent_points=recent_points_arg,
+            )
             self.global_fit_cache[model_name] = (cache_key, base_fit)
 
         pre_avail = bool(base_fit.get("prefill_available"))

@@ -139,16 +139,24 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     const fit = bm.latency_fit;
     const fitQ = (fit && fit.quantile_pct && fit.quantile_pct < 95) ? ('~P' + fit.quantile_pct) : 'P95';
     const has3Term = Boolean(fit && (fit.prefill_available || fit.cache_available));
-    const baseTipName = has3Term ? 'min base floor' : 'min warm TTFT';
+    const estTtftVal = (fit && fit.available)
+      ? Number(fit.est_ttft_s != null ? fit.est_ttft_s : fit.inferred_ttft_s)
+      : null;
+    const estDelayVal = (fit && fit.available)
+      ? (fit.est_delay_s != null ? Number(fit.est_delay_s) : (fit.avg_delay_s != null ? Number(fit.avg_delay_s) : null))
+      : null;
+    const estP50DelayVal = (fit && fit.available)
+      ? (fit.est_median_delay_s != null ? Number(fit.est_median_delay_s) : (fit.median_delay_s != null ? Number(fit.median_delay_s) : null))
+      : null;
     const fitExtraRates = [];
     if (fit && fit.prefill_available) fitExtraRates.push('~' + fmtBulkTps(fit.inferred_prefill_tps) + ' tok/s prefill');
     if (fit && fit.cache_available) fitExtraRates.push('~' + fmtBulkTps(fit.inferred_cache_tps) + ' tok/s cache');
-    const fitDelayTip = fit && fit.avg_delay_s != null
-      ? (', +' + Number(fit.avg_delay_s).toFixed(2) + 's avg delay' +
-         (fit.median_delay_s != null ? (' (P50 +' + Number(fit.median_delay_s).toFixed(2) + 's)') : ''))
+    const fitDelayTip = estDelayVal != null
+      ? (', +' + estDelayVal.toFixed(2) + 's avg delay' +
+         (estP50DelayVal != null ? (' (P50 +' + estP50DelayVal.toFixed(2) + 's)') : ''))
       : '';
     const fitTip = (fit && fit.available)
-      ? (' · ' + fitQ + ' roofline: ~' + fit.inferred_ttft_s + 's ' + baseTipName + ', ~' + fit.inferred_decode_tps + ' tok/s decode' +
+      ? (' · ' + fitQ + ' roofline: ~' + estTtftVal.toFixed(2) + 's avg TTFT, ~' + fit.inferred_decode_tps + ' tok/s decode' +
          (fitExtraRates.length ? (', ' + fitExtraRates.join(', ')) : '') + fitDelayTip)
       : '';
 
@@ -190,18 +198,34 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
       nomTpsTitle = fitQ + ' speed roofline (n=' + fit.warm_count + ' warm' + coldExclNote + '): ~' +
         Number(fit.inferred_decode_tps).toFixed(1) + ' tok/s decode (' + fit.slope_s_per_tok + ' s/tok) · ' +
         prefillGateNote(fit) + ' · ' + cacheGateNote(fit);
-      if (fit.avg_delay_s != null) {
-        const p50CellNote = fit.median_delay_s != null
-          ? (' · P50: +' + Number(fit.median_delay_s).toFixed(2) + 's')
+      const ttftParts = [];
+      if (has3Term) {
+        ttftParts.push('~' + Number(fit.inferred_ttft_s).toFixed(2) + 's base');
+        if (fit.prefill_available && fit.est_prefill_s != null) {
+          ttftParts.push('~' + Number(fit.est_prefill_s).toFixed(2) + 's prefill');
+        }
+        if (fit.cache_available && fit.est_cache_s != null) {
+          ttftParts.push('~' + Number(fit.est_cache_s).toFixed(2) + 's cache');
+        }
+      }
+      const ttftDesc = has3Term
+        ? ('avg step start (' + ttftParts.join(' + ') + ')')
+        : ('avg warm TTFT (' + fitQ + ')');
+      const sampleScopeNote = fit.est_steps_count > 0
+        ? (' · last ' + fit.est_steps_count + (fit.prefill_available ? ' steps' : ' warm steps'))
+        : '';
+      if (estDelayVal != null) {
+        const p50CellNote = estP50DelayVal != null
+          ? (' · P50 delay: +' + estP50DelayVal.toFixed(2) + 's')
           : '';
-        ttftDelayHtml = esc(fmtApproxSec(fit.inferred_ttft_s)) + ' <span class="muted">(' + esc(fmtShortDelay(fit.avg_delay_s)) + ')</span>';
-        ttftDelayTitle = '~' + Number(fit.inferred_ttft_s).toFixed(2) + 's ' + baseTipName + ' (' + fitQ + ') + ' +
-          Number(fit.avg_delay_s).toFixed(2) + 's avg excess delay (~' +
-          (Number(fit.inferred_ttft_s) + Number(fit.avg_delay_s)).toFixed(2) + 's mean ' +
-          (has3Term ? 'base overhead' : 'warm step overhead') + p50CellNote + ')';
+        ttftDelayHtml = esc(fmtApproxSec(estTtftVal)) + ' <span class="muted">(' + esc(fmtShortDelay(estDelayVal)) + ')</span>';
+        ttftDelayTitle = '~' + estTtftVal.toFixed(2) + 's ' + ttftDesc + ' + ' +
+          estDelayVal.toFixed(2) + 's avg delay (~' +
+          (estTtftVal + estDelayVal).toFixed(2) + 's expected before decode' +
+          p50CellNote + sampleScopeNote + ')';
       } else {
-        ttftDelayHtml = esc(fmtApproxSec(fit.inferred_ttft_s)) + ' <span class="muted">(—)</span>';
-        ttftDelayTitle = '~' + Number(fit.inferred_ttft_s).toFixed(2) + 's ' + baseTipName + ' (' + fitQ + ') · No modeled timed steps in current scope';
+        ttftDelayHtml = esc(fmtApproxSec(estTtftVal)) + ' <span class="muted">(—)</span>';
+        ttftDelayTitle = '~' + estTtftVal.toFixed(2) + 's ' + ttftDesc + sampleScopeNote;
       }
     } else {
       const rawAvgNote = bm.avg_effective_tps != null ? (' · Raw avg: ' + bm.avg_effective_tps + ' tok/s') : '';
@@ -280,17 +304,41 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
         : ' · Needs ≥4 warm timed steps on at least one model to estimate roofline delay');
     let totTtftDelayHtml;
     let totTtftDelayTitle;
-    if (totals.avg_delay_s != null) {
+    let wSum = 0;
+    let wTtftSum = 0;
+    let wDelaySum = 0;
+    let fittedModelsCnt = 0;
+    list.forEach(function (bm) {
+      const f = bm.latency_fit;
+      if (!f || !f.available) return;
+      const tVal = f.est_ttft_s != null ? Number(f.est_ttft_s) : Number(f.inferred_ttft_s);
+      const dVal = f.est_delay_s != null ? Number(f.est_delay_s) : (f.avg_delay_s != null ? Number(f.avg_delay_s) : null);
+      if (tVal == null || dVal == null) return;
+      const w = bm.timed_steps_count > 0 ? bm.timed_steps_count : (bm.steps_count || 0);
+      if (w <= 0) return;
+      wSum += w;
+      wTtftSum += w * tVal;
+      wDelaySum += w * dVal;
+      fittedModelsCnt += 1;
+    });
+    if (wSum > 0) {
+      const avgTotTtft = wTtftSum / wSum;
+      const avgTotDelay = wDelaySum / wSum;
+      totTtftDelayHtml = esc(fmtApproxSec(avgTotTtft)) + ' <span class="muted">(' + esc(fmtShortDelay(avgTotDelay)) + ')</span>';
+      totTtftDelayTitle = 'Step-weighted avg across ' + fittedModelsCnt + '/' + list.length +
+        ' fitted model(s): ~' + avgTotTtft.toFixed(2) + 's avg start + ' +
+        avgTotDelay.toFixed(2) + 's avg delay (~' + (avgTotTtft + avgTotDelay).toFixed(2) + 's expected before decode)';
+    } else if (totals.avg_delay_s != null) {
       const totP50Note = totals.median_delay_s != null
         ? (' · P50: +' + Number(totals.median_delay_s).toFixed(2) + 's')
         : '';
       totTtftDelayHtml = '— <span class="muted">(' + esc(fmtShortDelay(totals.avg_delay_s)) + ')</span>';
-      totTtftDelayTitle = 'Min TTFT varies by model · Pooled avg warm excess delay: +' +
+      totTtftDelayTitle = 'TTFT varies by model · Pooled avg excess delay: +' +
         Number(totals.avg_delay_s).toFixed(2) + 's' + totP50Note + ' (' +
         (totals.est_delay_steps_count || 0) + '/' + (totals.warm_timed_steps_count || 0) + ' warm steps covered)';
     } else {
       totTtftDelayHtml = '—';
-      totTtftDelayTitle = 'Needs ≥4 warm timed steps on at least one model to estimate roofline delay';
+      totTtftDelayTitle = 'Needs ≥4 warm timed steps on at least one model to estimate step start & delay';
     }
     const sumTr = document.createElement('tr');
     sumTr.className = 'model-summary-row';

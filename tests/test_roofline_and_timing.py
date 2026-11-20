@@ -1535,6 +1535,12 @@ class TestRooflineAndTiming(unittest.TestCase):
                 self.assertIsNone(m1["steps"][7]["est_delay_s"])
                 self.assertIsNone(m1["totals"]["est_cold_delay_s"])
                 self.assertEqual(m1["totals"]["cold_delay_steps_count"], 0)
+                self.assertEqual(fit1["est_ttft_s"], fit1["inferred_ttft_s"])
+                self.assertIsNone(fit1["est_prefill_s"])
+                self.assertIsNone(fit1["est_cache_s"])
+                self.assertIsNotNone(fit1["est_delay_s"])
+                self.assertIsNotNone(fit1["est_median_delay_s"])
+                self.assertEqual(fit1["est_steps_count"], 6)
 
                 # Phase 2: Add low-P cache spread (including two fast-decode 15k-output points to test w_clean)
                 tr_recs_p2: list[dict] = []
@@ -1618,6 +1624,11 @@ class TestRooflineAndTiming(unittest.TestCase):
                 self.assertLessEqual(fit2["inferred_decode_tps"], 235.0)
                 self.assertEqual(fit2["cold_excluded_count"], 2)
                 self.assertIsNone(m2["steps"][6]["est_delay_s"])
+                self.assertIsNone(fit2["est_prefill_s"])
+                self.assertIsNotNone(fit2["est_cache_s"])
+                self.assertGreater(fit2["est_cache_s"], 0.3)
+                self.assertGreater(fit2["est_ttft_s"], fit2["inferred_ttft_s"] + 0.3)
+                self.assertEqual(fit2["est_steps_count"], 18)
 
                 # Phase 3: Add 6 more high-prefill steps -> unlocks prefill & backfills earlier cold steps
                 tr_recs_p3: list[dict] = []
@@ -1676,6 +1687,14 @@ class TestRooflineAndTiming(unittest.TestCase):
                 self.assertLessEqual(fit3["inferred_cache_tps"], 160_000)
                 self.assertGreaterEqual(fit3["inferred_prefill_tps"], 15_000)
                 self.assertLessEqual(fit3["inferred_prefill_tps"], 26_000)
+                self.assertIsNotNone(fit3["est_prefill_s"])
+                self.assertIsNotNone(fit3["est_cache_s"])
+                self.assertGreater(fit3["est_prefill_s"], 1.0)
+                self.assertGreater(fit3["est_cache_s"], 0.3)
+                self.assertGreater(fit3["est_ttft_s"], fit3["inferred_ttft_s"] + 1.5)
+                self.assertIsNotNone(fit3["est_delay_s"])
+                self.assertIsNotNone(fit3["est_median_delay_s"])
+                self.assertEqual(fit3["est_steps_count"], 26)
 
                 # Earlier cold steps (ordinal 7, 8 -> indices 6, 7) are now backfilled with est_delay_s
                 self.assertIsNotNone(m3["steps"][6]["est_delay_s"])
@@ -1698,6 +1717,15 @@ class TestRooflineAndTiming(unittest.TestCase):
                 bm_all = mall["by_model"][0]
                 self.assertEqual(bm_all["latency_fit"]["inferred_prefill_tps"], fit3["inferred_prefill_tps"])
                 self.assertEqual(bm_all["latency_fit"]["inferred_cache_tps"], fit3["inferred_cache_tps"])
+                for key in (
+                    "est_ttft_s",
+                    "est_prefill_s",
+                    "est_cache_s",
+                    "est_delay_s",
+                    "est_median_delay_s",
+                    "est_steps_count",
+                ):
+                    self.assertEqual(bm_all["latency_fit"][key], fit3[key], key)
                 self.assertEqual(mall["totals"]["cold_delay_steps_count"], 8)
                 self.assertAlmostEqual(mall["totals"]["est_cold_delay_s"], tot3["est_cold_delay_s"], places=2)
                 self.assertAlmostEqual(mall["totals"]["est_total_delay_s"], tot3["est_total_delay_s"], places=2)
@@ -1705,6 +1733,62 @@ class TestRooflineAndTiming(unittest.TestCase):
                 for ss in bm_all["scatter_steps"]:
                     self.assertIn("input_tokens", ss)
                     self.assertIn("cache_read_tokens", ss)
+
+                # A separate conversation with just 1 step sees the exact same latest global expectations
+                cid_other = "conv-3term-other-scope"
+                other_dur = gt_dur(1500, 10000, 300, 4.0)
+                write_jsonl(
+                    brain / cid_other / ".system_generated" / "logs" / "transcript_full.jsonl",
+                    [
+                        {
+                            "step_index": 0,
+                            "type": "USER_INPUT",
+                            "created_at": _iso(cur + 10.0),
+                            "content": (
+                                "<USER_REQUEST>\nOther scope\n</USER_REQUEST>\n"
+                                "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Model ThreeTerm. No need to comment.\n</USER_SETTINGS_CHANGE>"
+                            ),
+                        },
+                        {
+                            "step_index": 1,
+                            "type": "PLANNER_RESPONSE",
+                            "created_at": _iso(cur + 12.0),
+                            "input_tokens": 1500,
+                            "cache_read_tokens": 10000,
+                            "output_tokens": 300,
+                            "thinking": "",
+                            "content": "Single step",
+                            "tool_calls": [],
+                        },
+                    ],
+                )
+                write_jsonl(
+                    state / "conversations" / f"{cid_other}.hooks.jsonl",
+                    [
+                        {"ts_ms": int((cur + 12.0) * 1000), "event": "PreInvocation", "conversation_id": cid_other},
+                        {"ts_ms": int((cur + 12.0 + other_dur) * 1000), "event": "PostInvocation", "conversation_id": cid_other},
+                    ],
+                )
+                eng._last_full_scan_mono = 0.0
+                m_c1 = eng.get_metrics(cid)
+                m_c2 = eng.get_metrics(cid_other)
+                m_all2 = eng.get_metrics(ALL_CONVERSATIONS_ID)
+                fit_c1 = m_c1["by_model"][0]["latency_fit"]
+                fit_c2 = m_c2["by_model"][0]["latency_fit"]
+                fit_all2 = m_all2["by_model"][0]["latency_fit"]
+                # Scoped avg_delay_s differs across conversations, while global est_ttft_s / est_delay_s stay invariant
+                self.assertNotAlmostEqual(fit_c1["avg_delay_s"], fit_c2["avg_delay_s"], places=1)
+                for key in (
+                    "est_ttft_s",
+                    "est_prefill_s",
+                    "est_cache_s",
+                    "est_delay_s",
+                    "est_median_delay_s",
+                    "est_steps_count",
+                ):
+                    self.assertEqual(fit_c1[key], fit_c2[key], key)
+                    self.assertEqual(fit_c1[key], fit_all2[key], key)
+                self.assertEqual(fit_c1["est_steps_count"], 27)
             finally:
                 eng.close()
 

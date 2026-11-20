@@ -77,7 +77,7 @@
               <th title="Total output tokens and estimated thinking tokens">Output (~Think)</th>
               <th title="Total model wait time (completed inference + retry/failed wait) and cumulative estimated delay (warm serving/prefill variance + retry/failed wait; system compaction calls excluded)">Time (~Delay)</th>
               <th title="Inferred uncongested nominal decode throughput ceiling (P95 speed roofline, tok/s) — hover cells for prefill &amp; cache recovery speeds">~Dec. TPS</th>
-              <th title="Inferred uncongested base latency floor (or warm TTFT before prefill/cache speeds unlock) and average per-step excess delay beyond the roofline — hover cells for P50 median">~Base (+Delay)</th>
+              <th title="Estimated average step start time (base floor + prefill + cache recovery) and average per-step excess delay across each model's recent steps — hover cells for breakdown &amp; P50">~TTFT (+Delay)</th>
             </tr>
           </thead>
           <tbody id="byModelTbody"></tbody>
