@@ -231,32 +231,51 @@ export function syncTheme() {
   if (onThemeChangedCb) onThemeChangedCb();
 }
 
+let themeSyncRafId = null;
+let suppressThemeObserver = false;
+
+function scheduleSyncTheme() {
+  if (suppressThemeObserver || themeSyncRafId !== null) return;
+  const sched = typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function'
+    ? window.requestAnimationFrame
+    : function (fn) { return setTimeout(fn, 16); };
+  themeSyncRafId = sched(function () {
+    themeSyncRafId = null;
+    syncTheme();
+  });
+}
+
 export function applyHostMessage(raw) {
   if (!raw || typeof raw !== 'object') return;
   const msg = (raw.payload && typeof raw.payload === 'object') ? raw.payload : raw;
   const tokens = msg.tokens || msg.variables || msg.cssVariables;
   const root = document.documentElement;
-  if (tokens && typeof tokens === 'object') {
-    Object.keys(tokens).forEach(function (k) {
-      const v = tokens[k];
-      if (
-        VALID_TOKEN_NAME.test(k) &&
-        typeof v === 'string' &&
-        v.length > 0 &&
-        v.length <= 200 &&
-        !/[;{}<>\\]|url\(|expression/i.test(v)
-      ) {
-        root.style.setProperty(k, v);
-      }
-    });
+  suppressThemeObserver = true;
+  try {
+    if (tokens && typeof tokens === 'object') {
+      Object.keys(tokens).forEach(function (k) {
+        const v = tokens[k];
+        if (
+          VALID_TOKEN_NAME.test(k) &&
+          typeof v === 'string' &&
+          v.length > 0 &&
+          v.length <= 200 &&
+          !/[;{}<>\\]|url\(|expression/i.test(v)
+        ) {
+          root.style.setProperty(k, v);
+        }
+      });
+    }
+    const rawScheme = msg.scheme || msg.theme || msg.colorScheme || msg.mode;
+    if (typeof rawScheme === 'string') {
+      const lower = rawScheme.toLowerCase();
+      if (lower.indexOf('dark') !== -1) hostPostScheme = 'dark';
+      else if (lower.indexOf('light') !== -1) hostPostScheme = 'light';
+    }
+    syncTheme();
+  } finally {
+    suppressThemeObserver = false;
   }
-  const rawScheme = msg.scheme || msg.theme || msg.colorScheme || msg.mode;
-  if (typeof rawScheme === 'string') {
-    const lower = rawScheme.toLowerCase();
-    if (lower.indexOf('dark') !== -1) hostPostScheme = 'dark';
-    else if (lower.indexOf('light') !== -1) hostPostScheme = 'light';
-  }
-  syncTheme();
 }
 
 export function initThemeControls(onThemeChanged) {
@@ -265,7 +284,7 @@ export function initThemeControls(onThemeChanged) {
 
   if (typeof MutationObserver === 'function') {
     new MutationObserver(function () {
-      syncTheme();
+      scheduleSyncTheme();
     }).observe(document.documentElement, {
       attributes: true,
       attributeFilter: ['style', 'class']

@@ -700,6 +700,8 @@ class MetricsStore:
                 "est_cache_s": None,
                 "est_delay_s": None,
                 "est_median_delay_s": None,
+                "est_roofline_delay_s": None,
+                "est_retry_delay_s": None,
                 "est_steps_count": 0,
                 "cold_excluded_count": g_cold,
                 "prefill_available": False,
@@ -773,7 +775,8 @@ class MetricsStore:
 
         q_timed = """
             SELECT conv_id, ordinal, epoch_s, input_tokens, cache_read_tokens,
-                   output_tokens, duration_s, duration_source, cold_cache_spike
+                   output_tokens, duration_s, duration_source, cold_cache_spike,
+                   COALESCE(retry_wait_s, 0.0)
             FROM step_lite
             WHERE model_name = ?
               AND is_checkpoint = 0
@@ -798,12 +801,13 @@ class MetricsStore:
                 float(r[6]),
                 str(r[7] or ""),
                 int(r[8]),
+                float(r[9] or 0.0),
             )
             for r in reversed(warm_rows_desc)
         )
 
-        all_points_arg: tuple[tuple[int, int, int, float, str, int], ...] | None = None
-        recent_points_arg: tuple[tuple[int, int, int, float, str, int], ...] | None = None
+        all_points_arg: tuple[tuple[int, int, int, float, str, int, float], ...] | None = None
+        recent_points_arg: tuple[tuple[int, int, int, float, str, int, float], ...] | None = None
         if not (cac_cand_ok or pre_cand_ok):
             cache_key: Any = warm_key
         else:
@@ -861,6 +865,7 @@ class MetricsStore:
                     float(r[6]),
                     str(r[7] or ""),
                     int(r[8]),
+                    float(r[9] or 0.0),
                 )
                 for r in ordered
             )
@@ -881,6 +886,7 @@ class MetricsStore:
                         float(r[6]),
                         str(r[7] or ""),
                         int(r[8]),
+                        float(r[9] or 0.0),
                     )
                     for r in reversed(recent_rows_desc)
                 )

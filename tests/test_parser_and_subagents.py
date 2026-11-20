@@ -1632,6 +1632,29 @@ class TestParserAndSubagents(unittest.TestCase):
                     m_warm["totals"]["total_tokens"],
                     m_warm["grand_totals"]["total_tokens"],
                 )
+
+                # Even if dehydrated in-memory subagent counters are stale/zero, conv_model_totals keeps subagent rollup accurate
+                for scid in (cid_sub1, cid_sub2, cid_grand):
+                    sc = eng2._conversations[scid]
+                    sc.summary_steps_count = 0
+                    sc.own_input_tokens = 0
+                    sc.own_cache_read_tokens = 0
+                    sc.own_output_tokens = 0
+                    sc.own_est_thinking_tokens = 0
+                    sc.own_est_visible_tokens = 0
+                m_stale = eng2.get_metrics(cid_parent)
+                self.assertEqual(
+                    m_stale["totals"]["total_tokens"],
+                    m_stale["grand_totals"]["total_tokens"],
+                )
+                self.assertEqual(
+                    sum(it["planner_steps_count"] for it in m_stale["subagents"]["items"]),
+                    6,
+                )
+                self.assertGreater(m_stale["subagents"]["totals"]["total_tokens"], 0)
+                eng2._convs_cache = None
+                convs_by_id = {c["conversation_id"]: c for c in eng2.list_conversations()["conversations"]}
+                self.assertEqual(convs_by_id[cid_sub1]["planner_steps_count"], 3)
             finally:
                 eng2.close()
 

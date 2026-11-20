@@ -279,18 +279,28 @@ class TestInstallAndFrontend(unittest.TestCase):
             "HISTORY_AREA_THRESHOLD = 60",
             "lastHistoryKey",
             "steps10 = [10, 12, 14",
-            "Nominal TPS",
+            "Decode TPS",
             "speed roofline",
-            "Time (~Delay)",
-            "~Dec. TPS",
-            "~TTFT (+Delay)",
+            "Time (Delay)",
+            "TTFT (+Delay)",
             "est_ttft_s",
             "est_median_delay_s",
             "scatterModeToggle",
             'data-scatter-mode="prefill"',
             'data-scatter-mode="cache"',
-            "~Prefill TPS",
-            "~Cache TPS",
+            "Prefill TPS",
+            "Cache TPS",
+            "fmtLatencyPercentile",
+            "fmtPct",
+            "fmtLocalTime",
+            "scatter-hover-bar",
+            "detail-grid",
+            "detail-tools",
+            "lastScopeStructSig",
+            "lastStepsSig",
+            "scrollToStepIndex",
+            "scheduleSyncTheme",
+            "Generating (stale)",
             "computeStepRooflineParts",
             "lastDelay",
             "sumEstDelay",
@@ -332,6 +342,12 @@ class TestInstallAndFrontend(unittest.TestCase):
             "Uncached In",
             "Cached Read",
             "Output (incl. think)",
+            "est_roofline_delay_s",
+            "est_retry_delay_s",
+            "Session Token Split",
+            "kpi-scope-note",
+            "data-scope-match",
+            "switchTarget(state.selectedConvId)",
         ):
             self.assertIn(required, combined, required)
 
@@ -406,7 +422,9 @@ class TestInstallAndFrontend(unittest.TestCase):
         )
         self.assertIsNotNone(steps_thead_match)
         steps_thead = steps_thead_match.group(1) if steps_thead_match else ""
-        self.assertIn(">Time (~Delay)<", steps_thead)
+        self.assertIn(">Time (Delay)<", steps_thead)
+        self.assertIn(">Context (Hit%)<", steps_thead)
+        self.assertIn(">Out (Think)<", steps_thead)
         self.assertIn(">Paygo<", steps_thead)
         self.assertNotIn(">tok/s<", steps_thead)
 
@@ -427,6 +445,16 @@ class TestInstallAndFrontend(unittest.TestCase):
 
     def test_card_header_pills_and_toggles_uniform_height(self) -> None:
         css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+        # Verify balanced CSS braces (no stray '}' that could break subsequent rules)
+        css_no_comments = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+        depth = 0
+        for ch in css_no_comments:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                self.assertGreaterEqual(depth, 0, "Unexpected stray '}' in styles.css")
+        self.assertEqual(depth, 0, "Unbalanced '{' / '}' in styles.css")
 
         def parse_rule(selector: str) -> dict[str, str]:
             match = re.search(

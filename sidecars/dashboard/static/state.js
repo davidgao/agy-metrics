@@ -1,5 +1,7 @@
 // Shared dashboard client state, URL helpers, and demand-driven generation timer.
 
+import { fmtDuration } from './format.js';
+
 export const ALL_CONVERSATIONS_ID = '__all__';
 export const PROJECT_SCOPE_PREFIX = 'project:';
 export const UNASSIGNED_PROJECT_ID = '__unassigned__';
@@ -43,6 +45,8 @@ export const state = {
   scatterMode: 'decode',
   lastScatterKey: null,
   lastHistoryKey: null,
+  lastStepsSig: null,
+  scrollToStepIndex: null,
   modelFilter: null,
   pendingJump: null,
   es: null,
@@ -83,6 +87,10 @@ export function syncModeControls() {
   const followEl = document.getElementById('followToggle');
   if (allCtrl) allCtrl.classList.toggle('hidden', !isAgg);
   if (followEl) followEl.checked = Boolean(state.followActive);
+  ['ctxCard', 'historyCard', 'stepsCard', 'subagentCard'].forEach(function (id) {
+    const el = document.getElementById(id);
+    if (el && isAgg) el.style.display = 'none';
+  });
   const winBtns = document.querySelectorAll('.filter-pill[data-window]');
   winBtns.forEach(function (btn) {
     const active = btn.getAttribute('data-window') === state.timeWindow;
@@ -162,11 +170,19 @@ export function updateGeneratingTimer() {
   if (!pill || !dot || !lbl) return;
   if (state.status === 'generating') {
     pill.classList.add('generating');
+    if (state.healthFailCount > 0) {
+      dot.className = 'dot err';
+      lbl.textContent = 'Generating (stale)';
+      pill.title = 'Connection interrupted — generation timer paused until reconnected';
+      return;
+    }
+    pill.title = '';
     dot.className = 'dot gen';
     const sec = state.generatingSinceMs ? Math.max(0, (Date.now() - state.generatingSinceMs) / 1000) : 0;
-    lbl.textContent = 'Generating ' + sec.toFixed(1) + 's';
+    lbl.textContent = 'Generating ' + (sec >= 60 ? fmtDuration(sec) : (sec.toFixed(1) + 's'));
   } else {
     pill.classList.remove('generating');
+    pill.title = '';
     dot.className = 'dot';
     lbl.textContent = 'Idle';
   }
@@ -175,7 +191,7 @@ export function updateGeneratingTimer() {
 export function syncGeneratingTimer() {
   updateGeneratingTimer();
   const isHidden = typeof document !== 'undefined' && Boolean(document.hidden);
-  const shouldRun = state.status === 'generating' && !isHidden;
+  const shouldRun = state.status === 'generating' && !isHidden && state.healthFailCount === 0;
   if (shouldRun) {
     if (genTimerId === null) {
       genTimerId = setInterval(updateGeneratingTimer, 100);

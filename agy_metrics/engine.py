@@ -767,6 +767,12 @@ class MetricsEngine:
             ):
                 _emit_subtree(c)
 
+            db_steps_by_cid = {
+                str(r[0]): int(r[1] or 0)
+                for r in self._db.execute(
+                    "SELECT conv_id, SUM(steps_count) FROM conv_model_totals GROUP BY conv_id"
+                ).fetchall()
+            }
             payload = {
                 "active_conversation_id": active_id,
                 "active_project_id": active_project_id,
@@ -782,7 +788,12 @@ class MetricsEngine:
                         "model_name": c.current_model_name,
                         "status": c.status,
                         "planner_steps_count": (
-                            len(c.steps) if c.hydrated else c.summary_steps_count
+                            len(c.steps)
+                            if c.hydrated
+                            else (
+                                db_steps_by_cid.get(c.conversation_id)
+                                or c.summary_steps_count
+                            )
                         ),
                         "current_tokens": c.current_tokens,
                         "updated_at_ms": c.updated_at_ms,
@@ -894,7 +905,8 @@ class MetricsEngine:
             f"""
             SELECT conv_id, ordinal, step_index, epoch_s,
                    input_tokens, cache_read_tokens, output_tokens, duration_s,
-                   duration_source, cold_cache_spike, est_delay_s
+                   duration_source, cold_cache_spike, est_delay_s,
+                   COALESCE(retry_wait_s, 0.0)
             FROM step_lite
             WHERE model_name = ?
               AND is_checkpoint = 0
@@ -915,7 +927,8 @@ class MetricsEngine:
                 f"""
                 SELECT conv_id, ordinal, step_index, epoch_s,
                        input_tokens, cache_read_tokens, output_tokens, duration_s,
-                       duration_source, cold_cache_spike, est_delay_s
+                       duration_source, cold_cache_spike, est_delay_s,
+                       COALESCE(retry_wait_s, 0.0)
                 FROM step_lite
                 WHERE model_name = ?
                   AND is_checkpoint = 0
@@ -933,7 +946,8 @@ class MetricsEngine:
                 f"""
                 SELECT conv_id, ordinal, step_index, epoch_s,
                        input_tokens, cache_read_tokens, output_tokens, duration_s,
-                       duration_source, cold_cache_spike, est_delay_s
+                       duration_source, cold_cache_spike, est_delay_s,
+                       COALESCE(retry_wait_s, 0.0)
                 FROM step_lite
                 WHERE model_name = ?
                   AND is_checkpoint = 0
@@ -985,13 +999,15 @@ class MetricsEngine:
                 s_src,
                 s_cold,
                 s_delay,
+                s_retry,
             ) = sr
             c_obj = self._conversations.get(str(s_cid))
             s_dur_f = float(s_dur)
             s_out_i = int(s_out)
+            s_retry_f = max(0.0, float(s_retry or 0.0))
             s_delay_f = round(float(s_delay), 2) if s_delay is not None else None
             if s_out_i > 0 and s_delay_f is not None:
-                modeled_delays.append(s_delay_f)
+                modeled_delays.append(round(s_delay_f + s_retry_f, 2))
             scatter_steps.append(
                 {
                     "seq": seq_i,
@@ -1007,6 +1023,7 @@ class MetricsEngine:
                     "cold_cache_spike": bool(s_cold),
                     "step_kind": "planner",
                     "est_delay_s": s_delay_f,
+                    "retry_wait_s": round(s_retry_f, 2),
                     "conv_id": str(s_cid),
                     "conv_title": (
                         c_obj.title if c_obj is not None else str(s_cid)[:8]
@@ -1017,7 +1034,7 @@ class MetricsEngine:
         if not modeled_delays and est_delay_count > 0:
             fb_rows = self._db.execute(
                 f"""
-                SELECT est_delay_s
+                SELECT est_delay_s, COALESCE(retry_wait_s, 0.0)
                 FROM step_lite
                 WHERE model_name = ?
                   AND is_checkpoint = 0
@@ -1029,7 +1046,9 @@ class MetricsEngine:
                 """,
                 (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
             ).fetchall()
-            modeled_delays = [round(float(r[0]), 2) for r in fb_rows]
+            modeled_delays = [
+                round(float(r[0]) + max(0.0, float(r[1] or 0.0)), 2) for r in fb_rows
+            ]
 
         return scatter_steps, modeled_delays
 
@@ -1335,23 +1354,12 @@ class MetricsEngine:
                 est_delay_count=m_est_delay_count,
             )
 
-            m_avg_delay_s: float | None = (
-                round(m_delay_sum / m_est_delay_count, 2)
-                if m_est_delay_count > 0
-                else None
-            )
-
             if global_fit["available"]:
                 pooled_sample_delays.extend(win_modeled_delays)
-                fit: dict[str, Any] = {
-                    **global_fit,
-                    "avg_delay_s": m_avg_delay_s,
-                    "median_delay_s": round(statistics.median(win_modeled_delays), 2)
-                    if win_modeled_delays
-                    else None,
-                }
-            else:
-                fit = global_fit
+            fit: dict[str, Any] = dict(global_fit)
+            m_avg_delay_s: float | None = (
+                fit.get("avg_delay_s") if fit.get("available") else None
+            )
 
             m_est_warm_delay: float | None = (
                 round(m_warm_delay_sum, 2) if m_warm_delay_count > 0 else None
@@ -1496,8 +1504,8 @@ class MetricsEngine:
                 "est_cold_delay_s": est_cold_delay_tot,
                 "est_total_delay_s": est_total_delay_tot,
                 "avg_delay_s": (
-                    round(total_est_delay_sum / total_est_delay_steps, 2)
-                    if total_est_delay_steps > 0
+                    round(est_total_delay_tot / total_est_delay_steps, 2)
+                    if (est_total_delay_tot is not None and total_est_delay_steps > 0)
                     else None
                 ),
                 "median_delay_s": (
@@ -1949,28 +1957,17 @@ class MetricsEngine:
                     scope_args=scope_args,
                     est_delay_count=m_est_delay_count,
                 )
-                m_avg_delay_s: float | None = (
-                    round(m_delay_sum / m_est_delay_count, 2)
-                    if m_est_delay_count > 0
-                    else None
-                )
                 if global_fit["available"]:
                     all_modeled_delays.extend(m_delays)
-                    fit_for_conv: dict[str, Any] = {
-                        **global_fit,
-                        "cold_excluded_count": m_cold_excl,
-                        "avg_delay_s": m_avg_delay_s,
-                        "median_delay_s": (
-                            round(statistics.median(m_delays), 2)
-                            if m_delays
-                            else None
-                        ),
-                    }
-                else:
-                    fit_for_conv = {
-                        **global_fit,
-                        "cold_excluded_count": m_cold_excl,
-                    }
+                fit_for_conv: dict[str, Any] = {
+                    **global_fit,
+                    "cold_excluded_count": m_cold_excl,
+                }
+                m_avg_delay_s: float | None = (
+                    fit_for_conv.get("avg_delay_s")
+                    if fit_for_conv.get("available")
+                    else None
+                )
 
                 m_est_warm_delay: float | None = (
                     round(m_warm_delay_sum, 2) if m_warm_delay_count > 0 else None
@@ -2131,6 +2128,11 @@ class MetricsEngine:
                     for s in m_modeled_timed
                     if (d := step_delays.get(s.ordinal)) is not None
                 ]
+                m_delays_with_retry = [
+                    round(d + max(0.0, float(s.retry_wait_s)), 2)
+                    for s in m_modeled_timed
+                    if (d := step_delays.get(s.ordinal)) is not None
+                ]
                 m_agg = aggregate_steps(
                     m_steps,
                     failed_turns_wasted_s=m_ft_wasted,
@@ -2155,29 +2157,20 @@ class MetricsEngine:
                     total_cold_delay_sum += m_cold_delay_sum
                 if m_delays:
                     m_est_delay_count = len(m_delays)
-                    m_avg_delay_s = round(m_delay_sum / m_est_delay_count, 2)
                     total_est_delay_count += m_est_delay_count
                     total_est_delay_sum += m_delay_sum
-                    all_modeled_delays.extend(m_delays)
-                    fit_for_conv = {
-                        **global_fit,
-                        "cold_excluded_count": m_cold_excl,
-                        "avg_delay_s": m_avg_delay_s,
-                        "median_delay_s": round(statistics.median(m_delays), 2),
-                    }
+                    all_modeled_delays.extend(m_delays_with_retry)
                 else:
                     m_est_delay_count = 0
-                    m_avg_delay_s = None
-                    fit_for_conv = (
-                        {
-                            **global_fit,
-                            "cold_excluded_count": m_cold_excl,
-                            "avg_delay_s": None,
-                            "median_delay_s": None,
-                        }
-                        if global_fit["available"]
-                        else {**global_fit, "cold_excluded_count": m_cold_excl}
-                    )
+                fit_for_conv = {
+                    **global_fit,
+                    "cold_excluded_count": m_cold_excl,
+                }
+                m_avg_delay_s = (
+                    fit_for_conv.get("avg_delay_s")
+                    if fit_for_conv.get("available")
+                    else None
+                )
                 if m_delays or m_wasted_round > 0.0:
                     m_est_total_delay = round(
                         (m_delay_sum if m_delays else 0.0) + m_wasted_round, 2
@@ -2330,8 +2323,8 @@ class MetricsEngine:
             else None
         )
         totals["avg_delay_s"] = (
-            round(total_est_delay_sum / total_est_delay_count, 2)
-            if total_est_delay_count > 0
+            round(totals["est_total_delay_s"] / total_est_delay_count, 2)
+            if (totals["est_total_delay_s"] is not None and total_est_delay_count > 0)
             else None
         )
         totals["median_delay_s"] = (
@@ -2353,7 +2346,17 @@ class MetricsEngine:
 
         for sub_id, sub_role, model_hint in descendants:
             sub_conv = self._conversations.get(sub_id)
-            if sub_conv is None:
+            sub_db_rows = self._db.execute(
+                """
+                SELECT model_name, steps_count, input_tokens, cache_read_tokens,
+                       output_tokens, est_thinking_tokens, est_visible_tokens
+                FROM conv_model_totals
+                WHERE conv_id = ?
+                """,
+                (sub_id,),
+            ).fetchall()
+
+            if sub_conv is None and not sub_db_rows:
                 missing_model = normalize_step_model(
                     model_hint or "unknown", is_subagent=True
                 )
@@ -2380,28 +2383,6 @@ class MetricsEngine:
                 )
                 continue
 
-            s_in = sub_conv.own_input_tokens
-            s_cache = sub_conv.own_cache_read_tokens
-            s_out = sub_conv.own_output_tokens
-            s_think = sub_conv.own_est_thinking_tokens
-            s_vis = sub_conv.own_est_visible_tokens
-            sub_in += s_in
-            sub_cache += s_cache
-            sub_out += s_out
-            sub_think += s_think
-            sub_vis += s_vis
-            if sub_conv.status == "generating" and eff_status != "generating":
-                eff_status = "generating"
-                eff_gen_since = sub_conv.generating_since_ms
-
-            sub_db_rows = self._db.execute(
-                """
-                SELECT model_name, steps_count, input_tokens, cache_read_tokens, output_tokens
-                FROM conv_model_totals
-                WHERE conv_id = ?
-                """,
-                (sub_id,),
-            ).fetchall()
             single_sub_rows: list[dict[str, Any]] = []
             if sub_db_rows:
                 single_sub_rows = [
@@ -2414,7 +2395,13 @@ class MetricsEngine:
                     }
                     for r in sub_db_rows
                 ]
-            elif sub_conv.hydrated and sub_conv.steps:
+                s_steps = sum(int(r[1]) for r in sub_db_rows)
+                s_in = sum(int(r[2]) for r in sub_db_rows)
+                s_cache = sum(int(r[3]) for r in sub_db_rows)
+                s_out = sum(int(r[4]) for r in sub_db_rows)
+                s_think = sum(int(r[5]) for r in sub_db_rows)
+                s_vis = sum(int(r[6]) for r in sub_db_rows)
+            elif sub_conv is not None and sub_conv.hydrated and sub_conv.steps:
                 grouped_sub: dict[str, list[StepMetrics]] = {}
                 for st in sub_conv.steps:
                     grouped_sub.setdefault(st.model_name, []).append(st)
@@ -2430,17 +2417,55 @@ class MetricsEngine:
                     }
                     for sm_name, sm_steps in grouped_sub.items()
                 ]
-            elif s_in or s_cache or s_out:
-                single_sub_rows = [
-                    {
-                        "model_name": sub_conv.current_model_name,
-                        "steps_count": sub_conv.summary_steps_count,
-                        "input_tokens": s_in,
-                        "cache_read_tokens": s_cache,
-                        "output_tokens": s_out,
-                    }
-                ]
+                s_steps = len(sub_conv.steps)
+                s_in = sum(st.input_tokens for st in sub_conv.steps)
+                s_cache = sum(st.cache_read_tokens for st in sub_conv.steps)
+                s_out = sum(st.output_tokens for st in sub_conv.steps)
+                s_think = sum(st.est_thinking_tokens for st in sub_conv.steps)
+                s_vis = sum(st.est_visible_tokens for st in sub_conv.steps)
+            else:
+                assert sub_conv is not None
+                s_steps = sub_conv.summary_steps_count
+                s_in = sub_conv.own_input_tokens
+                s_cache = sub_conv.own_cache_read_tokens
+                s_out = sub_conv.own_output_tokens
+                s_think = sub_conv.own_est_thinking_tokens
+                s_vis = sub_conv.own_est_visible_tokens
+                if s_in or s_cache or s_out:
+                    single_sub_rows = [
+                        {
+                            "model_name": sub_conv.current_model_name,
+                            "steps_count": s_steps,
+                            "input_tokens": s_in,
+                            "cache_read_tokens": s_cache,
+                            "output_tokens": s_out,
+                        }
+                    ]
 
+            sub_in += s_in
+            sub_cache += s_cache
+            sub_out += s_out
+            sub_think += s_think
+            sub_vis += s_vis
+            if (
+                sub_conv is not None
+                and sub_conv.status == "generating"
+                and eff_status != "generating"
+            ):
+                eff_status = "generating"
+                eff_gen_since = sub_conv.generating_since_ms
+
+            sub_model_name = (
+                sub_conv.current_model_name
+                if sub_conv is not None
+                else (
+                    single_sub_rows[0]["model_name"]
+                    if single_sub_rows
+                    else normalize_step_model(
+                        model_hint or "unknown", is_subagent=True
+                    )
+                )
+            )
             if single_sub_rows:
                 all_sub_rows.extend(single_sub_rows)
                 sub_item_val = self._pricing.aggregate_valuation(single_sub_rows)
@@ -2468,28 +2493,25 @@ class MetricsEngine:
                     item_credits = None
                     item_fut = None
             else:
-                res_sub = self._pricing.resolve_model(sub_conv.current_model_name)
+                res_sub = self._pricing.resolve_model(sub_model_name)
                 item_status = res_sub.status
                 is_priced_empty = res_sub.status == "priced"
                 item_cost = 0.0 if is_priced_empty else None
                 item_credits = 0.0 if is_priced_empty else None
                 item_fut = 0.0 if is_priced_empty else None
 
+            sub_title = sub_conv.title if sub_conv is not None else ""
             sub_role_label = (
-                sub_role if (sub_role and sub_role != "Subagent") else sub_conv.title
+                sub_role if (sub_role and sub_role != "Subagent") else sub_title
             ) or "Subagent"
             sub_items.append(
                 {
                     "conversation_id": sub_id,
                     "role": sub_role_label,
-                    "agent_name": sub_conv.agent_name,
-                    "model_name": sub_conv.current_model_name,
-                    "status": sub_conv.status,
-                    "planner_steps_count": (
-                        len(sub_conv.steps)
-                        if sub_conv.hydrated
-                        else sub_conv.summary_steps_count
-                    ),
+                    "agent_name": sub_conv.agent_name if sub_conv is not None else "",
+                    "model_name": sub_model_name,
+                    "status": sub_conv.status if sub_conv is not None else "idle",
+                    "planner_steps_count": s_steps,
                     "input_tokens": s_in,
                     "cache_read_tokens": s_cache,
                     "output_tokens": s_out,

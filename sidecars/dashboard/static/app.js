@@ -16,10 +16,14 @@ import {
   fmtDuration,
   fmtExactSecNote,
   fmtInt,
+  fmtLocalTime,
+  fmtPct,
+  fmtStepDuration,
   fmtUsd,
   fmtWastedSummary,
   fmtWastedTimeNote,
   getModelColorMap,
+  plural,
   shortModelName,
   srcLabel
 } from './format.js';
@@ -107,18 +111,21 @@ function renderMetrics(m) {
     state.lastHistoryKey = null;
     if (state.pendingJump && !isAllMode && state.pendingJump.convId === m.conversation_id) {
       state.expandedStep = state.pendingJump.stepIndex;
+      state.scrollToStepIndex = state.pendingJump.stepIndex;
       state.showAllSteps = true;
       state.modelFilter = state.pendingJump.modelName || null;
       state.pendingJump = null;
     } else {
       state.showAllSteps = false;
       state.expandedStep = null;
+      state.scrollToStepIndex = null;
       if (!prevWasSameAgg) {
         state.modelFilter = null;
       }
     }
   } else if (state.pendingJump && !isAllMode && state.pendingJump.convId === m.conversation_id) {
     state.expandedStep = state.pendingJump.stepIndex;
+    state.scrollToStepIndex = state.pendingJump.stepIndex;
     state.showAllSteps = true;
     state.modelFilter = state.pendingJump.modelName || state.modelFilter;
     state.pendingJump = null;
@@ -169,15 +176,23 @@ function renderMetrics(m) {
   const colorMap = getModelColorMap(byModel);
 
   const modelPill = document.getElementById('modelPill');
-  modelPill.textContent = m.model_name || 'unknown';
-  modelPill.title = m.model_name || 'unknown';
+  if (isAllMode) {
+    const modelCnt = byModel.length;
+    modelPill.textContent = modelCnt > 0 ? (modelCnt + ' ' + plural(modelCnt, 'model')) : 'No models';
+    modelPill.title = modelCnt > 0
+      ? ('Models in view: ' + byModel.map(function (bm) { return shortModelName(bm.model_name); }).join(', '))
+      : 'No recorded models in selected scope';
+  } else {
+    modelPill.textContent = m.model_name || 'unknown';
+    modelPill.title = m.model_name || 'unknown';
+  }
 
   if (!isAllMode) {
     const ctx = m.context || {};
     const brk = ctx.breakdown || {};
     const cur = ctx.current_tokens || 0;
     document.getElementById('ctxTotal').textContent = fmtCompact(cur) + ' tok';
-    document.getElementById('ctxHitText').textContent = (ctx.cache_hit_pct || 0) + '% cached (' + fmtCompact(ctx.cache_read_tokens) + ' / ' + fmtCompact(cur) + ')';
+    document.getElementById('ctxHitText').textContent = fmtPct(ctx.cache_hit_pct) + ' cached (' + fmtCompact(ctx.cache_read_tokens) + ' / ' + fmtCompact(cur) + ')';
 
     const badgesEl = document.getElementById('contextBadges');
     badgesEl.innerHTML = '';
@@ -194,7 +209,7 @@ function renderMetrics(m) {
       const b2 = document.createElement('span');
       b2.className = 'pill compact';
       b2.textContent = 'Compacted';
-      b2.title = 'Active context includes a compacted summary (<CONTEXT_SUMMARY>)';
+      b2.title = 'Active context includes a compacted summary from a prior context compaction';
       badgesEl.appendChild(b2);
     }
 
@@ -213,18 +228,19 @@ function renderMetrics(m) {
     segs.forEach(function (s) {
       if (s.hidden && s.val === 0) return;
       const pct = cur > 0 ? (s.val / cur) * 100 : 0;
+      const segTip = s.label + ': ~' + fmtInt(s.val) + ' tok (' + pct.toFixed(1) + '%, est. split)';
       if (s.val > 0) {
         const segDiv = document.createElement('div');
         segDiv.className = 'seg ' + s.cls;
         segDiv.style.width = pct.toFixed(2) + '%';
-        segDiv.title = s.label + ': ' + fmtInt(s.val) + ' tok (' + pct.toFixed(1) + '%)';
+        segDiv.title = segTip;
         bar.appendChild(segDiv);
       }
 
       const lItem = document.createElement('span');
       lItem.className = 'legend-item';
-      lItem.title = s.label + ': ' + fmtInt(s.val) + ' tok (' + pct.toFixed(1) + '%)';
-      lItem.innerHTML = '<span class="swatch ' + s.cls + '"></span><span>' + esc(s.label) + ': <span class="mono">' + esc(fmtCompact(s.val)) + '</span></span>';
+      lItem.title = segTip;
+      lItem.innerHTML = '<span class="swatch ' + s.cls + '"></span><span>' + esc(s.label) + ': <span class="mono">~' + esc(fmtCompact(s.val)) + '</span></span>';
       leg.appendChild(lItem);
     });
 
@@ -275,30 +291,43 @@ function renderMetrics(m) {
     scopedLast && scopedLast.conv_title && (isAllMode || (scopedLast.conv_id && scopedLast.conv_id !== m.conversation_id))
   );
   const lastConvNote = isExternalLast ? ('[' + scopedLast.conv_title + '] ') : '';
-  document.getElementById('kpiInTitle').textContent = 'Input Tokens' + scopeTag;
-  document.getElementById('kpiOutTitle').textContent = 'Output Tokens' + scopeTag;
+  const subScopeNote = (!isAllMode && subs.count > 0)
+    ? ('incl. ' + subs.count + ' subagent' + (subs.count === 1 ? '' : 's'))
+    : '';
+  const subScopeHtml = subScopeNote
+    ? ('<span class="kpi-scope-note">' + esc(subScopeNote) + '</span>')
+    : '';
+  const kpiInTitleEl = document.getElementById('kpiInTitle');
+  kpiInTitleEl.innerHTML = esc('Input Tokens' + scopeTag) + subScopeHtml;
+  kpiInTitleEl.title = subScopeNote ? ('Includes main conversation + ' + subs.count + ' subagent' + (subs.count === 1 ? '' : 's')) : '';
+  const kpiOutTitleEl = document.getElementById('kpiOutTitle');
+  kpiOutTitleEl.innerHTML = esc('Output Tokens' + scopeTag) + subScopeHtml;
+  kpiOutTitleEl.title = subScopeNote ? ('Includes main conversation + ' + subs.count + ' subagent' + (subs.count === 1 ? '' : 's')) : '';
   const kpiLastTitleEl = document.getElementById('kpiLastTitle');
-  kpiLastTitleEl.textContent = 'Latest Step' + stepTag + scopeTag;
+  const lastBaseTitle = (!isAllMode && !selectedModelEntry && subs.count > 0) ? 'Latest Main Step' : 'Latest Step';
+  kpiLastTitleEl.textContent = lastBaseTitle + stepTag + scopeTag;
   kpiLastTitleEl.title = isExternalLast
     ? ((isAllMode ? 'Global latest step in ' : 'Latest subagent step in ') + scopedLast.conv_title)
-    : '';
-  document.getElementById('kpiTimingTitle').textContent = (selectedModelEntry ? 'Model Timing' : (m.mode === 'project' ? 'Project Timing' : (isAllMode ? 'Total Timing' : 'Session Timing'))) + scopeTag;
+    : ((!isAllMode && !selectedModelEntry && subs.count > 0) ? 'Latest step in the main conversation' : '');
+  const kpiTimingTitleEl = document.getElementById('kpiTimingTitle');
+  kpiTimingTitleEl.innerHTML = esc((selectedModelEntry ? 'Model Timing' : (m.mode === 'project' ? 'Project Timing' : (isAllMode ? 'Total Timing' : 'Session Timing'))) + scopeTag) + subScopeHtml;
+  kpiTimingTitleEl.title = subScopeNote ? ('Includes main conversation + ' + subs.count + ' subagent' + (subs.count === 1 ? '' : 's')) : '';
 
   document.getElementById('totGrossIn').textContent = fmtCompact(scopedTot.gross_input_tokens);
   document.getElementById('totIn').textContent = fmtInt(scopedTot.input_tokens);
   document.getElementById('totCache').textContent = fmtInt(scopedTot.cache_read_tokens);
-  document.getElementById('totHitPct').textContent = (scopedTot.cache_hit_pct || 0) + '%';
+  document.getElementById('totHitPct').textContent = fmtPct(scopedTot.cache_hit_pct);
 
   document.getElementById('totOut').textContent = fmtCompact(scopedTot.output_tokens);
-  document.getElementById('totThink').textContent = fmtInt(scopedTot.est_thinking_tokens);
-  document.getElementById('totVis').textContent = fmtInt(scopedTot.est_visible_tokens);
+  document.getElementById('totThink').textContent = '~' + fmtInt(scopedTot.est_thinking_tokens);
+  document.getElementById('totVis').textContent = '~' + fmtInt(scopedTot.est_visible_tokens);
 
   const lastDurEl = document.getElementById('lastDur');
-  lastDurEl.textContent = (scopedLast && scopedLast.duration_s != null) ? (scopedLast.duration_s + 's') : '—';
+  lastDurEl.textContent = (scopedLast && scopedLast.duration_s != null) ? fmtStepDuration(scopedLast.duration_s) : '—';
   if (!scopedLast) {
     lastDurEl.title = '';
   } else if (scopedLast.step_kind === 'checkpoint') {
-    lastDurEl.title = lastConvNote + 'System compaction call (CHECKPOINT; untimed)';
+    lastDurEl.title = lastConvNote + 'Context compaction call (untimed)';
   } else if (scopedLast.duration_s != null) {
     const lastRetryNote = scopedLast.retry_wait_s > 0
       ? (' · +' + fmtDuration(scopedLast.retry_wait_s) + fmtExactSecNote(scopedLast.retry_wait_s) + ' retry wait')
@@ -320,7 +349,8 @@ function renderMetrics(m) {
     const lastTagParts = [];
     if (scopedLast.cold_cache_spike) lastTagParts.push('❄');
     if (lastRetryS > 0) lastTagParts.push('↻');
-    lastDelayEl.textContent = '~' + combinedLastDelay.toFixed(2) + 's' + (lastTagParts.length ? (' (' + lastTagParts.join(' ') + ')') : '');
+    const lastDelayStr = combinedLastDelay >= 60 ? fmtApproxDuration(combinedLastDelay) : ('~' + combinedLastDelay.toFixed(2) + 's');
+    lastDelayEl.textContent = lastDelayStr + (lastTagParts.length ? (' (' + lastTagParts.join(' ') + ')') : '');
     const retryPart = lastRetryS > 0
       ? (' (~' + Number(scopedLast.est_delay_s).toFixed(2) + 's roofline + ' + fmtDuration(lastRetryS) + fmtExactSecNote(lastRetryS) + ' retry wait)')
       : '';
@@ -336,7 +366,7 @@ function renderMetrics(m) {
       (scopedLast.cold_cache_spike ? ' (❄ cold prefill; prefill roofline gated)' : '');
   } else if (scopedLast.step_kind === 'checkpoint') {
     lastDelayEl.textContent = '—';
-    lastDelayEl.title = 'System compaction call (excluded from roofline delay)';
+    lastDelayEl.title = 'Context compaction call (excluded from roofline delay)';
   } else if (scopedLast.cold_cache_spike) {
     lastDelayEl.textContent = '— (❄ cold)';
     lastDelayEl.title = 'Cold KV-cache prefill step; needs ≥6 steps ≥25k uncached tokens to unlock prefill roofline';
@@ -364,7 +394,7 @@ function renderMetrics(m) {
   const sumModelTimeS = scopedTot.model_time_s || 0;
   const sumInfTimeS = scopedTot.inference_time_s != null ? scopedTot.inference_time_s : sumModelTimeS;
   sumModelEl.textContent = fmtDuration(sumModelTimeS);
-  sumModelEl.title = (scopedTot.timed_steps_count || 0) + ' timed step(s): ' +
+  sumModelEl.title = (scopedTot.timed_steps_count || 0) + ' timed ' + plural(scopedTot.timed_steps_count || 0, 'step') + ': ' +
     fmtDuration(sumInfTimeS) + fmtExactSecNote(sumInfTimeS) + ' inference' +
     fmtColdTimeNote(scopedTot) + fmtWastedTimeNote(scopedTot);
 
@@ -378,19 +408,23 @@ function renderMetrics(m) {
     sumDelayEl.textContent = fmtApproxDuration(totDelay) + (partialScoped ? '*' : '');
     const dParts = [];
     if (scopedTot.est_warm_delay_s != null) {
-      dParts.push('~' + fmtDuration(scopedTot.est_warm_delay_s) + fmtExactSecNote(scopedTot.est_warm_delay_s) + ' warm roofline across ' + totWarmDelaySteps + '/' + (scopedTot.warm_timed_steps_count || 0) + ' warm step(s)');
+      dParts.push('~' + fmtDuration(scopedTot.est_warm_delay_s) + fmtExactSecNote(scopedTot.est_warm_delay_s) + ' warm roofline across ' + totWarmDelaySteps + '/' + (scopedTot.warm_timed_steps_count || 0) + ' warm ' + plural(scopedTot.warm_timed_steps_count || 0, 'step'));
     }
     if (scopedTot.est_cold_delay_s != null) {
-      dParts.push('~' + fmtDuration(scopedTot.est_cold_delay_s) + fmtExactSecNote(scopedTot.est_cold_delay_s) + ' ❄ cold roofline across ' + totColdDelaySteps + ' step(s)');
+      dParts.push('~' + fmtDuration(scopedTot.est_cold_delay_s) + fmtExactSecNote(scopedTot.est_cold_delay_s) + ' ❄ cold roofline across ' + totColdDelaySteps + ' ' + plural(totColdDelaySteps, 'step'));
     }
     if (scopedWastedS > 0) {
       const wSum = fmtWastedSummary(scopedTot);
       dParts.push(fmtDuration(scopedWastedS) + fmtExactSecNote(scopedWastedS) + ' retry/failed wait' + (wSum ? (' (' + wSum + ')') : ''));
     }
+    const partialScopedNote = partialScoped
+      ? (' · *Partial coverage: ' + (scopedTot.est_delay_steps_count || 0) + '/' + (scopedTot.warm_timed_steps_count || 0) + ' warm steps modeled')
+      : '';
     sumDelayEl.title = 'Estimated total delay included in model time: ' +
       fmtApproxDuration(totDelay) + fmtExactSecNote(totDelay) +
       (dParts.length ? (' (' + dParts.join(' + ') + ')') : '') +
-      (sumModelTimeS > 0 ? (' · ' + Math.min(100, Math.round((totDelay / sumModelTimeS) * 100)) + '% of model time') : '');
+      (sumModelTimeS > 0 ? (' · ' + Math.min(100, Math.round((totDelay / sumModelTimeS) * 100)) + '% of model time') : '') +
+      partialScopedNote;
   } else if (selectedModelEntry && selectedModelEntry.latency_fit && selectedModelEntry.latency_fit.reason === 'min_steps') {
     sumDelayEl.textContent = '— (' + (selectedModelEntry.latency_fit.warm_count || 0) + '/4)';
     sumDelayEl.title = 'Needs ≥4 warm timed steps on ' + shortModelName(selectedModelEntry.model_name) + ' to estimate cumulative delay';
@@ -423,7 +457,7 @@ function renderMetrics(m) {
   sumToolEl.title = 'Cumulative tool execution time: ' + fmtDuration(sumToolTimeS) + fmtExactSecNote(sumToolTimeS);
   const stepCountLblEl = document.getElementById('stepCountLbl');
   if (stepCountLblEl) {
-    stepCountLblEl.textContent = (isAllMode || (!selectedModelEntry && subs.count > 0)) ? 'Total Steps' : 'Planner Steps';
+    stepCountLblEl.textContent = 'Steps';
   }
   document.getElementById('stepCount').textContent = String(scopedStepsCount);
 
@@ -432,8 +466,15 @@ function renderMetrics(m) {
     subCard.classList.add('visible');
     const subVal = subs.valuation || {};
     const subCostNote = (subVal.coverage && subVal.coverage.priced_steps > 0) ? (' · ' + fmtUsd(subVal.cost_usd)) : '';
-    document.getElementById('subSummary').textContent = subs.count + ' subagent(s) · ' + fmtCompact(subs.totals.total_tokens) + ' tok' + subCostNote;
-    document.getElementById('grandTotalTok').textContent = fmtInt((m.grand_totals || {}).total_tokens || 0) + ' tok';
+    const subTok = Number((subs.totals && subs.totals.total_tokens) || 0);
+    const grandTok = Number((m.grand_totals && m.grand_totals.total_tokens) || 0);
+    const mainTok = Math.max(0, grandTok - subTok);
+    const subPct = grandTok > 0 ? Math.round((subTok / grandTok) * 100) : 0;
+    document.getElementById('subSummary').textContent =
+      subs.count + ' subagent' + (subs.count === 1 ? '' : 's') + ' · ' + fmtCompact(subTok) + ' tok' + subCostNote;
+    const grandTotalEl = document.getElementById('grandTotalTok');
+    grandTotalEl.textContent = 'Main: ' + fmtCompact(mainTok) + ' · Subagents: ' + fmtCompact(subTok) + ' (' + subPct + '%)';
+    grandTotalEl.title = 'Session total: ' + fmtInt(grandTok) + ' tok (Main: ' + fmtInt(mainTok) + ' + Subagents: ' + fmtInt(subTok) + ') — already included in KPI & Paygo totals above';
     const subChips = document.getElementById('subChips');
     subChips.innerHTML = '';
     subs.items.forEach(function (it) {
@@ -445,7 +486,8 @@ function renderMetrics(m) {
         : '';
       const cleanSubModel = it.model_name ? String(it.model_name).replace(/^Subagent\s*·\s*/i, '') : '';
       const modelNote = cleanSubModel ? (' [' + cleanSubModel + ']') : '';
-      ch.textContent = (it.role || 'Subagent') + agentNote + modelNote + ' (' + it.planner_steps_count + ' steps · ' + fmtCompact((it.input_tokens || 0) + (it.cache_read_tokens || 0) + (it.output_tokens || 0)) + ' tok)';
+      const subSteps = it.planner_steps_count || 0;
+      ch.textContent = (it.role || 'Subagent') + agentNote + modelNote + ' (' + subSteps + ' step' + (subSteps === 1 ? '' : 's') + ' · ' + fmtCompact((it.input_tokens || 0) + (it.cache_read_tokens || 0) + (it.output_tokens || 0)) + ' tok)';
       const tipParts = ['Click to inspect subagent'];
       if (it.cost_usd != null) {
         tipParts.push('Paygo: ' + fmtUsd(it.cost_usd) + ' (' + fmtCredits(it.credits) + ')');
@@ -476,15 +518,21 @@ function renderMetrics(m) {
   const visibleSteps = isFolded ? orderedSteps.slice(0, RECENT_STEPS_LIMIT) : orderedSteps;
   const hiddenCount = orderedSteps.length - visibleSteps.length;
 
+  const subStepsTotal = (subs.items || []).reduce(function (acc, it) {
+    return acc + (Number(it.planner_steps_count) || 0);
+  }, 0);
+  const mainOnlyNote = (!isAllMode && subStepsTotal > 0)
+    ? ('Main only (+' + subStepsTotal + ' subagent step' + (subStepsTotal === 1 ? '' : 's') + ' above) · ')
+    : '';
   const stepsMetaEl = document.getElementById('stepsMeta');
   if (state.modelFilter) {
-    stepsMetaEl.textContent = isFolded
+    stepsMetaEl.textContent = mainOnlyNote + (isFolded
       ? ('Filtered: ' + shortModelName(state.modelFilter) + ' (latest ' + visibleSteps.length + ' of ' + orderedSteps.length + ') · Click row for details')
-      : ('Filtered: ' + shortModelName(state.modelFilter) + ' (' + orderedSteps.length + ' / ' + allSteps.length + ' steps) · Click row for details');
+      : ('Filtered: ' + shortModelName(state.modelFilter) + ' (' + orderedSteps.length + ' / ' + allSteps.length + ' steps) · Click row for details'));
   } else {
-    stepsMetaEl.textContent = isFolded
+    stepsMetaEl.textContent = mainOnlyNote + (isFolded
       ? ('Latest ' + visibleSteps.length + ' of ' + orderedSteps.length + ' steps · Click row for details')
-      : ('All Models · ' + orderedSteps.length + ' steps · Click row for details');
+      : ('All Models · ' + orderedSteps.length + ' steps · Click row for details'));
   }
 
   const toggleBtn = document.getElementById('stepsToggleBtn');
@@ -500,7 +548,37 @@ function renderMetrics(m) {
     toggleBtn.title = 'Fold table back to the ' + RECENT_STEPS_LIMIT + ' most recent steps';
   }
 
+  const fitByModel = Object.create(null);
+  const fitKeyParts = [];
+  byModel.forEach(function (bm) {
+    if (bm && bm.model_name) {
+      fitByModel[bm.model_name] = bm.latency_fit || null;
+      const bf = bm.latency_fit;
+      fitKeyParts.push(bm.model_name + ':' + (bf && bf.available ? (bf.inferred_ttft_s + ',' + bf.slope_s_per_tok + ',' + (bf.prefill_available ? 1 : 0) + ',' + (bf.cache_available ? 1 : 0)) : '0'));
+    }
+  });
+
+  const stepsSig = [
+    m.conversation_id || '',
+    state.modelFilter || '',
+    state.showAllSteps ? 1 : 0,
+    state.expandedStep != null ? state.expandedStep : '',
+    orderedSteps.length,
+    visibleSteps.map(function (s) {
+      return [
+        s.step_index, s.ordinal, s.model_name, s.total_context, s.output_tokens,
+        s.duration_s, s.est_delay_s, s.retry_wait_s, s.cost_usd, s.tool_exec_s,
+        (s.tool_names || []).length
+      ].join(',');
+    }).join(';'),
+    fitKeyParts.join(';')
+  ].join('|');
+
   const tbody = document.getElementById('stepsTbody');
+  if (state.lastStepsSig === stepsSig && state.scrollToStepIndex == null) {
+    return;
+  }
+  state.lastStepsSig = stepsSig;
   tbody.innerHTML = '';
   if (orderedSteps.length === 0) {
     const noStepsTr = document.createElement('tr');
@@ -512,14 +590,15 @@ function renderMetrics(m) {
     tbody.appendChild(noStepsTr);
   }
 
-  const fitByModel = Object.create(null);
-  byModel.forEach(function (bm) {
-    if (bm && bm.model_name) fitByModel[bm.model_name] = bm.latency_fit || null;
-  });
-
+  let scrollTargetTr = null;
   visibleSteps.forEach(function (s) {
     const tr = document.createElement('tr');
-    tr.className = 'step-row';
+    const isExpanded = state.expandedStep === s.step_index;
+    tr.className = 'step-row' + (isExpanded ? ' expanded' : '');
+    tr.setAttribute('data-step-index', String(s.step_index));
+    if (state.scrollToStepIndex === s.step_index) {
+      scrollTargetTr = tr;
+    }
     const isCheckpoint = s.step_kind === 'checkpoint';
     let flagsHtml = '';
     if (s.cold_cache_spike) {
@@ -527,15 +606,15 @@ function renderMetrics(m) {
       flagsHtml += ' <span class="step-flag" title="' + esc(coldTip) + '">❄</span>';
     }
     if (isCheckpoint) {
-      flagsHtml += ' <span class="step-flag" title="System compaction call (CHECKPOINT): summarized history into <CONTEXT_SUMMARY>">⇄</span>';
+      flagsHtml += ' <span class="step-flag" title="Context compaction call: summarized prior history into a compacted summary">⇄</span>';
     } else if (s.compacted) {
-      flagsHtml += ' <span class="step-flag" title="Context compacted: resumed from <CONTEXT_SUMMARY> after CHECKPOINT compaction">⇄</span>';
+      flagsHtml += ' <span class="step-flag" title="Context compacted: resumed from a compacted summary">⇄</span>';
     }
     if ((s.retry_wait_s || 0) > 0 || (s.retry_count || 0) > 0) {
       const rCount = s.retry_count || 1;
       const rTip = s.retry_wait_s > 0
         ? ('Retried (' + rCount + '): +' + fmtDuration(s.retry_wait_s) + fmtExactSecNote(s.retry_wait_s) + ' failed-attempt wait before winning step')
-        : ('Retried after ' + rCount + ' failed attempt(s)');
+        : ('Retried after ' + rCount + ' failed ' + plural(rCount, 'attempt'));
       flagsHtml += ' <span class="step-flag" title="' + esc(rTip) + '">↻</span>';
     }
 
@@ -544,11 +623,11 @@ function renderMetrics(m) {
       ? '<span class="step-flag" title="Model switched from previous step">↱ </span>'
       : '';
 
-    const stepTitle = 'Ordinal #' + s.ordinal + ', raw step_index ' + s.step_index +
-      (s.created_at ? (', recorded at ' + s.created_at) : '') + '. Click row to expand details.';
-    const modelTitle = s.model_name + (isCheckpoint ? ' (system compaction call)' : '');
+    const stepTitle = 'Step #' + s.ordinal + ' (log index ' + s.step_index + ')' +
+      (s.created_at ? (', recorded at ' + fmtLocalTime(s.created_at)) : '') + '. Click row to expand details.';
+    const modelTitle = s.model_name + (isCheckpoint ? ' (context compaction)' : '');
     const ctxTitle = fmtInt(s.total_context) + ' total context tokens (' +
-      fmtInt(s.cache_read_tokens) + ' cached read = ' + s.cache_hit_pct + '% hit, ' +
+      fmtInt(s.cache_read_tokens) + ' cached read = ' + fmtPct(s.cache_hit_pct) + ' hit, ' +
       fmtInt(s.input_tokens) + ' uncached prefill)';
     const outTitle = fmtInt(s.output_tokens) + ' output tokens (~' +
       fmtInt(s.est_thinking_tokens) + ' est. thinking, ~' +
@@ -560,7 +639,7 @@ function renderMetrics(m) {
     let durTitle;
     if (isCheckpoint) {
       durCellHtml = '—';
-      durTitle = 'System compaction call (CHECKPOINT; untimed and excluded from roofline delay)';
+      durTitle = 'Context compaction call (untimed and excluded from roofline delay)';
     } else if (s.duration_s == null) {
       if (retryS > 0) {
         durCellHtml = '— <span class="muted">(+' + esc(fmtDuration(retryS)) + ')</span>';
@@ -630,10 +709,10 @@ function renderMetrics(m) {
     let toolsCellHtml;
     let toolsTitle;
     if (isCheckpoint) {
-      toolsTitle = 'System context compaction call (CHECKPOINT): summarized history into <CONTEXT_SUMMARY>';
+      toolsTitle = 'Context compaction call: summarized history into a compacted summary';
       toolsCellHtml = '<span class="pill compact" title="' + esc(toolsTitle) + '">⇄ compaction</span>';
     } else if (toolsList.length > 0) {
-      toolsTitle = toolsList.length + ' tool call(s): ' + toolsList.join(', ') + ' (tool exec: ' + s.tool_exec_s + 's)';
+      toolsTitle = toolsList.length + ' ' + plural(toolsList.length, 'tool call') + ': ' + toolsList.join(', ') + ' (tool exec: ' + s.tool_exec_s + 's)';
       toolsCellHtml = esc(toolsList.join(', '));
     } else {
       toolsTitle = 'Direct model response (no tool calls invoked)';
@@ -643,41 +722,74 @@ function renderMetrics(m) {
     tr.innerHTML =
       '<td class="mono" title="' + esc(stepTitle) + '">#' + esc(s.ordinal) + flagsHtml + '</td>' +
       '<td title="' + esc(modelTitle) + '"><span class="model-badge" title="' + esc(modelTitle) + '"><span class="model-dot" style="background:' + esc(mCol) + '"></span>' + switchTag + '<span>' + esc(shortModelName(s.model_name)) + '</span></span></td>' +
-      '<td class="mono" title="' + esc(ctxTitle) + '">' + esc(fmtCompact(s.total_context)) + ' <span class="muted">(' + esc(s.cache_hit_pct) + '%)</span></td>' +
-      '<td class="mono" title="' + esc(outTitle) + '">' + esc(fmtInt(s.output_tokens)) + ' <span class="muted">(~' + esc(fmtInt(s.est_thinking_tokens)) + ')</span></td>' +
-      '<td class="mono" title="' + esc(durTitle) + '">' + durCellHtml + '</td>' +
-      '<td class="mono" title="' + esc(paygoTitle) + '">' + paygoCellHtml + '</td>' +
+      '<td class="mono num" title="' + esc(ctxTitle) + '">' + esc(fmtCompact(s.total_context)) + ' <span class="muted">(' + esc(fmtPct(s.cache_hit_pct)) + ')</span></td>' +
+      '<td class="mono num" title="' + esc(outTitle) + '">' + esc(fmtInt(s.output_tokens)) + ' <span class="muted">(~' + esc(fmtInt(s.est_thinking_tokens)) + ')</span></td>' +
+      '<td class="mono num" title="' + esc(durTitle) + '">' + durCellHtml + '</td>' +
+      '<td class="mono num" title="' + esc(paygoTitle) + '">' + paygoCellHtml + '</td>' +
       '<td class="muted tools-cell" title="' + esc(toolsTitle) + '">' + toolsCellHtml + '</td>';
 
     tr.addEventListener('click', function () {
       state.expandedStep = (state.expandedStep === s.step_index) ? null : s.step_index;
+      state.scrollToStepIndex = null;
       renderMetrics(state.lastPayload);
     });
     tbody.appendChild(tr);
 
-    if (state.expandedStep === s.step_index) {
+    if (isExpanded) {
       const dtr = document.createElement('tr');
       dtr.className = 'detail-row';
       const detailParts = (s.duration_s != null) ? computeStepRooflineParts(s, stepFit) : null;
-      dtr.innerHTML =
-        '<td colspan="7">' +
-        '<b>Step ' + esc(s.step_index) + '</b>' +
-        (isCheckpoint ? ' · Kind: <span class="mono">Compaction (CHECKPOINT)</span>' : '') +
-        ' · Model: <span class="mono">' + esc(s.model_name) + '</span>' +
+      const detailRetryS = Math.max(0, Number(s.retry_wait_s || 0));
+      const detailItems = [];
+      const rawIdxNote = s.step_index !== s.ordinal ? (' <span class="muted">(log #' + esc(s.step_index) + ')</span>') : '';
+      detailItems.push('<span class="detail-item"><strong>Step #' + esc(s.ordinal) + '</strong>' + rawIdxNote + '</span>');
+      if (isCheckpoint) {
+        detailItems.push('<span class="detail-item">Kind: <span class="mono">Context compaction</span></span>');
+      }
+      detailItems.push(
+        '<span class="detail-item">Model: <span class="mono">' + esc(s.model_name) + '</span>' +
         (s.model_switched ? ' <span class="pill info">Model Switch</span>' : '') +
-        (s.cold_cache_spike ? ' <span class="pill warn">❄ Cold Prefill</span>' : '') + ' · ' +
-        (s.cost_usd != null ? ('Paygo: <span class="mono">' + esc(fmtUsd(s.cost_usd)) + ' (' + esc(fmtCredits(s.credits)) + ')</span> · ') : '') +
-        (s.duration_s != null ? ('Inference: <span class="mono">' + esc(s.duration_s) + 's</span> · ') : '') +
-        (detailParts ? ('Roofline: <span class="mono">~' + esc(detailParts.expectedS.toFixed(2)) + 's (' + esc(detailParts.partsText) + ')</span> · ') : '') +
-        (s.est_delay_s != null ? ('Est. delay: <span class="mono">~' + esc(Number(s.est_delay_s).toFixed(2)) + 's</span> · ') : '') +
-        'Uncached: <span class="mono">' + esc(fmtInt(s.input_tokens)) + '</span> · ' +
-        'Cached: <span class="mono">' + esc(fmtInt(s.cache_read_tokens)) + '</span> · ' +
-        (isCheckpoint ? 'Summary est: ' : 'Visible est: ') + '<span class="mono">' + esc(fmtInt(s.est_visible_tokens)) + '</span> · ' +
-        (s.retry_wait_s > 0 ? ('Retry wait: <span class="mono">' + esc(fmtDuration(s.retry_wait_s)) + '</span> · ') : '') +
-        'Tool exec: <span class="mono">' + esc(s.tool_exec_s) + 's</span> · ' +
-        'Source: <span class="mono">' + esc(srcLabel(s.duration_source)) + '</span> · ' +
-        'At: <span class="mono">' + esc(s.created_at) + '</span>' +
-        '</td>';
+        (s.cold_cache_spike ? ' <span class="pill warn">❄ Cold Prefill</span>' : '') + '</span>'
+      );
+      if (s.cost_usd != null) {
+        detailItems.push('<span class="detail-item">Paygo: <span class="mono">' + esc(fmtUsd(s.cost_usd)) + ' (' + esc(fmtCredits(s.credits)) + ')</span></span>');
+      }
+      if (s.duration_s != null) {
+        detailItems.push('<span class="detail-item">Inference: <span class="mono">' + esc(fmtStepDuration(s.duration_s)) + '</span></span>');
+      }
+      if (detailParts) {
+        detailItems.push('<span class="detail-item">Roofline: <span class="mono">~' + esc(detailParts.expectedS.toFixed(2)) + 's (' + esc(detailParts.partsText) + ')</span></span>');
+      }
+      if (s.est_delay_s != null) {
+        const roofD = Number(s.est_delay_s);
+        const totD = roofD + detailRetryS;
+        const totDStr = totD >= 60 ? fmtApproxDuration(totD) : ('~' + totD.toFixed(2) + 's');
+        const delayBreak = detailRetryS > 0
+          ? (' (~' + roofD.toFixed(2) + 's roofline + ' + fmtDuration(detailRetryS) + ' retry)')
+          : '';
+        detailItems.push(
+          '<span class="detail-item">Est. delay: <span class="mono" title="' +
+          esc('Total step delay including retry wait' + delayBreak) + '">' +
+          esc(totDStr) + esc(delayBreak) + '</span></span>'
+        );
+      } else if (detailRetryS > 0) {
+        detailItems.push(
+          '<span class="detail-item">Est. delay: <span class="mono" title="Retry wait before winning attempt">+' +
+          esc(fmtDuration(detailRetryS)) + ' (retry wait)</span></span>'
+        );
+      }
+      detailItems.push('<span class="detail-item">Uncached: <span class="mono">' + esc(fmtInt(s.input_tokens)) + '</span></span>');
+      detailItems.push('<span class="detail-item">Cached: <span class="mono">' + esc(fmtInt(s.cache_read_tokens)) + '</span></span>');
+      detailItems.push('<span class="detail-item">' + (isCheckpoint ? 'Summary est:' : 'Visible est:') + ' <span class="mono">~' + esc(fmtInt(s.est_visible_tokens)) + '</span></span>');
+      detailItems.push('<span class="detail-item">Tool exec: <span class="mono">' + esc(fmtStepDuration(s.tool_exec_s)) + '</span></span>');
+      detailItems.push('<span class="detail-item">Source: <span class="mono">' + esc(srcLabel(s.duration_source)) + '</span></span>');
+      if (s.created_at) {
+        detailItems.push('<span class="detail-item">At: <span class="mono" title="' + esc(s.created_at) + '">' + esc(fmtLocalTime(s.created_at)) + '</span></span>');
+      }
+      const toolsBlockHtml = toolsList.length > 0
+        ? ('<div class="detail-tools">Tools (' + toolsList.length + '): <span class="mono">' + esc(toolsList.join(', ')) + '</span></div>')
+        : '';
+      dtr.innerHTML = '<td colspan="7"><div class="detail-grid">' + detailItems.join('') + '</div>' + toolsBlockHtml + '</td>';
       tbody.appendChild(dtr);
     }
   });
@@ -696,6 +808,25 @@ function renderMetrics(m) {
       renderMetrics(state.lastPayload);
     });
     tbody.appendChild(foldTr);
+  }
+
+  if (scrollTargetTr) {
+    const targetRow = scrollTargetTr;
+    state.scrollToStepIndex = null;
+    const doScroll = function () {
+      if (typeof targetRow.scrollIntoView === 'function') {
+        targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      targetRow.classList.add('jump-flash');
+      setTimeout(function () {
+        targetRow.classList.remove('jump-flash');
+      }, 900);
+    };
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(doScroll);
+    } else {
+      doScroll();
+    }
   }
 }
 
@@ -825,13 +956,10 @@ function fetchOnce(convId, win, useEtag) {
       if (ctrl && state.fetchAbort === ctrl) state.fetchAbort = null;
       if (err && err.name === 'AbortError') return;
       state.healthFailCount += 1;
-      if (!state.es || state.es.readyState !== 1) {
-        showSseReconnecting();
-      }
-      if (state.sseDisabled || !state.es || state.es.readyState !== 1 || !state.sseSubId) {
-        const errDelay = Math.min(5000, 1000 * Math.pow(2, Math.min(state.healthFailCount, 3)));
-        schedulePoll(errDelay);
-      }
+      showSseReconnecting();
+      syncGeneratingTimer();
+      const errDelay = Math.min(5000, 1000 * Math.pow(2, Math.min(state.healthFailCount, 3)));
+      schedulePoll(errDelay);
     });
 }
 
@@ -880,6 +1008,7 @@ function markSseHealthy() {
   if (dot) dot.className = 'dot live';
   if (lbl) lbl.textContent = 'Live';
   if (pill) pill.style.display = 'none';
+  syncGeneratingTimer();
 }
 
 function showSseReconnecting() {
@@ -893,6 +1022,7 @@ function showSseReconnecting() {
       : 'Reconnecting';
   }
   if (pill) pill.style.display = '';
+  syncGeneratingTimer();
 }
 
 function scheduleSseRetry() {
@@ -1157,7 +1287,9 @@ function initDashboard() {
       }
       if (state.convsDataCache) renderScopeSelector(state.convsDataCache, selectScope);
       syncModeControls();
-      if (!(state.es && state.es.readyState === 1 && state.sseSubId) && !(state.sseDisabled && state.pollTimer !== null)) {
+      if (state.selectedConvId) {
+        switchTarget(state.selectedConvId);
+      } else if (!(state.es && state.es.readyState === 1 && state.sseSubId) && !(state.sseDisabled && state.pollTimer !== null)) {
         connectSSE();
       }
     }

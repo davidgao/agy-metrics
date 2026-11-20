@@ -1288,8 +1288,21 @@ class TestRooflineAndTiming(unittest.TestCase):
                     round(tot["est_warm_delay_s"] + 360.0, 2),
                     places=2,
                 )
-                # avg_delay_s stays warm-only (does NOT inflate by +72s per step from 360s retry wait)
-                self.assertLess(tot["avg_delay_s"], 2.0)
+                # Global sliding-window delay includes retry wait, while roofline breakdown stays uncorrupted
+                self.assertEqual(fit["avg_delay_s"], fit["est_delay_s"])
+                self.assertEqual(fit["median_delay_s"], fit["est_median_delay_s"])
+                self.assertLess(fit["est_roofline_delay_s"], 2.0)
+                self.assertAlmostEqual(fit["est_retry_delay_s"], 10.0, places=2)
+                self.assertAlmostEqual(
+                    fit["est_delay_s"],
+                    round(fit["est_roofline_delay_s"] + fit["est_retry_delay_s"], 2),
+                    places=2,
+                )
+                self.assertAlmostEqual(
+                    tot["avg_delay_s"],
+                    round(tot["est_total_delay_s"] / tot["est_delay_steps_count"], 2),
+                    places=2,
+                )
                 # avg_effective_tps uses pure inference_time_s, not model_time_s
                 self.assertAlmostEqual(
                     tot["avg_effective_tps"],
@@ -1776,14 +1789,19 @@ class TestRooflineAndTiming(unittest.TestCase):
                 fit_c1 = m_c1["by_model"][0]["latency_fit"]
                 fit_c2 = m_c2["by_model"][0]["latency_fit"]
                 fit_all2 = m_all2["by_model"][0]["latency_fit"]
-                # Scoped avg_delay_s differs across conversations, while global est_ttft_s / est_delay_s stay invariant
-                self.assertNotAlmostEqual(fit_c1["avg_delay_s"], fit_c2["avg_delay_s"], places=1)
+                # Global sliding-window delay expectations (including avg_delay_s/median_delay_s) stay invariant across scopes
+                self.assertEqual(fit_c1["avg_delay_s"], fit_c1["est_delay_s"])
+                self.assertEqual(fit_c1["median_delay_s"], fit_c1["est_median_delay_s"])
                 for key in (
+                    "avg_delay_s",
+                    "median_delay_s",
                     "est_ttft_s",
                     "est_prefill_s",
                     "est_cache_s",
                     "est_delay_s",
                     "est_median_delay_s",
+                    "est_roofline_delay_s",
+                    "est_retry_delay_s",
                     "est_steps_count",
                 ):
                     self.assertEqual(fit_c1[key], fit_c2[key], key)

@@ -10,6 +10,7 @@ import {
 
 let scopeKbIdx = -1;
 let scopeOnSelectCb = null;
+let lastScopeStructSig = null;
 const scopeParentOverrides = new Map();
 
 function scopeCurrentTargetId() {
@@ -154,7 +155,7 @@ function scopeAttachSelectHandler(el, scopeId) {
   });
 }
 
-function scopeMakeConvButton(c, isSubagent, currentTargetId) {
+function scopeMakeConvButton(c, isSubagent, currentTargetId, isDirectMatch) {
   const isSelected = state.viewMode === 'conversation' && c.conversation_id === currentTargetId;
   const isActive = c.conversation_id === state.activeConvId;
   const title = c.title || c.conversation_id.slice(0, 8);
@@ -163,6 +164,9 @@ function scopeMakeConvButton(c, isSubagent, currentTargetId) {
   btn.type = 'button';
   btn.className = 'scope-item-btn';
   btn.setAttribute('data-scope', c.conversation_id);
+  if (isDirectMatch) {
+    btn.setAttribute('data-scope-match', '1');
+  }
   btn.setAttribute('role', 'option');
   btn.setAttribute('aria-selected', isSelected ? 'true' : 'false');
 
@@ -174,11 +178,13 @@ function scopeMakeConvButton(c, isSubagent, currentTargetId) {
 
   let prefixHtml = '';
   if (isSubagent) prefixHtml += '<span class="scope-branch">↳</span>';
+  let statusHtml = '';
   if (c.status === 'generating') {
-    prefixHtml += '<span class="dot gen" title="Generating"></span>';
+    statusHtml = '<span class="dot gen" title="Generating"></span>';
   } else if (isActive) {
-    prefixHtml += '<span class="scope-star" title="Active conversation">★</span>';
+    statusHtml = '<span class="scope-star" title="Active conversation">★</span>';
   }
+  prefixHtml += '<span class="scope-status-slot">' + statusHtml + '</span>';
   const agentHtml = (isSubagent && c.agent_name)
     ? ('<span class="scope-agent-tag">' + esc(c.agent_name) + '</span>')
     : '';
@@ -233,7 +239,8 @@ function scopeRenderConversationBranch(container, conv, idxData, q, currentTarge
     row.appendChild(sp);
   }
 
-  row.appendChild(scopeMakeConvButton(conv, false, currentTargetId));
+  const convDirectMatch = Boolean(q && scopeMatchesNode(conv, q));
+  row.appendChild(scopeMakeConvButton(conv, false, currentTargetId, convDirectMatch));
   container.appendChild(row);
 
   if (hasKids && isExpanded) {
@@ -250,7 +257,8 @@ function scopeRenderConversationBranch(container, conv, idxData, q, currentTarge
         subRow.className = 'scope-row scope-sub-row' + (subSelected ? ' active' : '');
         const indentPx = 14 + Math.min(Math.max(1, depthLevel), 3) * 12;
         subRow.style.paddingLeft = indentPx + 'px';
-        subRow.appendChild(scopeMakeConvButton(child, true, currentTargetId));
+        const childDirectMatch = Boolean(q && scopeMatchesNode(child, q));
+        subRow.appendChild(scopeMakeConvButton(child, true, currentTargetId, childDirectMatch));
         container.appendChild(subRow);
         renderChildren(child.conversation_id, depthLevel + 1, seenSet);
       });
@@ -275,18 +283,19 @@ function scopeRenderTreeList() {
   const projSig = idxData.projects.map(function (p) {
     return p.project_id + ':' + p.name + ':' + (p.conversations_count || 0);
   }).join('|');
-  const listSig = idxData.convs.map(function (c) {
+  const structListSig = idxData.convs.map(function (c) {
     return [
       c.conversation_id,
       c.title || '',
-      c.status || '',
-      c.current_tokens || 0,
       c.project_id || '',
       c.parent_id || '',
       c.agent_name || ''
     ].join(':');
   }).join('|');
-  const treeSig = [
+  const liveListSig = idxData.convs.map(function (c) {
+    return (c.status || '') + ':' + (c.current_tokens || 0);
+  }).join('|');
+  const structSig = [
     q,
     state.viewMode,
     currentTargetId || '',
@@ -294,30 +303,65 @@ function scopeRenderTreeList() {
     Array.from(state.collapsedProjects).sort().join(','),
     overridesSig,
     projSig,
-    listSig
+    structListSig
   ].join('||');
+  const treeSig = structSig + '||' + liveListSig;
 
   if (state.lastScopeTreeSig === treeSig) {
     return;
   }
+  if (lastScopeStructSig === structSig && treeEl.children.length > 0) {
+    state.lastScopeTreeSig = treeSig;
+    treeEl.querySelectorAll('.scope-item-btn[data-scope]').forEach(function (btn) {
+      const cid = btn.getAttribute('data-scope');
+      const conv = idxData.byId[cid];
+      if (!conv) return;
+      const metaEl = btn.querySelector('.scope-item-meta');
+      const nextMeta = fmtCompact(conv.current_tokens);
+      if (metaEl && metaEl.textContent !== nextMeta) {
+        metaEl.textContent = nextMeta;
+      }
+      const statusSlot = btn.querySelector('.scope-status-slot');
+      if (statusSlot) {
+        const isActive = conv.conversation_id === state.activeConvId;
+        const nextHtml = conv.status === 'generating'
+          ? '<span class="dot gen" title="Generating"></span>'
+          : (isActive ? '<span class="scope-star" title="Active conversation">★</span>' : '');
+        if (statusSlot.innerHTML !== nextHtml) {
+          statusSlot.innerHTML = nextHtml;
+        }
+      }
+    });
+    return;
+  }
+  lastScopeStructSig = structSig;
   state.lastScopeTreeSig = treeSig;
 
   const prevScroll = treeEl.scrollTop;
   treeEl.innerHTML = '';
   scopeKbIdx = -1;
 
-  // 1. Top-level All Conversations row
-  const allBtn = document.createElement('button');
-  allBtn.type = 'button';
-  allBtn.className = 'scope-row scope-all-row' + (state.viewMode === 'all' ? ' active' : '');
-  allBtn.setAttribute('data-scope', ALL_CONVERSATIONS_ID);
-  allBtn.setAttribute('role', 'option');
-  allBtn.setAttribute('aria-selected', state.viewMode === 'all' ? 'true' : 'false');
-  allBtn.innerHTML =
-    '<span class="scope-item-main"><span class="scope-item-title">All Conversations</span></span>' +
-    '<span class="scope-item-meta mono">' + esc(idxData.totalTopConvs + ' conv' + (idxData.totalTopConvs === 1 ? '' : 's')) + '</span>';
-  scopeAttachSelectHandler(allBtn, ALL_CONVERSATIONS_ID);
-  treeEl.appendChild(allBtn);
+  let renderedCount = 0;
+
+  // 1. Top-level All Conversations row (only show while searching if query matches it)
+  const allMatchesQuery = !q || 'all conversations'.indexOf(q) !== -1;
+  if (allMatchesQuery) {
+    const allBtn = document.createElement('button');
+    allBtn.type = 'button';
+    allBtn.className = 'scope-row scope-all-row' + (state.viewMode === 'all' ? ' active' : '');
+    allBtn.setAttribute('data-scope', ALL_CONVERSATIONS_ID);
+    if (q) {
+      allBtn.setAttribute('data-scope-match', '1');
+      renderedCount += 1;
+    }
+    allBtn.setAttribute('role', 'option');
+    allBtn.setAttribute('aria-selected', state.viewMode === 'all' ? 'true' : 'false');
+    allBtn.innerHTML =
+      '<span class="scope-item-main"><span class="scope-item-title">All Conversations</span></span>' +
+      '<span class="scope-item-meta mono">' + esc(idxData.totalTopConvs + ' conv' + (idxData.totalTopConvs === 1 ? '' : 's')) + '</span>';
+    scopeAttachSelectHandler(allBtn, ALL_CONVERSATIONS_ID);
+    treeEl.appendChild(allBtn);
+  }
 
   if (idxData.convs.length === 0) {
     const emptyDiv = document.createElement('div');
@@ -330,7 +374,6 @@ function scopeRenderTreeList() {
   const anySubagents = idxData.convs.some(function (c) {
     return Boolean(idxData.childrenByParent[c.conversation_id] && idxData.childrenByParent[c.conversation_id].length);
   });
-  let renderedCount = 0;
 
   if (!idxData.hasNamedProjects) {
     const topConvs = idxData.convs.filter(function (c) {
@@ -386,6 +429,9 @@ function scopeRenderTreeList() {
       pSel.type = 'button';
       pSel.className = 'scope-project-select';
       pSel.setAttribute('data-scope', projScopeId);
+      if (q && projMatches) {
+        pSel.setAttribute('data-scope-match', '1');
+      }
       pSel.setAttribute('role', 'option');
       pSel.setAttribute('aria-selected', isProjSelected ? 'true' : 'false');
       pSel.title = 'Filter aggregate view to project: ' + proj.name;
@@ -416,6 +462,15 @@ function scopeRenderTreeList() {
     noMatch.className = 'scope-empty muted';
     noMatch.textContent = 'No matching projects or conversations';
     treeEl.appendChild(noMatch);
+  } else if (q) {
+    const items = Array.from(treeEl.querySelectorAll('[data-scope]'));
+    if (items.length > 0) {
+      const directIdx = items.findIndex(function (el) {
+        return el.getAttribute('data-scope-match') === '1';
+      });
+      scopeKbIdx = directIdx >= 0 ? directIdx : 0;
+      scopeApplyKbFocus(items);
+    }
   }
 
   treeEl.scrollTop = prevScroll;
@@ -439,6 +494,7 @@ function scopeSetMenuOpen(open) {
   if (trigger) trigger.setAttribute('aria-expanded', state.scopeMenuOpen ? 'true' : 'false');
   if (state.scopeMenuOpen) {
     state.lastScopeTreeSig = null;
+    lastScopeStructSig = null;
     scopeRenderTreeList();
     if (search) {
       search.focus();
@@ -446,6 +502,7 @@ function scopeSetMenuOpen(open) {
     }
   } else {
     scopeKbIdx = -1;
+    lastScopeStructSig = null;
     if (state.scopeFilterQuery) {
       state.scopeFilterQuery = '';
       if (search) search.value = '';
@@ -509,6 +566,10 @@ export function initScopeSelector(onSelectScope) {
         scopeApplyKbFocus(items);
       } else if (e.key === 'Enter') {
         if (e.target && e.target.classList && e.target.classList.contains('scope-twisty')) {
+          return;
+        }
+        if (items.length === 0) {
+          e.preventDefault();
           return;
         }
         const picked = (scopeKbIdx >= 0 && items[scopeKbIdx])

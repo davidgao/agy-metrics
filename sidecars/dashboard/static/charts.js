@@ -14,14 +14,17 @@ import {
   fmtDuration,
   fmtExactSecNote,
   fmtInt,
+  fmtLatencyPercentile,
   fmtNomTps,
   fmtOrchSavingsPct,
+  fmtPct,
   fmtRate,
   fmtShortDelay,
   fmtUsd,
   fmtWastedSummary,
   fmtWastedTimeNote,
   niceCeil,
+  plural,
   shortModelName,
   srcLabel
 } from './format.js';
@@ -128,14 +131,14 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     scopeLbl.style.cursor = 'pointer';
     scopeLbl.title = 'Click to clear model filter';
   } else {
-    scopeLbl.textContent = 'Click a row for ~TTFT / TPS fit & filter';
+    scopeLbl.textContent = 'Click a row to inspect speed & filter';
     scopeLbl.style.cursor = '';
     scopeLbl.title = '';
   }
 
   if (list.length === 0) {
     const emptyRow = document.createElement('tr');
-    emptyRow.innerHTML = '<td colspan="7" class="muted">No planner steps yet</td>';
+    emptyRow.innerHTML = '<td colspan="7" class="muted">No steps yet</td>';
     tbody.appendChild(emptyRow);
     return;
   }
@@ -144,7 +147,8 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     const color = colorMap[bm.model_name] || 'var(--m-muted)';
     const isSelected = state.modelFilter === bm.model_name;
     const fit = bm.latency_fit;
-    const fitQ = (fit && fit.quantile_pct && fit.quantile_pct < 95) ? ('~P' + fit.quantile_pct) : 'P95';
+    const fitQ = fmtLatencyPercentile(fit && fit.quantile_pct, 5);
+    const fitFastPct = (fit && fit.quantile_pct) ? Math.max(1, Math.round(100 - Number(fit.quantile_pct))) : 5;
     const has3Term = Boolean(fit && (fit.prefill_available || fit.cache_available));
     const estTtftVal = (fit && fit.available)
       ? Number(fit.est_ttft_s != null ? fit.est_ttft_s : fit.inferred_ttft_s)
@@ -155,11 +159,20 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     const estP50DelayVal = (fit && fit.available)
       ? (fit.est_median_delay_s != null ? Number(fit.est_median_delay_s) : (fit.median_delay_s != null ? Number(fit.median_delay_s) : null))
       : null;
+    const estRoofDelayVal = (fit && fit.available && fit.est_roofline_delay_s != null)
+      ? Number(fit.est_roofline_delay_s)
+      : null;
+    const estRetryDelayVal = (fit && fit.available && fit.est_retry_delay_s != null)
+      ? Number(fit.est_retry_delay_s)
+      : 0;
+    const estDelayBreakNote = (estRetryDelayVal > 0 && estRoofDelayVal != null)
+      ? (' (~' + estRoofDelayVal.toFixed(2) + 's roofline + ' + estRetryDelayVal.toFixed(2) + 's retry wait)')
+      : '';
     const fitExtraRates = [];
     if (fit && fit.prefill_available) fitExtraRates.push('~' + fmtBulkTps(fit.inferred_prefill_tps) + ' tok/s prefill');
     if (fit && fit.cache_available) fitExtraRates.push('~' + fmtBulkTps(fit.inferred_cache_tps) + ' tok/s cache');
     const fitDelayTip = estDelayVal != null
-      ? (', +' + estDelayVal.toFixed(2) + 's avg delay' +
+      ? (', +' + estDelayVal.toFixed(2) + 's avg delay' + estDelayBreakNote +
          (estP50DelayVal != null ? (' (P50 +' + estP50DelayVal.toFixed(2) + 's)') : ''))
       : '';
     const fitTip = (fit && fit.available)
@@ -177,22 +190,25 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     const partialBmDelay = (bm.est_delay_steps_count || 0) < (bm.warm_timed_steps_count || 0) || ((bm.est_delay_steps_count || 0) === 0 && bmWastedS > 0);
     const bmDelayParts = [];
     if (bm.est_warm_delay_s != null) {
-      bmDelayParts.push('~' + fmtDuration(bm.est_warm_delay_s) + fmtExactSecNote(bm.est_warm_delay_s) + ' warm roofline delay across ' + bmWarmDelayCnt + ' step(s)');
+      bmDelayParts.push('~' + fmtDuration(bm.est_warm_delay_s) + fmtExactSecNote(bm.est_warm_delay_s) + ' warm roofline delay across ' + bmWarmDelayCnt + ' ' + plural(bmWarmDelayCnt, 'step'));
     }
     if (bm.est_cold_delay_s != null) {
-      bmDelayParts.push('~' + fmtDuration(bm.est_cold_delay_s) + fmtExactSecNote(bm.est_cold_delay_s) + ' ❄ cold roofline delay across ' + bmColdDelayCnt + ' step(s)');
+      bmDelayParts.push('~' + fmtDuration(bm.est_cold_delay_s) + fmtExactSecNote(bm.est_cold_delay_s) + ' ❄ cold roofline delay across ' + bmColdDelayCnt + ' ' + plural(bmColdDelayCnt, 'step'));
     }
     if (bmWastedS > 0) {
       const bmSum = fmtWastedSummary(bm);
       bmDelayParts.push(fmtDuration(bmWastedS) + fmtExactSecNote(bmWastedS) + ' retry/failed wait' + (bmSum ? (' (' + bmSum + ')') : ''));
     }
+    const partialBmNote = partialBmDelay
+      ? (' · *Partial coverage: ' + (bm.est_delay_steps_count || 0) + '/' + (bm.warm_timed_steps_count || 0) + ' warm steps modeled')
+      : '';
     const timeHtml = esc(fmtDuration(bm.model_time_s || 0)) +
       (bm.est_total_delay_s != null ? (' <span class="muted">(' + esc(fmtApproxDuration(bm.est_total_delay_s)) + (partialBmDelay ? '*' : '') + ')</span>') : '');
-    const timeTitle = (bm.timed_steps_count || 0) + ' timed step(s): ' +
+    const timeTitle = (bm.timed_steps_count || 0) + ' timed ' + plural(bm.timed_steps_count || 0, 'step') + ': ' +
       fmtDuration(bmInfS) + fmtExactSecNote(bmInfS) + ' inference' + fmtColdTimeNote(bm) + fmtWastedTimeNote(bm) +
       (bm.est_total_delay_s != null
         ? (' · total delay ~' + fmtDuration(bm.est_total_delay_s) + fmtExactSecNote(bm.est_total_delay_s) +
-           (bmDelayParts.length ? (' (' + bmDelayParts.join(' + ') + ')') : ''))
+           (bmDelayParts.length ? (' (' + bmDelayParts.join(' + ') + ')') : '') + partialBmNote)
         : ' · Warm excess delay needs ≥4 warm timed steps');
 
     let nomTpsHtml;
@@ -202,7 +218,7 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     if (fit && fit.available) {
       const coldExclNote = fit.cold_excluded_count ? (', ' + fit.cold_excluded_count + ' cold excl.') : '';
       nomTpsHtml = '~' + esc(fmtNomTps(fit.inferred_decode_tps));
-      nomTpsTitle = fitQ + ' speed roofline (n=' + fit.warm_count + ' warm' + coldExclNote + '): ~' +
+      nomTpsTitle = fitQ + ' latency frontier (fastest ' + fitFastPct + '% speed roofline, n=' + fit.warm_count + ' warm' + coldExclNote + '): ~' +
         Number(fit.inferred_decode_tps).toFixed(1) + ' tok/s decode (' + fit.slope_s_per_tok + ' s/tok) · ' +
         prefillGateNote(fit) + ' · ' + cacheGateNote(fit);
       const ttftParts = [];
@@ -219,7 +235,7 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
         ? ('avg step start (' + ttftParts.join(' + ') + ')')
         : ('avg warm TTFT (' + fitQ + ')');
       const sampleScopeNote = fit.est_steps_count > 0
-        ? (' · last ' + fit.est_steps_count + (fit.prefill_available ? ' steps' : ' warm steps'))
+        ? (' · global sliding window of last ' + fit.est_steps_count + (fit.prefill_available ? ' steps' : ' warm steps'))
         : '';
       if (estDelayVal != null) {
         const p50CellNote = estP50DelayVal != null
@@ -227,8 +243,8 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
           : '';
         ttftDelayHtml = esc(fmtApproxSec(estTtftVal)) + ' <span class="muted">(' + esc(fmtShortDelay(estDelayVal)) + ')</span>';
         ttftDelayTitle = '~' + estTtftVal.toFixed(2) + 's ' + ttftDesc + ' + ' +
-          estDelayVal.toFixed(2) + 's avg delay (~' +
-          (estTtftVal + estDelayVal).toFixed(2) + 's expected before decode' +
+          estDelayVal.toFixed(2) + 's avg delay' + estDelayBreakNote + ' (~' +
+          (estTtftVal + estDelayVal).toFixed(2) + 's expected overhead + delay per step' +
           p50CellNote + sampleScopeNote + ')';
       } else {
         ttftDelayHtml = esc(fmtApproxSec(estTtftVal)) + ' <span class="muted">(—)</span>';
@@ -258,7 +274,7 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     }
 
     const tr = document.createElement('tr');
-    const stepTitle = bm.steps_count + ' step(s)' + (bm.compaction_steps_count ? (' (incl. ' + bm.compaction_steps_count + ' compaction)') : '');
+    const stepTitle = bm.steps_count + ' ' + plural(bm.steps_count, 'step') + (bm.compaction_steps_count ? (' (incl. ' + bm.compaction_steps_count + ' compaction)') : '');
     const bmVal = bm.valuation;
     const costTip = (bmVal && bmVal.status === 'priced')
       ? (' · Paygo: ' + fmtUsd(bmVal.cost_usd) + ' (' + fmtCredits(bmVal.credits) + ')')
@@ -268,12 +284,12 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     tr.innerHTML =
       '<td><span class="model-badge"><span class="model-dot" style="background:' + esc(color) + '"></span><span>' + esc(shortModelName(bm.model_name)) + '</span></span>' +
       (bm.is_active ? ' <span class="muted" title="Active model">★</span>' : '') + '</td>' +
-      '<td class="mono" title="' + esc(stepTitle) + '">' + esc(bm.steps_count) + '</td>' +
-      '<td class="mono" title="' + esc(inputTitle) + '">' + esc(fmtCompact(bm.gross_input_tokens)) + ' <span class="muted">(' + esc(bm.cache_hit_pct) + '%)</span></td>' +
-      '<td class="mono" title="' + esc(fmtInt(bm.output_tokens) + ' out (~' + fmtInt(bm.est_thinking_tokens) + ' think, ~' + fmtInt(bm.est_visible_tokens) + ' visible)') + '">' + esc(fmtCompact(bm.output_tokens)) + ' <span class="muted">(~' + esc(fmtCompact(bm.est_thinking_tokens)) + ')</span></td>' +
-      '<td class="mono" title="' + esc(timeTitle) + '">' + timeHtml + '</td>' +
-      '<td class="mono" title="' + esc(nomTpsTitle) + '">' + nomTpsHtml + '</td>' +
-      '<td class="mono" title="' + esc(ttftDelayTitle) + '">' + ttftDelayHtml + '</td>';
+      '<td class="mono num" title="' + esc(stepTitle) + '">' + esc(bm.steps_count) + '</td>' +
+      '<td class="mono num" title="' + esc(inputTitle) + '">' + esc(fmtCompact(bm.gross_input_tokens)) + ' <span class="muted">(' + esc(fmtPct(bm.cache_hit_pct)) + ')</span></td>' +
+      '<td class="mono num" title="' + esc(fmtInt(bm.output_tokens) + ' out (~' + fmtInt(bm.est_thinking_tokens) + ' think, ~' + fmtInt(bm.est_visible_tokens) + ' visible)') + '">' + esc(fmtCompact(bm.output_tokens)) + ' <span class="muted">(~' + esc(fmtCompact(bm.est_thinking_tokens)) + ')</span></td>' +
+      '<td class="mono num" title="' + esc(timeTitle) + '">' + timeHtml + '</td>' +
+      '<td class="mono num" title="' + esc(nomTpsTitle) + '">' + nomTpsHtml + '</td>' +
+      '<td class="mono num" title="' + esc(ttftDelayTitle) + '">' + ttftDelayHtml + '</td>';
     tr.addEventListener('click', function () {
       if (onToggleModel) onToggleModel(bm.model_name);
     });
@@ -299,15 +315,18 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
       const totSum = fmtWastedSummary(totals);
       totDelayParts.push(fmtDuration(totWastedS) + fmtExactSecNote(totWastedS) + ' retry/failed wait' + (totSum ? (' (' + totSum + ')') : ''));
     }
+    const partialTotNote = partialTotDelay
+      ? (' · *Partial coverage: ' + (totals.est_delay_steps_count || 0) + '/' + (totals.warm_timed_steps_count || 0) + ' warm steps modeled')
+      : '';
     const totTimeHtml = esc(fmtDuration(totals.model_time_s || 0)) +
       (totals.est_total_delay_s != null
         ? (' <span class="muted">(' + esc(fmtApproxDuration(totals.est_total_delay_s)) + (partialTotDelay ? '*' : '') + ')</span>')
         : '');
-    const totTimeTitle = (totals.timed_steps_count || 0) + ' timed step(s): ' +
+    const totTimeTitle = (totals.timed_steps_count || 0) + ' timed ' + plural(totals.timed_steps_count || 0, 'step') + ': ' +
       fmtDuration(totInfS) + fmtExactSecNote(totInfS) + ' inference' + fmtColdTimeNote(totals) + fmtWastedTimeNote(totals) +
       (totals.est_total_delay_s != null
         ? (' · total delay ~' + fmtDuration(totals.est_total_delay_s) + fmtExactSecNote(totals.est_total_delay_s) +
-           (totDelayParts.length ? (' (' + totDelayParts.join(' + ') + ')') : ''))
+           (totDelayParts.length ? (' (' + totDelayParts.join(' + ') + ')') : '') + partialTotNote)
         : ' · Needs ≥4 warm timed steps on at least one model to estimate roofline delay');
     let totTtftDelayHtml;
     let totTtftDelayTitle;
@@ -333,14 +352,14 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
       const avgTotDelay = wDelaySum / wSum;
       totTtftDelayHtml = esc(fmtApproxSec(avgTotTtft)) + ' <span class="muted">(' + esc(fmtShortDelay(avgTotDelay)) + ')</span>';
       totTtftDelayTitle = 'Step-weighted avg across ' + fittedModelsCnt + '/' + list.length +
-        ' fitted model(s): ~' + avgTotTtft.toFixed(2) + 's avg start + ' +
-        avgTotDelay.toFixed(2) + 's avg delay (~' + (avgTotTtft + avgTotDelay).toFixed(2) + 's expected before decode)';
+        ' fitted ' + plural(list.length, 'model') + ': ~' + avgTotTtft.toFixed(2) + 's avg start + ' +
+        avgTotDelay.toFixed(2) + 's avg delay (~' + (avgTotTtft + avgTotDelay).toFixed(2) + 's expected overhead + delay per step)';
     } else if (totals.avg_delay_s != null) {
       const totP50Note = totals.median_delay_s != null
         ? (' · P50: +' + Number(totals.median_delay_s).toFixed(2) + 's')
         : '';
       totTtftDelayHtml = '— <span class="muted">(' + esc(fmtShortDelay(totals.avg_delay_s)) + ')</span>';
-      totTtftDelayTitle = 'TTFT varies by model · Pooled avg excess delay: +' +
+      totTtftDelayTitle = 'TTFT varies by model · Pooled avg delay: +' +
         Number(totals.avg_delay_s).toFixed(2) + 's' + totP50Note + ' (' +
         (totals.est_delay_steps_count || 0) + '/' + (totals.warm_timed_steps_count || 0) + ' warm steps covered)';
     } else {
@@ -358,12 +377,12 @@ export function renderByModel(byModel, totals, colorMap, callbacks) {
     }
     sumTr.innerHTML =
       '<td>All Models</td>' +
-      '<td class="mono">' + esc(totals.steps_count || 0) + '</td>' +
-      '<td class="mono" title="' + esc(totInputTitle) + '">' + esc(fmtCompact(totals.gross_input_tokens)) + ' (' + esc(totals.cache_hit_pct || 0) + '%)</td>' +
-      '<td class="mono">' + esc(fmtCompact(totals.output_tokens)) + ' (~' + esc(fmtCompact(totals.est_thinking_tokens)) + ')</td>' +
-      '<td class="mono" title="' + esc(totTimeTitle) + '">' + totTimeHtml + '</td>' +
-      '<td class="mono" title="Nominal TPS varies by model">—</td>' +
-      '<td class="mono" title="' + esc(totTtftDelayTitle) + '">' + totTtftDelayHtml + '</td>';
+      '<td class="mono num">' + esc(totals.steps_count || 0) + '</td>' +
+      '<td class="mono num" title="' + esc(totInputTitle) + '">' + esc(fmtCompact(totals.gross_input_tokens)) + ' (' + esc(fmtPct(totals.cache_hit_pct)) + ')</td>' +
+      '<td class="mono num">' + esc(fmtCompact(totals.output_tokens)) + ' (~' + esc(fmtCompact(totals.est_thinking_tokens)) + ')</td>' +
+      '<td class="mono num" title="' + esc(totTimeTitle) + '">' + totTimeHtml + '</td>' +
+      '<td class="mono num" title="Decode TPS varies by model">—</td>' +
+      '<td class="mono num" title="' + esc(totTtftDelayTitle) + '">' + totTtftDelayHtml + '</td>';
     tbody.appendChild(sumTr);
   }
 }
@@ -408,7 +427,7 @@ export function renderChart(steps, colorMap, byModel) {
   leg.innerHTML =
     '<span class="legend-item"><span class="swatch c-cached"></span>Cached Read</span>' +
     '<span class="legend-item"><span class="swatch c-uncached"></span>Uncached Prefill</span>' +
-    (hasCompaction ? '<span class="legend-item" title="Context compaction boundary: prior history replaced by <CONTEXT_SUMMARY>"><span class="divider-swatch"></span>Compaction</span>' : '');
+    (hasCompaction ? '<span class="legend-item" title="Context compaction boundary: prior history replaced by compacted summary"><span class="divider-swatch"></span>Compaction</span>' : '');
   const stepModelSet = new Set();
   list.forEach(function (s) {
     if (s && s.model_name) stepModelSet.add(s.model_name);
@@ -428,14 +447,14 @@ export function renderChart(steps, colorMap, byModel) {
   const h = 156;
 
   if (n === 0) {
-    hover.textContent = 'No planner steps yet';
+    hover.textContent = 'No steps yet';
     const emptyTxt = document.createElementNS(NS, 'text');
     emptyTxt.setAttribute('x', String(w / 2));
     emptyTxt.setAttribute('y', String(h / 2));
     emptyTxt.setAttribute('text-anchor', 'middle');
     emptyTxt.setAttribute('fill', 'var(--m-muted)');
     emptyTxt.setAttribute('font-size', '12');
-    emptyTxt.textContent = 'No planner steps yet';
+    emptyTxt.textContent = 'No steps yet';
     svg.appendChild(emptyTxt);
     return;
   }
@@ -830,14 +849,16 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
     fit.cache_available ? 1 : 0,
     fit.cache_slope_s_per_tok != null ? fit.cache_slope_s_per_tok : '',
     fit.high_cache_count || 0,
-    fit.avg_delay_s != null ? fit.avg_delay_s : '',
-    fit.median_delay_s != null ? fit.median_delay_s : ''
+    fit.est_delay_s != null ? fit.est_delay_s : (fit.avg_delay_s != null ? fit.avg_delay_s : ''),
+    fit.est_median_delay_s != null ? fit.est_median_delay_s : (fit.median_delay_s != null ? fit.median_delay_s : ''),
+    fit.est_retry_delay_s != null ? fit.est_retry_delay_s : ''
   ].join(',');
   const scatterKey = [
     state.renderedViewKey || state.renderedConvId || '',
     modelName,
     scatterMode,
     state.showColdPrefills ? 1 : 0,
+    state.expandedStep != null ? state.expandedStep : '',
     modelTimedSteps.length,
     lastSig,
     fitSig
@@ -863,15 +884,17 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   } else {
     coldBtn.style.display = '';
     coldBtn.className = 'filter-pill' + (state.showColdPrefills ? ' active' : '');
-    coldBtn.textContent = (state.showColdPrefills ? '❄ Cold shown (' : '❄ Show cold (') + coldPts.length + ')';
-    coldBtn.title = fit.prefill_available
-      ? 'Toggle visibility of cold-cache prefill steps (included in 3-term roofline)'
-      : 'Toggle visibility of cold-cache prefill steps (currently excluded from speed roofline fit)';
+    coldBtn.textContent = '❄ Cold prefills (' + coldPts.length + ')';
+    coldBtn.title = (state.showColdPrefills ? 'Hide' : 'Show') + ' ' + coldPts.length + ' cold-cache prefill ' + plural(coldPts.length, 'step') + ' in this view (' +
+      (fit.prefill_available ? 'included in 3-term roofline)' : 'currently excluded from speed roofline fit)');
   }
 
-  const qLabel = (fit.quantile_pct && fit.quantile_pct < 95) ? ('~P' + fit.quantile_pct) : 'P95';
-  const prefillQ = (fit.prefill_quantile_pct && fit.prefill_quantile_pct < 90) ? ('~P' + fit.prefill_quantile_pct) : 'P90';
-  const cacheQ = (fit.cache_quantile_pct && fit.cache_quantile_pct < 90) ? ('~P' + fit.cache_quantile_pct) : 'P90';
+  const qLabel = fmtLatencyPercentile(fit.quantile_pct, 5);
+  const decFastPct = fit.quantile_pct ? Math.max(1, Math.round(100 - Number(fit.quantile_pct))) : 5;
+  const prefillQ = fmtLatencyPercentile(fit.prefill_quantile_pct, 10);
+  const preFastPct = fit.prefill_quantile_pct ? Math.max(1, Math.round(100 - Number(fit.prefill_quantile_pct))) : 10;
+  const cacheQ = fmtLatencyPercentile(fit.cache_quantile_pct, 10);
+  const cacFastPct = fit.cache_quantile_pct ? Math.max(1, Math.round(100 - Number(fit.cache_quantile_pct))) : 10;
   const lastModeled = fit.prefill_available
     ? (modelTimedSteps.length ? modelTimedSteps[modelTimedSteps.length - 1] : null)
     : (warmPts.length ? warmPts[warmPts.length - 1] : null);
@@ -880,7 +903,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   if (fit.available) {
     const has3Term = Boolean(fit.prefill_available || fit.cache_available);
     const coldNote = fit.prefill_available
-      ? ((fit.cold_count > 0) ? (' · ' + fit.cold_count + ' cold') : '')
+      ? ((fit.cold_count > 0) ? (' · ' + fit.cold_count + ' global cold') : '')
       : (coldPts.length > 0 ? (' · ' + coldPts.length + ' cold excl.') : '');
     let latestDelayHtml = '';
     if (lastModeled) {
@@ -888,16 +911,21 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
       const expectedLast = lmParts ? lmParts.expectedS : (fit.inferred_ttft_s + fit.slope_s_per_tok * lastModeled.output_tokens);
       const rawLastDelta = lastModeled.duration_s - expectedLast;
       const hasRecordedDelay = lastModeled.est_delay_s != null;
-      const clampedLastDelta = hasRecordedDelay ? Number(lastModeled.est_delay_s) : Math.max(0, rawLastDelta);
+      const roofLastDelta = hasRecordedDelay ? Number(lastModeled.est_delay_s) : Math.max(0, rawLastDelta);
+      const lastRetryWait = Math.max(0, Number(lastModeled.retry_wait_s || 0));
+      const totalLastDelta = roofLastDelta + lastRetryWait;
       const breakdownStr = lmParts ? (' (' + lmParts.partsText + ')') : '';
+      const retryDetailStr = lastRetryWait > 0
+        ? (' (+' + roofLastDelta.toFixed(2) + 's roofline + ' + fmtDuration(lastRetryWait) + fmtExactSecNote(lastRetryWait) + ' retry wait)')
+        : '';
       const latestTitle = hasRecordedDelay
         ? ('Latest modeled step #' + lastModeled.ordinal + (lastModeled.cold_cache_spike ? ' (❄ cold)' : '') + ': ' + lastModeled.duration_s + 's actual · +' +
-           clampedLastDelta.toFixed(2) + 's recorded delay (roofline ~' + expectedLast.toFixed(2) + 's' + breakdownStr + ')')
+           totalLastDelta.toFixed(2) + 's total delay' + retryDetailStr + ' (roofline ~' + expectedLast.toFixed(2) + 's' + breakdownStr + ')')
         : ('Latest modeled step #' + lastModeled.ordinal + ': ' + lastModeled.duration_s + 's actual vs ~' +
-           expectedLast.toFixed(2) + 's roofline' + breakdownStr + ' (' + (rawLastDelta >= 0 ? '+' : '') + rawLastDelta.toFixed(2) + 's)');
+           expectedLast.toFixed(2) + 's roofline' + breakdownStr + ' (' + (rawLastDelta >= 0 ? '+' : '') + rawLastDelta.toFixed(2) + 's)' + retryDetailStr);
       latestDelayHtml =
         '<div class="scatter-kpi" title="' + esc(latestTitle) + '">' +
-          '<span class="scatter-kpi-val mono">+' + esc(clampedLastDelta.toFixed(2)) + 's</span>' +
+          '<span class="scatter-kpi-val mono">+' + esc(totalLastDelta.toFixed(2)) + 's</span>' +
           '<span class="scatter-kpi-lbl">Latest Delay (#' + esc(lastModeled.ordinal) + ')</span>' +
         '</div>';
     }
@@ -907,35 +935,47 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
     const fitScopeNote = (fit.used_count && fit.warm_count > fit.used_count)
       ? ('most recent ' + fit.used_count + ' of ' + fit.warm_count + ' global warm steps (recency half-life 35)')
       : ('n=' + fit.warm_count + ' global warm steps');
-    const noteTitle = (fit.quantile_pct && fit.quantile_pct < 95)
-      ? ('Small-sample quantile relaxation (~P' + fit.quantile_pct + ' instead of P95) over ' + fitScopeNote)
-      : ('P95 uncongested speed roofline over ' + fitScopeNote);
-    const baseKpiLbl = has3Term ? '~Base Floor' : ('~Min TTFT (' + qLabel + ')');
+    const noteTitle = decFastPct > 5
+      ? ('Small-sample latency frontier relaxation (' + qLabel + ' — fastest ' + decFastPct + '% instead of P5) over ' + fitScopeNote)
+      : ('P5 latency frontier (fastest 5% uncongested speed roofline) over ' + fitScopeNote);
+    const baseKpiLbl = has3Term ? 'Base Floor' : ('Min TTFT (' + qLabel + ')');
     const baseKpiTitle = has3Term
-      ? ('Inferred base dispatch/RTT overhead after peeling prefill & cache read time (' + qLabel + ' intercept)')
-      : ('Inferred uncongested warm Time to First Token — X-intercept of the ' + qLabel + ' speed roofline (0 output tokens)');
+      ? ('Inferred base dispatch/RTT overhead after peeling prefill & cache read time (' + qLabel + ' latency frontier intercept, fastest ' + decFastPct + '%)')
+      : ('Inferred uncongested warm Time to First Token — X-intercept of the ' + qLabel + ' latency frontier (fastest ' + decFastPct + '% speed roofline, 0 output tokens)');
     const preVal = fit.prefill_available ? ('~' + fmtBulkTps(fit.inferred_prefill_tps) + ' tok/s') : '—';
-    const preLbl = fit.prefill_available ? ('~Prefill TPS (' + prefillQ + ')') : '~Prefill TPS';
+    const preLbl = fit.prefill_available ? ('Prefill TPS (' + prefillQ + ')') : 'Prefill TPS';
     const preTitle = fit.prefill_available
-      ? ('Inferred uncongested uncached prefill speed (' + prefillQ + ' frontier): ~' +
+      ? ('Inferred uncongested uncached prefill speed (' + prefillQ + ' latency frontier, fastest ' + preFastPct + '%): ~' +
          fmtInt(fit.inferred_prefill_tps) + ' tok/s (' + (Number(fit.prefill_slope_s_per_tok) * 1e6).toFixed(1) + ' µs/tok)')
       : prefillGateNote(fit);
     const cacVal = fit.cache_available ? ('~' + fmtBulkTps(fit.inferred_cache_tps) + ' tok/s') : '—';
-    const cacLbl = fit.cache_available ? ('~Cache TPS (' + cacheQ + ')') : '~Cache TPS';
+    const cacLbl = fit.cache_available ? ('Cache TPS (' + cacheQ + ')') : 'Cache TPS';
     const cacTitle = fit.cache_available
-      ? ('Inferred KV-cache recovery speed (' + cacheQ + ' frontier on low-prefill steps): ~' +
+      ? ('Inferred KV-cache recovery speed (' + cacheQ + ' latency frontier on low-prefill steps, fastest ' + cacFastPct + '%): ~' +
          fmtInt(fit.inferred_cache_tps) + ' tok/s (' + (Number(fit.cache_slope_s_per_tok) * 1e6).toFixed(1) + ' µs/tok)')
       : cacheGateNote(fit);
-    const avgDelayDisp = fit.avg_delay_s != null ? ('+' + Number(fit.avg_delay_s).toFixed(2) + 's') : '—';
-    const p50DelayDisp = fit.median_delay_s != null ? ('+' + Number(fit.median_delay_s).toFixed(2) + 's') : '—';
+    const globalAvgDelay = fit.est_delay_s != null ? Number(fit.est_delay_s) : (fit.avg_delay_s != null ? Number(fit.avg_delay_s) : null);
+    const globalP50Delay = fit.est_median_delay_s != null ? Number(fit.est_median_delay_s) : (fit.median_delay_s != null ? Number(fit.median_delay_s) : null);
+    const globalRoofDelay = fit.est_roofline_delay_s != null ? Number(fit.est_roofline_delay_s) : null;
+    const globalRetryDelay = fit.est_retry_delay_s != null ? Number(fit.est_retry_delay_s) : 0;
+    const delayWinLabel = fit.est_steps_count > 0
+      ? ('last ' + fit.est_steps_count + ' global ' + (fit.prefill_available ? 'steps' : 'warm steps'))
+      : 'recent global steps';
+    const retryBreakTip = (globalRetryDelay > 0 && globalRoofDelay != null)
+      ? (' (~' + globalRoofDelay.toFixed(2) + 's roofline + ' + globalRetryDelay.toFixed(2) + 's retry wait)')
+      : '';
+    const avgDelayTitle = 'Global expected avg delay (including retry wait) over the ' + delayWinLabel + retryBreakTip;
+    const p50DelayTitle = 'Global P50 (median) delay (including retry wait) over the ' + delayWinLabel + ' — compare with Avg Delay to spot tail stalls';
+    const avgDelayDisp = globalAvgDelay != null ? ('+' + globalAvgDelay.toFixed(2) + 's') : '—';
+    const p50DelayDisp = globalP50Delay != null ? ('+' + globalP50Delay.toFixed(2) + 's') : '—';
     statsRow.innerHTML =
       '<div class="scatter-kpi" title="' + esc(baseKpiTitle) + '">' +
         '<span class="scatter-kpi-val mono">~' + esc(fit.inferred_ttft_s.toFixed(2)) + 's</span>' +
         '<span class="scatter-kpi-lbl">' + esc(baseKpiLbl) + '</span>' +
       '</div>' +
-      '<div class="scatter-kpi" title="Inferred uncongested decode throughput ceiling — slope of the ' + esc(qLabel) + ' speed roofline (' + esc(fit.slope_s_per_tok) + ' s/tok)">' +
+      '<div class="scatter-kpi" title="Inferred uncongested decode throughput ceiling — slope of the ' + esc(qLabel) + ' latency frontier (fastest ' + esc(decFastPct) + '% speed roofline, ' + esc(fit.slope_s_per_tok) + ' s/tok)">' +
         '<span class="scatter-kpi-val mono">~' + esc(fmtNomTps(fit.inferred_decode_tps)) + ' tok/s</span>' +
-        '<span class="scatter-kpi-lbl">~Nominal TPS (' + esc(qLabel) + ')</span>' +
+        '<span class="scatter-kpi-lbl">Decode TPS (' + esc(qLabel) + ')</span>' +
       '</div>' +
       '<div class="scatter-kpi" title="' + esc(preTitle) + '">' +
         '<span class="scatter-kpi-val mono">' + esc(preVal) + '</span>' +
@@ -945,11 +985,11 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
         '<span class="scatter-kpi-val mono">' + esc(cacVal) + '</span>' +
         '<span class="scatter-kpi-lbl">' + esc(cacLbl) + '</span>' +
       '</div>' +
-      '<div class="scatter-kpi" title="Average (mean) horizontal excess latency beyond the uncongested speed roofline across modeled steps">' +
+      '<div class="scatter-kpi" title="' + esc(avgDelayTitle) + '">' +
         '<span class="scatter-kpi-val mono">' + esc(avgDelayDisp) + '</span>' +
         '<span class="scatter-kpi-lbl">Avg Delay</span>' +
       '</div>' +
-      '<div class="scatter-kpi" title="P50 (median) horizontal excess latency beyond the uncongested speed roofline across modeled steps — compare with Avg Delay to spot tail stalls">' +
+      '<div class="scatter-kpi" title="' + esc(p50DelayTitle) + '">' +
         '<span class="scatter-kpi-val mono">' + esc(p50DelayDisp) + '</span>' +
         '<span class="scatter-kpi-lbl">P50 Delay</span>' +
       '</div>' +
@@ -958,11 +998,11 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   } else {
     let msg = 'Warm step timings have too much variance to fit a positive speed roofline yet.';
     if (fit.reason === 'min_steps') {
-      msg = 'Inferred ~Base Floor & nominal TPS need ≥4 warm timed steps (' +
+      msg = 'Inferred Base Floor & Decode TPS need ≥4 warm timed steps (' +
         (fit.warm_count || 0) + '/4 recorded' +
         (coldPts.length ? (', ' + coldPts.length + ' cold excluded') : '') + ').';
     } else if (fit.reason === 'min_spread') {
-      msg = 'Inferred ~Base Floor & nominal TPS need ≥200 tok output spread across warm steps (current spread: ' +
+      msg = 'Inferred Base Floor & Decode TPS need ≥200 tok output spread across warm steps (current spread: ' +
         fmtInt(fit.token_spread || 0) + ' tok).';
     } else if (fit.reason === 'unattributed') {
       msg = 'Roofline speed fit is disabled for unattributed ("unknown" / "auto") model steps.';
@@ -985,7 +1025,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   const NS = 'http://www.w3.org/2000/svg';
   const w = 600;
   const h = 184;
-  const padL = 46;
+  const padL = 56;
   const padR = 16;
   const padT = 16;
   const padB = 24;
@@ -1004,13 +1044,17 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
         : (hasExternalPts
             ? 'Hover a point to inspect · Click to view step or open subagent'
             : 'Hover a point to inspect · Click to view step details'));
-  if (scatterMode === 'prefill' && !fit.prefill_available) {
-    hover.textContent = prefillGateNote(fit) + ' · ' + baseHoverMsg;
-  } else if (scatterMode === 'cache' && !fit.cache_available) {
-    hover.textContent = cacheGateNote(fit) + ' · ' + baseHoverMsg;
-  } else {
-    hover.textContent = baseHoverMsg;
-  }
+  const defaultHoverMsg = (scatterMode === 'prefill' && !fit.prefill_available)
+    ? (prefillGateNote(fit) + ' · ' + baseHoverMsg)
+    : ((scatterMode === 'cache' && !fit.cache_available)
+        ? (cacheGateNote(fit) + ' · ' + baseHoverMsg)
+        : baseHoverMsg);
+  hover.textContent = defaultHoverMsg;
+  hover.title = defaultHoverMsg;
+  svg.onmouseleave = function () {
+    hover.textContent = defaultHoverMsg;
+    hover.title = defaultHoverMsg;
+  };
   if (plottedPts.length === 0) {
     const emptyTxt = document.createElementNS(NS, 'text');
     emptyTxt.setAttribute('x', String(w / 2));
@@ -1019,7 +1063,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
     emptyTxt.setAttribute('fill', 'var(--m-muted)');
     emptyTxt.setAttribute('font-size', '12');
     emptyTxt.textContent = coldPts.length > 0
-      ? 'Only cold-prefill timed steps recorded — click "❄ Show cold" above'
+      ? 'Only cold-prefill timed steps recorded — click "❄ Cold prefills" above'
       : 'No timed steps recorded for this model yet';
     svg.appendChild(emptyTxt);
     leg.innerHTML = '';
@@ -1093,7 +1137,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
   yUnit.setAttribute('fill', 'var(--m-muted)');
   yUnit.setAttribute('font-size', '9.5');
   yUnit.setAttribute('font-family', 'var(--m-mono)');
-  yUnit.textContent = scatterMode === 'prefill' ? 'in ↑' : (scatterMode === 'cache' ? 'cac ↑' : 'tok ↑');
+  yUnit.textContent = scatterMode === 'prefill' ? 'Uncached ↑' : (scatterMode === 'cache' ? 'Cached ↑' : 'Output ↑');
   svg.appendChild(yUnit);
 
   [0, 0.5, 1].forEach(function (frac) {
@@ -1155,6 +1199,22 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
     svg.appendChild(lbl);
   });
 
+  const isPeeledAxis = scatterMode !== 'decode' || sPre > 0 || sCac > 0;
+  const xAxisTitle = document.createElementNS(NS, 'text');
+  xAxisTitle.setAttribute('x', String(padL + plotW));
+  xAxisTitle.setAttribute('y', String(padT + plotH - 4));
+  xAxisTitle.setAttribute('text-anchor', 'end');
+  xAxisTitle.setAttribute('fill', 'var(--m-muted)');
+  xAxisTitle.setAttribute('font-size', '9');
+  xAxisTitle.setAttribute('font-family', 'var(--m-mono)');
+  xAxisTitle.setAttribute('opacity', '0.78');
+  xAxisTitle.textContent = !isPeeledAxis
+    ? 'duration (s) →'
+    : (scatterMode === 'prefill'
+        ? 'prefill-only (s) →'
+        : (scatterMode === 'cache' ? 'cache-only (s) →' : 'decode-only (s) →'));
+  svg.appendChild(xAxisTitle);
+
   if (lineAvailable && tBase < maxX) {
     const xStart = tBase;
     let xEnd = maxX;
@@ -1213,8 +1273,11 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
       residualNote = ' · ' + (delta >= 0 ? '+' : '') + delta.toFixed(1) + 's vs roofline';
     }
     const ptConvPrefix = (isExternalPt(s) && s.conv_title) ? ('[' + s.conv_title + '] ') : '';
-    const peelNote = (scatterMode !== 'decode' || sPre > 0 || sCac > 0)
-      ? (' · peeled ' + p.xSec.toFixed(2) + 's')
+    const peelModeLbl = scatterMode === 'prefill'
+      ? 'prefill-only '
+      : (scatterMode === 'cache' ? 'cache-only ' : 'decode-only ');
+    const peelNote = isPeeledAxis
+      ? (' · ' + peelModeLbl + p.xSec.toFixed(2) + 's')
       : '';
     let ptMetricDesc;
     if (scatterMode === 'prefill') {
@@ -1297,8 +1360,21 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
       g.appendChild(halo);
     }
 
+    const isSelectedStep = !isExternalPt(s) && state.expandedStep === s.step_index;
+    if (isSelectedStep) {
+      const selRing = document.createElementNS(NS, 'circle');
+      selRing.setAttribute('cx', cx.toFixed(1));
+      selRing.setAttribute('cy', cy.toFixed(1));
+      selRing.setAttribute('r', isLatest ? '9.5' : '7.2');
+      selRing.setAttribute('fill', 'none');
+      selRing.setAttribute('stroke', 'var(--m-primary)');
+      selRing.setAttribute('stroke-width', '1.8');
+      g.appendChild(selRing);
+    }
+
     g.addEventListener('mouseenter', function () {
       hover.textContent = ptSummary;
+      hover.title = ptSummary;
     });
     g.addEventListener('click', function () {
       if (isExternalPt(s)) {
@@ -1315,6 +1391,7 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
       }
       const nextExpanded = (state.expandedStep === s.step_index) ? null : s.step_index;
       state.expandedStep = nextExpanded;
+      state.scrollToStepIndex = nextExpanded;
       if (nextExpanded !== null && !state.showAllSteps) {
         const payloadSteps = (state.lastPayload && state.lastPayload.steps) ? state.lastPayload.steps : allSteps;
         const allModelSteps = (payloadSteps || []).filter(function (x) { return x.model_name === modelName; });
@@ -1330,9 +1407,12 @@ export function renderLatencyScatter(selectedModelEntry, allSteps, colorMap, cal
     svg.appendChild(g);
   });
 
+  const opacityLegendTxt = scatterMode === 'decode'
+    ? 'Older → Recent · ◎ Latest'
+    : 'Lower → Higher sample weight · ◎ Latest';
   let legHtml =
     '<span class="legend-item"><span class="model-dot" style="background:' + esc(modelCol) + ';opacity:0.38"></span>' +
-    '<span class="model-dot" style="background:' + esc(modelCol) + '"></span><span>Older → Recent · ◎ Latest</span></span>';
+    '<span class="model-dot" style="background:' + esc(modelCol) + '"></span><span>' + esc(opacityLegendTxt) + '</span></span>';
   if (lineAvailable) {
     legHtml += '<span class="legend-item"><span class="trend-swatch" style="border-color:' + esc(modelCol) + '"></span><span>' + esc(lineLabel) + '</span></span>';
   }

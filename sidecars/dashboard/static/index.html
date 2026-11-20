@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AGY Metrics</title>
+  <script>(function(){try{var r=document.documentElement,m=localStorage.getItem('agy_metrics.theme');if(m==='dark'||m==='light'){r.dataset.forceTheme=m;r.dataset.theme=m;return;}var q=(new URLSearchParams(location.search)).get('theme')||'';if(/light/i.test(q)){r.dataset.theme='light';return;}if(/dark/i.test(q)){r.dataset.theme='dark';return;}if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches){r.dataset.theme='light';}}catch(e){}})();</script>
   <script src="preload.js"></script>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
@@ -68,19 +69,19 @@
           <span class="section-title">Per-Model Token &amp; Timing</span>
           <span class="muted" id="byModelSub"></span>
         </div>
-        <span class="muted" id="byModelScope">Click a row to filter</span>
+        <span class="muted" id="byModelScope">Click a row to inspect speed &amp; filter</span>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th title="Model or Orchestrator role attribution">Model</th>
-              <th title="Total recorded LLM steps (including system compaction calls)">Steps</th>
-              <th title="Gross input tokens (Uncached + Cached) and KV-cache hit percentage — hover cells for exact uncached / cached split">Input (Hit%)</th>
-              <th title="Total output tokens and estimated thinking tokens">Output (~Think)</th>
-              <th title="Total model wait time (completed inference + retry/failed wait) and cumulative estimated delay (warm serving/prefill variance + retry/failed wait; system compaction calls excluded)">Time (~Delay)</th>
-              <th title="Inferred uncongested nominal decode throughput ceiling (P95 speed roofline, tok/s) — hover cells for prefill &amp; cache recovery speeds">~Dec. TPS</th>
-              <th title="Estimated average step start time (base floor + prefill + cache recovery) and average per-step excess delay across each model's recent steps — hover cells for breakdown &amp; P50">~TTFT (+Delay)</th>
+              <th class="num" title="Total recorded LLM steps (including system compaction calls)">Steps</th>
+              <th class="num" title="Gross input tokens (Uncached + Cached) and KV-cache hit percentage — hover cells for exact uncached / cached split">Input (Hit%)</th>
+              <th class="num" title="Total output tokens and estimated thinking tokens">Output (Think)</th>
+              <th class="num" title="Total model wait time (completed inference + retry/failed wait) and cumulative estimated delay (warm serving/prefill variance + retry/failed wait; system compaction calls excluded)">Time (Delay)</th>
+              <th class="num" title="Inferred uncongested decode throughput ceiling (P5 latency frontier / fastest 5% speed roofline, tok/s) — hover cells for prefill &amp; cache recovery speeds">Decode TPS</th>
+              <th class="num" title="Global sliding-window estimated step start time (base floor + prefill + cache recovery) and average per-step delay (including retry wait) — hover cells for breakdown &amp; P50">TTFT (+Delay)</th>
             </tr>
           </thead>
           <tbody id="byModelTbody"></tbody>
@@ -105,10 +106,8 @@
       <div class="chart-box">
         <svg id="scatterSvg" class="scatter-chart" viewBox="0 0 600 184"></svg>
       </div>
-      <div class="section-head" style="margin-top:6px;margin-bottom:0">
-        <div class="legend" id="scatterLegend" style="margin-top:0"></div>
-        <span class="muted mono" id="scatterHover">Hover a point to inspect</span>
-      </div>
+      <div class="legend" id="scatterLegend" style="margin-top:6px"></div>
+      <div class="scatter-hover-bar muted mono" id="scatterHover">Hover a point to inspect</div>
     </div>
 
     <div class="card" id="valuationCard">
@@ -163,24 +162,24 @@
       <div class="card">
         <div class="section-title" id="kpiOutTitle">Output Tokens</div>
         <div class="big-num mono" id="totOut">0</div>
-        <div class="kv-line"><span class="muted">~Thinking (est.)</span><span class="mono" id="totThink">0</span></div>
-        <div class="kv-line"><span class="muted">~Visible + Tools</span><span class="mono" id="totVis">0</span></div>
+        <div class="kv-line"><span class="muted" title="Estimated thinking tokens">Thinking</span><span class="mono" id="totThink">0</span></div>
+        <div class="kv-line"><span class="muted" title="Estimated visible reply + tool call tokens">Visible + Tools</span><span class="mono" id="totVis">0</span></div>
       </div>
 
       <div class="card">
         <div class="section-title" id="kpiLastTitle">Latest Step</div>
         <div class="big-num mono" id="lastDur">—</div>
-        <div class="kv-line"><span class="muted">~Est. Delay</span><span class="mono" id="lastDelay">—</span></div>
+        <div class="kv-line"><span class="muted">Est. Delay</span><span class="mono" id="lastDelay">—</span></div>
         <div class="kv-line"><span class="muted">Step Output</span><span class="mono" id="lastOut">—</span></div>
       </div>
 
       <div class="card">
         <div class="section-title" id="kpiTimingTitle">Session Timing</div>
         <div class="big-num mono" id="sumModelTime">0.0s</div>
-        <div class="kv-line"><span class="muted">~Est. Total Delay</span><span class="mono" id="sumEstDelay">—</span></div>
+        <div class="kv-line"><span class="muted">Est. Total Delay</span><span class="mono" id="sumEstDelay">—</span></div>
         <div class="kv-line" id="sumWastedRow" style="display:none"><span class="muted">↳ Retry / Failed</span><span class="mono" id="sumWastedTime">0.0s</span></div>
         <div class="kv-line"><span class="muted">Tool Execution</span><span class="mono" id="sumToolTime">0.0s</span></div>
-        <div class="kv-line"><span class="muted" id="stepCountLbl">Planner Steps</span><span class="mono" id="stepCount">0</span></div>
+        <div class="kv-line"><span class="muted" id="stepCountLbl">Steps</span><span class="mono" id="stepCount">0</span></div>
       </div>
     </div>
 
@@ -190,7 +189,7 @@
         <span class="mono muted" id="subSummary"></span>
       </div>
       <div class="kv-line">
-        <span class="muted">Grand Total (Main + Subagents)</span>
+        <span class="muted">Session Token Split</span>
         <span class="mono" id="grandTotalTok">0</span>
       </div>
       <div class="chips" id="subChips"></div>
@@ -224,10 +223,10 @@
             <tr>
               <th title="Step ordinal and flags (❄ Cold Prefill, ⇄ Compaction/Compacted, ↻ Retried)">#</th>
               <th title="Attributed model or Orchestrator phase (↱ Model Switch)">Model</th>
-              <th title="Total context window size (Uncached + Cached) and KV-cache hit percentage">Context (Cache%)</th>
-              <th title="Total output tokens and estimated thinking tokens">Out (~Think)</th>
-              <th title="Model wait time (completed inference + retry wait) and estimated excess delay beyond the speed roofline">Time (~Delay)</th>
-              <th title="Estimated step Paygo cost using current pricing rates — hover cells for AI Credits equivalent">Paygo</th>
+              <th class="num" title="Total context window size (Uncached + Cached) and KV-cache hit percentage">Context (Hit%)</th>
+              <th class="num" title="Total output tokens and estimated thinking tokens">Out (Think)</th>
+              <th class="num" title="Model wait time (completed inference + retry wait) and estimated total delay (roofline excess + retry wait)">Time (Delay)</th>
+              <th class="num" title="Estimated step Paygo cost using current pricing rates — hover cells for AI Credits equivalent">Paygo</th>
               <th title="Tool calls invoked in this step, reply, or compaction call">Tools</th>
             </tr>
           </thead>

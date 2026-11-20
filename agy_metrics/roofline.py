@@ -170,12 +170,13 @@ def step_roofline_delay(
 
 def _normalize_fit_points(
     points: tuple[tuple[Any, ...], ...],
-) -> list[tuple[int, int, int, float, str, int]]:
-    out: list[tuple[int, int, int, float, str, int]] = []
+) -> list[tuple[int, int, int, float, str, int, float]]:
+    out: list[tuple[int, int, int, float, str, int, float]] = []
     for p in points:
         if len(p) == 3:
-            out.append((0, 0, int(p[0]), float(p[1]), str(p[2] or ""), 0))
+            out.append((0, 0, int(p[0]), float(p[1]), str(p[2] or ""), 0, 0.0))
         else:
+            retry_s = max(0.0, float(p[6] or 0.0)) if len(p) >= 7 else 0.0
             out.append(
                 (
                     int(p[0]),
@@ -184,6 +185,7 @@ def _normalize_fit_points(
                     float(p[3]),
                     str(p[4] or ""),
                     int(p[5]),
+                    retry_s,
                 )
             )
     return out
@@ -209,7 +211,7 @@ def _bin_balance_weights(
 
 
 def _fit_decode_stage(
-    dec_pts: list[tuple[int, int, int, float, str, int]],
+    dec_pts: list[tuple[int, int, int, float, str, int, float]],
     s_pre: float,
     s_cac: float,
 ) -> tuple[tuple[float, float, int] | None, str]:
@@ -408,8 +410,8 @@ def _fit_peeled_line(
 
 def compute_roofline_fit(
     warm_points: tuple[tuple[Any, ...], ...],
-    all_points: tuple[tuple[int, int, int, float, str, int], ...] | None = None,
-    recent_points: tuple[tuple[int, int, int, float, str, int], ...] | None = None,
+    all_points: tuple[tuple[Any, ...], ...] | None = None,
+    recent_points: tuple[tuple[Any, ...], ...] | None = None,
 ) -> dict[str, Any]:
     """Fit staged 3-speed roofline (decode, cache recovery, true prefill + base floor)."""
     norm_warm = _normalize_fit_points(warm_points)
@@ -471,6 +473,8 @@ def compute_roofline_fit(
         "est_cache_s": None,
         "est_delay_s": None,
         "est_median_delay_s": None,
+        "est_roofline_delay_s": None,
+        "est_retry_delay_s": None,
         "est_steps_count": 0,
         "prefill_available": False,
         "prefill_reason": prefill_reason,
@@ -595,21 +599,13 @@ def compute_roofline_fit(
         if dec_res_fin is not None:
             b_dec, s_dec, q_dec = dec_res_fin
 
-    eval_pts = pool if prefill_available else pts
-    delays = [
-        max(0.0, r[3] - (b_dec + s_pre * r[0] + s_cac * r[1] + s_dec * r[2]))
-        for r in eval_pts
-    ]
-    avg_delay = sum(delays) / len(delays)
-    median_delay = statistics.median(delays)
-
     if prefill_available:
         norm_recent = (
             _normalize_fit_points(recent_points)[-_FIT_MAX_RECENT_STEPS:]
             if recent_points is not None
             else []
         )
-        recent_eval_pts = norm_recent if norm_recent else pool
+        recent_eval_pts = norm_recent if norm_recent else pool[-_FIT_MAX_RECENT_STEPS:]
     else:
         recent_eval_pts = pts
     n_recent = len(recent_eval_pts)
@@ -618,12 +614,18 @@ def compute_roofline_fit(
     est_prefill = s_pre * avg_in_tok if prefill_available else 0.0
     est_cache = s_cac * avg_cac_tok if cache_available else 0.0
     est_ttft = b_dec + est_prefill + est_cache
-    recent_delays = [
+    recent_roof_delays = [
         max(0.0, r[3] - (b_dec + s_pre * r[0] + s_cac * r[1] + s_dec * r[2]))
         for r in recent_eval_pts
     ]
-    est_delay = sum(recent_delays) / len(recent_delays)
-    est_median_delay = statistics.median(recent_delays)
+    recent_retry_delays = [max(0.0, r[6]) for r in recent_eval_pts]
+    recent_total_delays = [
+        rd + rw for rd, rw in zip(recent_roof_delays, recent_retry_delays)
+    ]
+    est_roofline_delay = sum(recent_roof_delays) / n_recent
+    est_retry_delay = sum(recent_retry_delays) / n_recent
+    est_delay = sum(recent_total_delays) / n_recent
+    est_median_delay = statistics.median(recent_total_delays)
 
     return {
         "available": True,
@@ -636,13 +638,15 @@ def compute_roofline_fit(
         "inferred_base_s": round(b_dec, 2),
         "inferred_decode_tps": round(1.0 / s_dec, 1),
         "slope_s_per_tok": round(s_dec, 6),
-        "avg_delay_s": round(avg_delay, 2),
-        "median_delay_s": round(median_delay, 2),
+        "avg_delay_s": round(est_delay, 2),
+        "median_delay_s": round(est_median_delay, 2),
         "est_ttft_s": round(est_ttft, 2),
         "est_prefill_s": round(est_prefill, 2) if prefill_available else None,
         "est_cache_s": round(est_cache, 2) if cache_available else None,
         "est_delay_s": round(est_delay, 2),
         "est_median_delay_s": round(est_median_delay, 2),
+        "est_roofline_delay_s": round(est_roofline_delay, 2),
+        "est_retry_delay_s": round(est_retry_delay, 2),
         "est_steps_count": n_recent,
         "prefill_available": prefill_available,
         "prefill_reason": prefill_reason,

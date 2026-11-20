@@ -23,9 +23,37 @@ export function fmtInt(n) {
 
 export function fmtCompact(n) {
   const v = Number(n || 0);
-  if (v >= 1000000) return (v / 1000000).toFixed(2) + 'M';
+  if (v >= 999950) return (v / 1000000).toFixed(2) + 'M';
   if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
   return String(v);
+}
+
+export function fmtPct(pct) {
+  return Number(pct || 0).toFixed(1) + '%';
+}
+
+export function plural(n, singular, pluralForm) {
+  return Number(n) === 1 ? singular : (pluralForm || (singular + 's'));
+}
+
+export function fmtLatencyPercentile(quantilePct, targetLatPct) {
+  const target = targetLatPct || 5;
+  if (quantilePct == null || isNaN(quantilePct)) return 'P' + target;
+  const latPct = Math.max(1, Math.min(50, Math.round(100 - Number(quantilePct))));
+  return latPct > target ? ('~P' + latPct) : ('P' + target);
+}
+
+export function fmtLocalTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
 }
 
 export function fmtUsd(val) {
@@ -163,6 +191,12 @@ export function fmtDuration(sec) {
   }
   const days = v / 86400;
   return days >= 100 ? (Math.round(days) + 'd') : (days.toFixed(1) + 'd');
+}
+
+export function fmtStepDuration(sec) {
+  const v = Math.max(0, Number(sec || 0));
+  if (v >= 60) return fmtDuration(v);
+  return Number(v.toFixed(2)) + 's';
 }
 
 export function fmtApproxDuration(sec) {
