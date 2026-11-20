@@ -83,6 +83,7 @@ _SHORT_MODEL_ALIASES = {
     "pro": "Gemini Pro",
     "carbon": "Gemini 4 Carbon",
     "argon": "Gemini 4 Argon",
+    "neon": "Gemini 4 Neon",
     "hydrogen": "Gemini 4 Hydrogen",
     "opus": "Claude Opus",
     "sonnet": "Claude Sonnet",
@@ -93,6 +94,7 @@ _SHORT_MODEL_ALIASES = {
 }
 
 _EFFORT_QUALIFIERS = {
+    "xhigh": "XHigh",
     "high": "High",
     "medium": "Medium",
     "low": "Low",

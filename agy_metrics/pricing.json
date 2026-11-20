@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-11-14",
+  "updated_at": "2026-11-19",
   "credits_per_usd": 100.0,
   "orchestrator": {
     "default_planner_id": "gemini-4-carbon",
@@ -41,6 +41,17 @@
         "input": 4.0,
         "cache_read": 0.2,
         "output": 20.0
+      }
+    },
+    {
+      "id": "gemini-4-neon",
+      "label": "Gemini 4 Neon",
+      "pool": "gemini",
+      "match_any": ["neon"],
+      "rates": {
+        "input": 3.0,
+        "cache_read": 0.15,
+        "output": 15.0
       }
     },
     {

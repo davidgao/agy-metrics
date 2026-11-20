@@ -35,6 +35,9 @@ class TestPricing(unittest.TestCase):
             cases = [
                 ("Gemini 4 Carbon (High)", "gemini-4-carbon", 2.0, 0.1, 10.0),
                 ("Gemini 4 Argon", "gemini-4-argon", 2.0, 0.1, 10.0),
+                ("Gemini 4 Neon (High)", "gemini-4-neon", 3.0, 0.15, 15.0),
+                ("gemini-4-neon", "gemini-4-neon", 3.0, 0.15, 15.0),
+                ("Subagent · Gemini 4 Neon (High)", "gemini-4-neon", 3.0, 0.15, 15.0),
                 ("gemini-4-hydrogen", "gemini-4-hydrogen", 1.5, 0.075, 7.5),
                 ("Subagent · Gemini 4 Hydrogen (High)", "gemini-4-hydrogen", 1.5, 0.075, 7.5),
                 ("Gemini 3 Flash-Lite", "gemini-flash-lite", 0.3, 0.03, 2.5),
@@ -74,6 +77,19 @@ class TestPricing(unittest.TestCase):
             self.assertEqual(exec_argon.orchestrator_role, "executor")
             assert exec_argon.counterfactual_planner is not None
             self.assertEqual(exec_argon.counterfactual_planner.catalog_id, "gemini-4-argon")
+
+            exec_neon = cat_pre.resolve_model("Orchestrator (Neon) · Executor")
+            self.assertEqual(exec_neon.status, "priced")
+            self.assertEqual(exec_neon.orchestrator_role, "executor")
+            assert exec_neon.entry is not None and exec_neon.counterfactual_planner is not None
+            self.assertEqual(exec_neon.entry.catalog_id, "gemini-4-hydrogen")
+            self.assertEqual(exec_neon.counterfactual_planner.catalog_id, "gemini-4-neon")
+
+            plan_neon = cat_pre.resolve_model("Orchestrator (Neon) · Planner")
+            self.assertEqual(plan_neon.orchestrator_role, "planner")
+            assert plan_neon.entry is not None
+            self.assertEqual(plan_neon.entry.catalog_id, "gemini-4-neon")
+            self.assertFalse(plan_neon.entry.has_future_change)
 
             plan_carbon = cat_pre.resolve_model("Orchestrator (Carbon) · Planner")
             self.assertEqual(plan_carbon.orchestrator_role, "planner")

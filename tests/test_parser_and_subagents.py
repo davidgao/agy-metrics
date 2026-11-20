@@ -1177,6 +1177,9 @@ class TestParserAndSubagents(unittest.TestCase):
         cases = [
             ("gemini-4-hydrogen-tiered-high", "Gemini 4 Hydrogen (High)"),
             ("gemini-4-carbon-tiered-high", "Gemini 4 Carbon (High)"),
+            ("gemini-4-neon-tiered-high", "Gemini 4 Neon (High)"),
+            ("gemini-4-neon-tiered-xhigh", "Gemini 4 Neon (XHigh)"),
+            ("neon", "Gemini 4 Neon"),
             ("gemini-3.1-pro-tiered-high", "Gemini 3.1 Pro (High)"),
             ("gemini-3-flash-tiered-low", "Gemini 3 Flash (Low)"),
             ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
@@ -1200,6 +1203,10 @@ class TestParserAndSubagents(unittest.TestCase):
         self.assertEqual(
             normalize_step_model("Orchestrator (Carbon) · Executor", is_subagent=True),
             "Subagent · Gemini 4 Hydrogen",
+        )
+        self.assertEqual(
+            normalize_step_model("Orchestrator (Neon) · Planner", is_subagent=True),
+            "Subagent · Gemini 4 Neon",
         )
         self.assertEqual(
             normalize_step_model("Subagent · gemini-4-hydrogen-tiered-high", is_subagent=True),
