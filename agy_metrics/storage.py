@@ -63,7 +63,7 @@ _ROLLUP_AGG_COLS_SQL = """
 def _events_union_sql(where_clause: str) -> str:
     return f"""
         SELECT (CASE WHEN epoch_s > 0 THEN CAST(epoch_s / 3600 AS INT) * 3600 ELSE 0 END) AS hour_epoch,
-               conv_id, model_name,
+               conv_id, model_name, counterfactual_model,
                1 AS is_step, is_checkpoint, input_tokens, cache_read_tokens,
                output_tokens, est_thinking_tokens, est_visible_tokens,
                duration_s, tool_exec_s, cold_cache_spike, est_delay_s, compaction_event,
@@ -74,7 +74,7 @@ def _events_union_sql(where_clause: str) -> str:
         WHERE {where_clause}
         UNION ALL
         SELECT (CASE WHEN epoch_s > 0 THEN CAST(epoch_s / 3600 AS INT) * 3600 ELSE 0 END) AS hour_epoch,
-               conv_id, model_name,
+               conv_id, model_name, '' AS counterfactual_model,
                0 AS is_step, 0 AS is_checkpoint, 0 AS input_tokens, 0 AS cache_read_tokens,
                0 AS output_tokens, 0 AS est_thinking_tokens, 0 AS est_visible_tokens,
                NULL AS duration_s, 0.0 AS tool_exec_s, 0 AS cold_cache_spike, NULL AS est_delay_s, 0 AS compaction_event,
@@ -157,6 +157,7 @@ class MetricsStore:
             CREATE TABLE IF NOT EXISTS conv_model_totals (
                 conv_id TEXT NOT NULL,
                 model_name TEXT NOT NULL,
+                counterfactual_model TEXT NOT NULL DEFAULT '',
                 steps_count INT NOT NULL,
                 compaction_steps_count INT NOT NULL,
                 input_tokens INT NOT NULL,
@@ -180,13 +181,14 @@ class MetricsStore:
                 failed_turns_count INT NOT NULL,
                 cold_delay_steps_count INT NOT NULL,
                 est_cold_delay_s REAL NOT NULL,
-                PRIMARY KEY (conv_id, model_name)
+                PRIMARY KEY (conv_id, model_name, counterfactual_model)
             ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS hour_model_totals (
                 hour_epoch INT NOT NULL,
                 conv_id TEXT NOT NULL,
                 model_name TEXT NOT NULL,
+                counterfactual_model TEXT NOT NULL DEFAULT '',
                 steps_count INT NOT NULL,
                 compaction_steps_count INT NOT NULL,
                 input_tokens INT NOT NULL,
@@ -210,7 +212,7 @@ class MetricsStore:
                 failed_turns_count INT NOT NULL,
                 cold_delay_steps_count INT NOT NULL,
                 est_cold_delay_s REAL NOT NULL,
-                PRIMARY KEY (hour_epoch, conv_id, model_name)
+                PRIMARY KEY (hour_epoch, conv_id, model_name, counterfactual_model)
             ) WITHOUT ROWID;
 
             CREATE INDEX IF NOT EXISTS idx_hour_conv ON hour_model_totals(conv_id);
@@ -236,6 +238,7 @@ class MetricsStore:
                 compaction_event INT NOT NULL,
                 retry_wait_s REAL NOT NULL DEFAULT 0.0,
                 retry_count INT NOT NULL DEFAULT 0,
+                counterfactual_model TEXT NOT NULL DEFAULT '',
                 est_delay_s REAL,
                 delay_finalized INT NOT NULL DEFAULT 0,
                 PRIMARY KEY (conv_id, ordinal)
@@ -453,18 +456,18 @@ class MetricsStore:
             self.db.execute(
                 f"""
                 INSERT INTO conv_model_totals
-                SELECT conv_id, model_name, {agg}
+                SELECT conv_id, model_name, counterfactual_model, {agg}
                 FROM ({union_sql})
-                GROUP BY conv_id, model_name
+                GROUP BY conv_id, model_name, counterfactual_model
                 """,
                 (cid, cid),
             )
             self.db.execute(
                 f"""
                 INSERT INTO hour_model_totals
-                SELECT hour_epoch, conv_id, model_name, {agg}
+                SELECT hour_epoch, conv_id, model_name, counterfactual_model, {agg}
                 FROM ({union_sql})
-                GROUP BY hour_epoch, conv_id, model_name
+                GROUP BY hour_epoch, conv_id, model_name, counterfactual_model
                 """,
                 (cid, cid),
             )
@@ -517,6 +520,7 @@ class MetricsStore:
                     comp_ev,
                     float(s.retry_wait_s),
                     int(s.retry_count),
+                    str(s.counterfactual_model or ""),
                 )
             )
 
@@ -640,7 +644,7 @@ class MetricsStore:
                     )
                     if step_rows:
                         self.db.executemany(
-                            "INSERT INTO step_lite VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO step_lite VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             step_rows,
                         )
                     if failed_rows:
@@ -1049,71 +1053,104 @@ class MetricsStore:
 
     def query_window_val_rows(
         self,
-        cutoff_epoch: float,
+        cutoff_epoch: float | None,
         conv_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if conv_ids is not None and len(conv_ids) == 0:
             return []
-        boundary_hour = int(cutoff_epoch // 3600) * 3600
-        ceil_hour = boundary_hour + 3600
-        if conv_ids is None:
-            sql = """
-                SELECT model_name,
-                       SUM(steps_count),
-                       SUM(input_tokens),
-                       SUM(cache_read_tokens),
-                       SUM(output_tokens)
-                FROM (
-                    SELECT model_name, steps_count, input_tokens, cache_read_tokens, output_tokens
-                    FROM hour_model_totals
-                    WHERE hour_epoch >= ?
-                    UNION ALL
+        if cutoff_epoch is None:
+            if conv_ids is None:
+                sql = """
                     SELECT model_name,
-                           COUNT(*),
-                           COALESCE(SUM(input_tokens), 0),
-                           COALESCE(SUM(cache_read_tokens), 0),
-                           COALESCE(SUM(output_tokens), 0)
-                    FROM step_lite
-                    WHERE epoch_s >= ? AND epoch_s < ?
-                    GROUP BY model_name
-                )
-                GROUP BY model_name
-            """
-            params: tuple[Any, ...] = (ceil_hour, cutoff_epoch, ceil_hour)
+                           counterfactual_model,
+                           SUM(steps_count),
+                           SUM(input_tokens),
+                           SUM(cache_read_tokens),
+                           SUM(output_tokens)
+                    FROM conv_model_totals
+                    GROUP BY model_name, counterfactual_model
+                """
+                params: tuple[Any, ...] = ()
+            else:
+                placeholders = ",".join("?" for _ in conv_ids)
+                sql = f"""
+                    SELECT model_name,
+                           counterfactual_model,
+                           SUM(steps_count),
+                           SUM(input_tokens),
+                           SUM(cache_read_tokens),
+                           SUM(output_tokens)
+                    FROM conv_model_totals
+                    WHERE conv_id IN ({placeholders})
+                    GROUP BY model_name, counterfactual_model
+                """
+                params = tuple(conv_ids)
         else:
-            placeholders = ",".join("?" for _ in conv_ids)
-            sql = f"""
-                SELECT model_name,
-                       SUM(steps_count),
-                       SUM(input_tokens),
-                       SUM(cache_read_tokens),
-                       SUM(output_tokens)
-                FROM (
-                    SELECT model_name, steps_count, input_tokens, cache_read_tokens, output_tokens
-                    FROM hour_model_totals
-                    WHERE conv_id IN ({placeholders}) AND hour_epoch >= ?
-                    UNION ALL
+            boundary_hour = int(cutoff_epoch // 3600) * 3600
+            ceil_hour = boundary_hour + 3600
+            if conv_ids is None:
+                sql = """
                     SELECT model_name,
-                           COUNT(*),
-                           COALESCE(SUM(input_tokens), 0),
-                           COALESCE(SUM(cache_read_tokens), 0),
-                           COALESCE(SUM(output_tokens), 0)
-                    FROM step_lite
-                    WHERE conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?
-                    GROUP BY model_name
-                )
-                GROUP BY model_name
-            """
-            params = (*conv_ids, ceil_hour, *conv_ids, cutoff_epoch, ceil_hour)
+                           counterfactual_model,
+                           SUM(steps_count),
+                           SUM(input_tokens),
+                           SUM(cache_read_tokens),
+                           SUM(output_tokens)
+                    FROM (
+                        SELECT model_name, counterfactual_model, steps_count, input_tokens, cache_read_tokens, output_tokens
+                        FROM hour_model_totals
+                        WHERE hour_epoch >= ?
+                        UNION ALL
+                        SELECT model_name,
+                               counterfactual_model,
+                               COUNT(*),
+                               COALESCE(SUM(input_tokens), 0),
+                               COALESCE(SUM(cache_read_tokens), 0),
+                               COALESCE(SUM(output_tokens), 0)
+                        FROM step_lite
+                        WHERE epoch_s >= ? AND epoch_s < ?
+                        GROUP BY model_name, counterfactual_model
+                    )
+                    GROUP BY model_name, counterfactual_model
+                """
+                params = (ceil_hour, cutoff_epoch, ceil_hour)
+            else:
+                placeholders = ",".join("?" for _ in conv_ids)
+                sql = f"""
+                    SELECT model_name,
+                           counterfactual_model,
+                           SUM(steps_count),
+                           SUM(input_tokens),
+                           SUM(cache_read_tokens),
+                           SUM(output_tokens)
+                    FROM (
+                        SELECT model_name, counterfactual_model, steps_count, input_tokens, cache_read_tokens, output_tokens
+                        FROM hour_model_totals
+                        WHERE conv_id IN ({placeholders}) AND hour_epoch >= ?
+                        UNION ALL
+                        SELECT model_name,
+                               counterfactual_model,
+                               COUNT(*),
+                               COALESCE(SUM(input_tokens), 0),
+                               COALESCE(SUM(cache_read_tokens), 0),
+                               COALESCE(SUM(output_tokens), 0)
+                        FROM step_lite
+                        WHERE conv_id IN ({placeholders}) AND epoch_s >= ? AND epoch_s < ?
+                        GROUP BY model_name, counterfactual_model
+                    )
+                    GROUP BY model_name, counterfactual_model
+                """
+                params = (*conv_ids, ceil_hour, *conv_ids, cutoff_epoch, ceil_hour)
 
         rows = self.db.execute(sql, params).fetchall()
         return [
             {
                 "model_name": str(r[0]),
-                "steps_count": int(r[1] or 0),
-                "input_tokens": int(r[2] or 0),
-                "cache_read_tokens": int(r[3] or 0),
-                "output_tokens": int(r[4] or 0),
+                "counterfactual_model": str(r[1] or ""),
+                "steps_count": int(r[2] or 0),
+                "input_tokens": int(r[3] or 0),
+                "cache_read_tokens": int(r[4] or 0),
+                "output_tokens": int(r[5] or 0),
             }
             for r in rows
         ]

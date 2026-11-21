@@ -1209,6 +1209,9 @@ class TestParserAndSubagents(unittest.TestCase):
             ("pro", "Gemini Pro"),
             ("Gemini 4 Carbon (High)", "Gemini 4 Carbon (High)"),
             ("Orchestrator (Carbon) · Planner", "Orchestrator (Carbon) · Planner"),
+            ("Planner · gemini-4-neon-high", "Planner · Gemini 4 Neon (High)"),
+            ("Executor · gemini-4-hydrogen-medium", "Executor · Gemini 4 Hydrogen (Medium)"),
+            ("Planner · Planner · gemini-4-neon", "Planner · Gemini 4 Neon"),
             ("unknown", "unknown"),
             ("auto", "auto"),
         ]
@@ -1218,6 +1221,14 @@ class TestParserAndSubagents(unittest.TestCase):
         self.assertEqual(
             normalize_step_model("gemini-4-hydrogen-tiered-high", is_subagent=True),
             "Subagent · Gemini 4 Hydrogen (High)",
+        )
+        self.assertEqual(
+            normalize_step_model("Planner · Gemini 4 Neon (High)", is_subagent=True),
+            "Subagent · Gemini 4 Neon (High)",
+        )
+        self.assertEqual(
+            normalize_step_model("Executor · Claude Sonnet 4.6", is_subagent=True),
+            "Subagent · Claude Sonnet 4.6",
         )
         self.assertEqual(
             normalize_step_model("Orchestrator (Carbon) · Executor", is_subagent=True),
@@ -1657,6 +1668,255 @@ class TestParserAndSubagents(unittest.TestCase):
                 self.assertEqual(convs_by_id[cid_sub1]["planner_steps_count"], 3)
             finally:
                 eng2.close()
+
+    def test_per_step_model_orchestrator_handoff_isolation_and_subagent_inherit(self) -> None:
+        """Per-step `model` attributes Planner/Executor/Direct/Subagent separately with isolated rooflines."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            state = root / "state"
+            cid = "11111111-ffff-0000-0000-000000000001"
+            sub_inherit_id = "22222222-ffff-0000-0000-000000000002"
+            sub_own_id = "33333333-ffff-0000-0000-000000000003"
+
+            t0 = datetime(2026, 11, 20, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+
+            def _iso(ep: float) -> str:
+                return datetime.fromtimestamp(ep, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            tr: list[dict] = [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": _iso(t0),
+                    "content": "<USER_REQUEST>\nImplement feature\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Neon (High). No need to comment.\n</USER_SETTINGS_CHANGE>",
+                },
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso(t0 + 1),
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": 5000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 150,
+                    "thinking": "Exploring...",
+                    "content": "",
+                    "tool_calls": [],
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso(t0 + 4),
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": 5200,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 200,
+                    "thinking": "Planning...",
+                    "content": "",
+                    "tool_calls": [{"name": "exit_plan_mode", "args": {"plan": '"Step 1"'}}],
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "created_at": _iso(t0 + 6),
+                    "content": f"Created At: {_iso(t0 + 6)}\nCompleted At: {_iso(t0 + 7)}\nApproved.",
+                },
+                {
+                    "step_index": 4,
+                    "type": "SYSTEM_MESSAGE",
+                    "created_at": _iso(t0 + 8),
+                    "content": "<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>",
+                },
+                {
+                    "step_index": 5,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso(t0 + 9),
+                    "model": "claude-sonnet-4-6",
+                    "input_tokens": 5400,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 300,
+                    "content": "",
+                    "tool_calls": [
+                        {"name": "invoke_subagent", "args": {"Role": '"Inherited Worker"', "Model": '"inherit"'}},
+                        {"name": "invoke_subagent", "args": {"Role": '"Explicit Worker"', "Model": '"inherit"'}},
+                    ],
+                },
+                {
+                    "step_index": 6,
+                    "type": "GENERIC",
+                    "created_at": _iso(t0 + 10),
+                    "content": f"Created At: {_iso(t0 + 10)}\nCompleted At: {_iso(t0 + 11)}\nSpawned {sub_inherit_id}",
+                },
+                {
+                    "step_index": 7,
+                    "type": "GENERIC",
+                    "created_at": _iso(t0 + 11),
+                    "content": f"Created At: {_iso(t0 + 11)}\nCompleted At: {_iso(t0 + 12)}\nSpawned {sub_own_id}",
+                },
+                {
+                    "step_index": 8,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso(t0 + 13),
+                    "model": "claude-sonnet-4-6",
+                    "input_tokens": 5600,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 120,
+                    "content": "",
+                    "tool_calls": [{"name": "enter_plan_mode", "args": {"reason": '"Need review"'}}],
+                },
+                {
+                    "step_index": 9,
+                    "type": "SYSTEM_MESSAGE",
+                    "created_at": _iso(t0 + 14),
+                    "content": "[plan review due]",
+                },
+                {
+                    "step_index": 10,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso(t0 + 15),
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": 5800,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 180,
+                    "content": "Plan revised.",
+                    "tool_calls": [],
+                },
+                {
+                    "step_index": 11,
+                    "type": "USER_INPUT",
+                    "created_at": _iso(t0 + 20),
+                    "content": "<USER_REQUEST>\nDirect question on Sonnet\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Neon (High) to Claude Sonnet 4.6. No need to comment.\n</USER_SETTINGS_CHANGE>",
+                },
+                {
+                    "step_index": 12,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso(t0 + 21),
+                    "model": "claude-sonnet-4-6",
+                    "input_tokens": 6000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 140,
+                    "content": "Direct Sonnet answer.",
+                    "tool_calls": [],
+                },
+            ]
+            write_jsonl(brain / cid / ".system_generated" / "logs" / "transcript_full.jsonl", tr)
+
+            # Inherited subagent with no `model` on its step falls back to parent Executor's Sonnet
+            write_jsonl(
+                brain / sub_inherit_id / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": _iso(t0 + 10), "content": "Subtask 1"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": _iso(t0 + 10.5),
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 50,
+                        "content": "Sub 1 done.",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+            # Child subagent with its own `model` uses its own model over any fallback
+            write_jsonl(
+                brain / sub_own_id / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": _iso(t0 + 11), "content": "Subtask 2"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": _iso(t0 + 11.5),
+                        "model": "gemini-4-hydrogen-medium",
+                        "input_tokens": 1200,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 80,
+                        "content": "Sub 2 done.",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+
+            # Add enough timed steps on Executor Sonnet vs Direct Sonnet in another conv to verify separate rooflines
+            cid_direct = "44444444-ffff-0000-0000-000000000004"
+            tr_dir: list[dict] = [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": _iso(t0 + 100),
+                    "content": "<USER_REQUEST>\nDirect Sonnet speed\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Claude Sonnet 4.6.\n</USER_SETTINGS_CHANGE>",
+                }
+            ]
+            hk_dir: list[dict] = []
+            cur = t0 + 101
+            for j, out_tok in enumerate((100, 300, 600, 900), start=1):
+                dur_s = 0.5 + out_tok / 200.0
+                tr_dir.append(
+                    {
+                        "step_index": j,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": _iso(cur),
+                        "model": "claude-sonnet-4-6",
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 4000,
+                        "output_tokens": out_tok,
+                        "content": "Direct.",
+                        "tool_calls": [],
+                    }
+                )
+                hk_dir.append({"ts_ms": int(cur * 1000), "event": "PreInvocation", "conversation_id": cid_direct})
+                hk_dir.append({"ts_ms": int((cur + dur_s) * 1000), "event": "PostInvocation", "conversation_id": cid_direct})
+                cur += dur_s + 2
+            write_jsonl(brain / cid_direct / ".system_generated" / "logs" / "transcript_full.jsonl", tr_dir)
+            write_jsonl(state / "conversations" / f"{cid_direct}.hooks.jsonl", hk_dir)
+
+            eng = MetricsEngine(brain_dir=brain, state_dir=state, as_of_date="2026-11-20")
+            try:
+                m = eng.get_metrics(cid)
+                steps = m["steps"]
+                self.assertEqual(
+                    [s["model_name"] for s in steps],
+                    [
+                        "Planner · Gemini 4 Neon (High)",
+                        "Planner · Gemini 4 Neon (High)",
+                        "Executor · Claude Sonnet 4.6",
+                        "Executor · Claude Sonnet 4.6",
+                        "Planner · Gemini 4 Neon (High)",
+                        "Claude Sonnet 4.6",
+                    ],
+                )
+                self.assertEqual(
+                    [s["counterfactual_model"] for s in steps],
+                    [
+                        "",
+                        "",
+                        "Gemini 4 Neon (High)",
+                        "Gemini 4 Neon (High)",
+                        "",
+                        "",
+                    ],
+                )
+                self.assertEqual(m["model_name"], "Claude Sonnet 4.6")
+
+                sub_by_id = {it["conversation_id"]: it for it in m["subagents"]["items"]}
+                self.assertEqual(sub_by_id[sub_inherit_id]["model_name"], "Subagent · Claude Sonnet 4.6")
+                self.assertEqual(sub_by_id[sub_own_id]["model_name"], "Subagent · Gemini 4 Hydrogen (Medium)")
+
+                by_m = {bm["model_name"]: bm for bm in m["by_model"]}
+                self.assertIn("Planner · Gemini 4 Neon (High)", by_m)
+                self.assertIn("Executor · Claude Sonnet 4.6", by_m)
+                self.assertIn("Claude Sonnet 4.6", by_m)
+                self.assertIn("Subagent · Claude Sonnet 4.6", by_m)
+                self.assertIn("Subagent · Gemini 4 Hydrogen (Medium)", by_m)
+
+                # Direct Sonnet roofline uses only Direct Sonnet steps (4 warm steps in cid_direct),
+                # unpolluted by Executor · Claude Sonnet 4.6 (which has 1 warm step of its own)
+                self.assertTrue(by_m["Claude Sonnet 4.6"]["latency_fit"]["available"])
+                self.assertEqual(by_m["Claude Sonnet 4.6"]["latency_fit"]["warm_count"], 4)
+                self.assertFalse(by_m["Executor · Claude Sonnet 4.6"]["latency_fit"]["available"])
+                self.assertEqual(by_m["Executor · Claude Sonnet 4.6"]["latency_fit"]["warm_count"], 1)
+            finally:
+                eng.close()
 
 
 if __name__ == "__main__":

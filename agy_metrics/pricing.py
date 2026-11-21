@@ -15,6 +15,8 @@ from typing import Any
 _DEFAULT_BUNDLED_PATH = Path(__file__).resolve().parent / "pricing.json"
 _ORCH_PAREN_RE = re.compile(r"orchestrator\s*\(([^)]+)\)", re.IGNORECASE)
 _EXECUTOR_PHASE_RE = re.compile(r"(?:·|\b)executor\b", re.IGNORECASE)
+_PLANNER_PREFIX_RE = re.compile(r"^planner\s*·\s*(.+)$", re.IGNORECASE)
+_EXECUTOR_PREFIX_RE = re.compile(r"^executor\s*·\s*(.+)$", re.IGNORECASE)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _MAX_STR_LEN = 120
@@ -415,7 +417,9 @@ class PricingCatalog:
                 return eff
         return None
 
-    def resolve_model(self, raw_model_name: str) -> ModelResolution:
+    def resolve_model(
+        self, raw_model_name: str, counterfactual_model: str = ""
+    ) -> ModelResolution:
         """Resolve a transcript/dashboard model label to pricing and Orchestrator roles."""
         with self._lock:
             raw = (raw_model_name or "").strip()
@@ -446,12 +450,53 @@ class PricingCatalog:
                         counterfactual_planner=None,
                     )
 
+            m_plan = _PLANNER_PREFIX_RE.match(raw)
+            if m_plan:
+                planner_entry = self._resolve_base_hint(m_plan.group(1).strip())
+                if planner_entry is None:
+                    return ModelResolution(
+                        status="unpriced",
+                        entry=None,
+                        orchestrator_role="planner",
+                        counterfactual_planner=None,
+                    )
+                return ModelResolution(
+                    status="priced",
+                    entry=planner_entry,
+                    orchestrator_role="planner",
+                    counterfactual_planner=planner_entry,
+                )
+
+            m_exec = _EXECUTOR_PREFIX_RE.match(raw)
+            if m_exec:
+                executor_entry = self._resolve_base_hint(m_exec.group(1).strip())
+                cf_raw = (counterfactual_model or "").strip()
+                if cf_raw:
+                    planner_entry = self._resolve_base_hint(cf_raw)
+                else:
+                    planner_entry = self._bundled_by_id.get(self._default_planner_id)
+                if executor_entry is None:
+                    return ModelResolution(
+                        status="unpriced",
+                        entry=None,
+                        orchestrator_role="executor",
+                        counterfactual_planner=planner_entry,
+                    )
+                return ModelResolution(
+                    status="priced",
+                    entry=executor_entry,
+                    orchestrator_role="executor",
+                    counterfactual_planner=planner_entry,
+                )
+
             if "orchestrator" in lower:
                 m_hint = _ORCH_PAREN_RE.search(raw)
                 base_hint = m_hint.group(1).strip() if m_hint else ""
                 phase = "executor" if _EXECUTOR_PHASE_RE.search(lower) else "planner"
                 if base_hint:
                     planner_entry = self._resolve_base_hint(base_hint)
+                elif phase == "executor" and (counterfactual_model or "").strip():
+                    planner_entry = self._resolve_base_hint(counterfactual_model)
                 else:
                     planner_entry = self._bundled_by_id.get(self._default_planner_id)
 
@@ -539,9 +584,12 @@ class PricingCatalog:
         input_tokens: int,
         cache_read_tokens: int,
         output_tokens: int,
+        counterfactual_model: str = "",
     ) -> dict[str, Any]:
         with self._lock:
-            res = self.resolve_model(model_name)
+            res = self.resolve_model(
+                model_name, counterfactual_model=counterfactual_model
+            )
             if res.status != "priced" or res.entry is None:
                 return {
                     "status": res.status,
@@ -625,6 +673,110 @@ class PricingCatalog:
                 "counterfactual_label": cf_label,
             }
 
+    def value_model_rows(
+        self, model_name: str, rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Value a group of rows for one model_name across potentially multiple counterfactuals."""
+        with self._lock:
+            if not rows:
+                return self.value_model_group(model_name, 0, 0, 0, 0)
+            tot_steps = sum(int(r.get("steps_count") or 0) for r in rows)
+            tot_in = sum(int(r.get("input_tokens") or 0) for r in rows)
+            tot_cache = sum(int(r.get("cache_read_tokens") or 0) for r in rows)
+            tot_out = sum(int(r.get("output_tokens") or 0) for r in rows)
+            first_cf = str(rows[0].get("counterfactual_model") or "")
+            base = self.value_model_group(
+                model_name,
+                tot_steps,
+                tot_in,
+                tot_cache,
+                tot_out,
+                counterfactual_model=first_cf,
+            )
+            if (
+                len(rows) == 1
+                or base["status"] != "priced"
+                or base["orchestrator_role"] != "executor"
+            ):
+                return base
+
+            sav_sum = 0.0
+            fut_sav_sum = 0.0
+            any_cf = False
+            cf_labels: list[str] = []
+            for row in rows:
+                cf_m = str(row.get("counterfactual_model") or "")
+                res = self.resolve_model(model_name, counterfactual_model=cf_m)
+                if res.status != "priced" or res.entry is None:
+                    continue
+                if res.counterfactual_planner is None:
+                    continue
+                any_cf = True
+                cf = res.counterfactual_planner
+                if cf.label not in cf_labels:
+                    cf_labels.append(cf.label)
+                r_in = int(row.get("input_tokens") or 0)
+                r_cache = int(row.get("cache_read_tokens") or 0)
+                r_out = int(row.get("output_tokens") or 0)
+                _, _, _, act_c = cost_for_tokens(r_in, r_cache, r_out, res.entry.rates)
+                _, _, _, f_act_c = cost_for_tokens(
+                    r_in, r_cache, r_out, res.entry.future_rates
+                )
+                _, _, _, cf_c = cost_for_tokens(r_in, r_cache, r_out, cf.rates)
+                _, _, _, f_cf_c = cost_for_tokens(r_in, r_cache, r_out, cf.future_rates)
+                sav_sum += cf_c - act_c
+                fut_sav_sum += f_cf_c - f_act_c
+
+            if any_cf:
+                base["orchestrator_savings_usd"] = round(sav_sum, 6)
+                base["orchestrator_future_savings_usd"] = round(fut_sav_sum, 6)
+                base["counterfactual_label"] = " / ".join(cf_labels)
+            else:
+                base["orchestrator_savings_usd"] = None
+                base["orchestrator_future_savings_usd"] = None
+                base["counterfactual_label"] = None
+            return base
+
+    @staticmethod
+    def _empty_inter_pool() -> dict[str, Any]:
+        return {
+            "present": False,
+            "offloaded": {
+                "steps": 0,
+                "avoided_cost_usd": 0.0,
+                "avoided_credits": 0.0,
+                "spent_elsewhere_usd": 0.0,
+                "spent_elsewhere_credits": 0.0,
+                "net_savings_usd": 0.0,
+                "net_savings_credits": 0.0,
+                "net_savings_pct": 0.0,
+                "has_future_change": False,
+                "future_avoided_cost_usd": 0.0,
+                "future_spent_elsewhere_usd": 0.0,
+                "future_net_savings_usd": 0.0,
+                "planner_labels": [],
+                "executor_labels": [],
+                "target_pools": [],
+            },
+            "absorbed": {
+                "steps": 0,
+                "spent_cost_usd": 0.0,
+                "spent_credits": 0.0,
+                "avoided_elsewhere_usd": 0.0,
+                "avoided_elsewhere_credits": 0.0,
+                "net_savings_usd": 0.0,
+                "net_savings_credits": 0.0,
+                "net_savings_pct": 0.0,
+                "has_future_change": False,
+                "future_spent_cost_usd": 0.0,
+                "future_avoided_elsewhere_usd": 0.0,
+                "future_net_savings_usd": 0.0,
+                "planner_labels": [],
+                "executor_labels": [],
+                "source_pools": [],
+            },
+        }
+
     def empty_valuation(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -662,7 +814,9 @@ class PricingCatalog:
                     "future_savings_credits": 0.0,
                     "future_savings_pct": 0.0,
                     "planner_labels": [],
+                    "executor_labels": [],
                     "executor_label": None,
+                    "inter_pool": self._empty_inter_pool(),
                 },
                 "coverage": {
                     "priced_steps": 0,
@@ -675,7 +829,9 @@ class PricingCatalog:
                 },
             }
 
-    def aggregate_valuation(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def aggregate_valuation(
+        self, rows: list[dict[str, Any]], *, pool_filter: str | None = None
+    ) -> dict[str, Any]:
         """Aggregate Paygo, Credits, Orchestrator savings, and coverage across model rows."""
         with self._lock:
             cpu = self._credits_per_usd
@@ -699,7 +855,27 @@ class PricingCatalog:
             orch_fut_counterfactual = 0.0
             orch_fut_changed = False
             planner_labels: list[str] = []
-            executor_label: str | None = None
+            executor_labels: list[str] = []
+
+            off_steps = 0
+            off_avoided = 0.0
+            off_spent_elsewhere = 0.0
+            off_fut_avoided = 0.0
+            off_fut_spent_elsewhere = 0.0
+            off_fut_changed = False
+            off_planner_labels: list[str] = []
+            off_executor_labels: list[str] = []
+            off_target_pools: list[str] = []
+
+            abs_steps = 0
+            abs_spent = 0.0
+            abs_avoided_elsewhere = 0.0
+            abs_fut_spent = 0.0
+            abs_fut_avoided_elsewhere = 0.0
+            abs_fut_changed = False
+            abs_planner_labels: list[str] = []
+            abs_executor_labels: list[str] = []
+            abs_source_pools: list[str] = []
 
             priced_steps = 0
             priced_tokens = 0
@@ -711,97 +887,193 @@ class PricingCatalog:
 
             for row in rows:
                 m_name = str(row.get("model_name") or "")
+                cf_name = str(row.get("counterfactual_model") or "")
                 steps_n = int(row.get("steps_count") or 0)
                 in_tok = int(row.get("input_tokens") or 0)
                 cache_tok = int(row.get("cache_read_tokens") or 0)
                 out_tok = int(row.get("output_tokens") or 0)
                 tok_tot = in_tok + cache_tok + out_tok
 
-                res = self.resolve_model(m_name)
+                res = self.resolve_model(m_name, counterfactual_model=cf_name)
                 if res.status == "unattributed":
-                    unattributed_steps += steps_n
-                    unattributed_tokens += tok_tot
+                    if pool_filter is None:
+                        unattributed_steps += steps_n
+                        unattributed_tokens += tok_tot
                     continue
                 if res.status != "priced" or res.entry is None:
-                    unpriced_steps += steps_n
-                    unpriced_tokens += tok_tot
-                    bucket = unpriced_by_name.get(m_name)
-                    if bucket is None:
-                        unpriced_by_name[m_name] = {
-                            "model_name": m_name,
-                            "steps_count": steps_n,
-                            "total_tokens": tok_tot,
-                        }
-                    else:
-                        bucket["steps_count"] += steps_n
-                        bucket["total_tokens"] += tok_tot
+                    if pool_filter is None:
+                        unpriced_steps += steps_n
+                        unpriced_tokens += tok_tot
+                        bucket = unpriced_by_name.get(m_name)
+                        if bucket is None:
+                            unpriced_by_name[m_name] = {
+                                "model_name": m_name,
+                                "steps_count": steps_n,
+                                "total_tokens": tok_tot,
+                            }
+                        else:
+                            bucket["steps_count"] += steps_n
+                            bucket["total_tokens"] += tok_tot
                     continue
 
                 eff = res.entry
-                priced_steps += steps_n
-                priced_tokens += tok_tot
-
                 u_in, c_in, out_c, tot_c = cost_for_tokens(
                     in_tok, cache_tok, out_tok, eff.rates
                 )
                 f_u_in, f_c_in, f_out_c, f_tot_c = cost_for_tokens(
                     in_tok, cache_tok, out_tok, eff.future_rates
                 )
-                cur_u_in += u_in
-                cur_c_in += c_in
-                cur_out += out_c
-                cur_tot += tot_c
-                fut_u_in += f_u_in
-                fut_c_in += f_c_in
-                fut_in += f_u_in + f_c_in
-                fut_out += f_out_c
-                fut_tot += f_tot_c
-                if eff.has_future_change:
-                    has_fut = True
-                    if eff.future_effective_date:
-                        fut_dates.add(eff.future_effective_date)
+
+                if pool_filter is None or eff.pool == pool_filter:
+                    priced_steps += steps_n
+                    priced_tokens += tok_tot
+                    cur_u_in += u_in
+                    cur_c_in += c_in
+                    cur_out += out_c
+                    cur_tot += tot_c
+                    fut_u_in += f_u_in
+                    fut_c_in += f_c_in
+                    fut_in += f_u_in + f_c_in
+                    fut_out += f_out_c
+                    fut_tot += f_tot_c
+                    if eff.has_future_change:
+                        has_fut = True
+                        if eff.future_effective_date:
+                            fut_dates.add(eff.future_effective_date)
 
                 if res.orchestrator_role == "planner":
-                    orch_planner_steps += steps_n
-                    orch_actual += tot_c
-                    orch_counterfactual += tot_c
-                    orch_fut_actual += f_tot_c
-                    orch_fut_counterfactual += f_tot_c
-                    if eff.label not in planner_labels:
-                        planner_labels.append(eff.label)
-                    if eff.has_future_change:
-                        orch_fut_changed = True
+                    if pool_filter is None or eff.pool == pool_filter:
+                        orch_planner_steps += steps_n
+                        orch_actual += tot_c
+                        orch_counterfactual += tot_c
+                        orch_fut_actual += f_tot_c
+                        orch_fut_counterfactual += f_tot_c
+                        if eff.label not in planner_labels:
+                            planner_labels.append(eff.label)
+                        if eff.has_future_change:
+                            orch_fut_changed = True
                 elif res.orchestrator_role == "executor":
-                    orch_executor_steps += steps_n
-                    executor_label = eff.label
-                    if res.counterfactual_planner is not None:
-                        cf = res.counterfactual_planner
+                    cf = res.counterfactual_planner
+                    if cf is not None:
                         _, _, _, cf_tot = cost_for_tokens(
                             in_tok, cache_tok, out_tok, cf.rates
                         )
                         _, _, _, cf_fut_tot = cost_for_tokens(
                             in_tok, cache_tok, out_tok, cf.future_rates
                         )
+                    else:
+                        cf_tot = tot_c
+                        cf_fut_tot = f_tot_c
+
+                    if pool_filter is None or (
+                        eff.pool == pool_filter
+                        and (cf is None or cf.pool == pool_filter)
+                    ):
+                        orch_executor_steps += steps_n
+                        if eff.label not in executor_labels:
+                            executor_labels.append(eff.label)
                         orch_actual += tot_c
                         orch_counterfactual += cf_tot
                         orch_fut_actual += f_tot_c
                         orch_fut_counterfactual += cf_fut_tot
-                        if cf.label not in planner_labels:
-                            planner_labels.append(cf.label)
+                        if cf is not None:
+                            if cf.label not in planner_labels:
+                                planner_labels.append(cf.label)
+                            if eff.has_future_change or cf.has_future_change:
+                                orch_fut_changed = True
+                        elif eff.has_future_change:
+                            orch_fut_changed = True
+                    elif cf is not None and cf.pool == pool_filter and eff.pool != pool_filter:
+                        off_steps += steps_n
+                        off_avoided += cf_tot
+                        off_spent_elsewhere += tot_c
+                        off_fut_avoided += cf_fut_tot
+                        off_fut_spent_elsewhere += f_tot_c
                         if eff.has_future_change or cf.has_future_change:
-                            orch_fut_changed = True
-                    else:
-                        orch_actual += tot_c
-                        orch_counterfactual += tot_c
-                        orch_fut_actual += f_tot_c
-                        orch_fut_counterfactual += f_tot_c
-                        if eff.has_future_change:
-                            orch_fut_changed = True
+                            off_fut_changed = True
+                        if cf.label not in off_planner_labels:
+                            off_planner_labels.append(cf.label)
+                        if eff.label not in off_executor_labels:
+                            off_executor_labels.append(eff.label)
+                        if eff.pool not in off_target_pools:
+                            off_target_pools.append(eff.pool)
+                    elif eff.pool == pool_filter and cf is not None and cf.pool != pool_filter:
+                        abs_steps += steps_n
+                        abs_spent += tot_c
+                        abs_avoided_elsewhere += cf_tot
+                        abs_fut_spent += f_tot_c
+                        abs_fut_avoided_elsewhere += cf_fut_tot
+                        if eff.has_future_change or cf.has_future_change:
+                            abs_fut_changed = True
+                        if cf.label not in abs_planner_labels:
+                            abs_planner_labels.append(cf.label)
+                        if eff.label not in abs_executor_labels:
+                            abs_executor_labels.append(eff.label)
+                        if cf.pool not in abs_source_pools:
+                            abs_source_pools.append(cf.pool)
 
-            orch_present = (orch_planner_steps > 0) or (orch_executor_steps > 0)
+            off_net = off_avoided - off_spent_elsewhere
+            off_fut_net = off_fut_avoided - off_fut_spent_elsewhere
+            off_net_pct = (
+                round(off_net / off_avoided * 100.0, 1)
+                if off_steps > 0 and off_avoided > 0.0
+                else 0.0
+            )
+            abs_net = abs_avoided_elsewhere - abs_spent
+            abs_fut_net = abs_fut_avoided_elsewhere - abs_fut_spent
+            abs_net_pct = (
+                round(abs_net / abs_avoided_elsewhere * 100.0, 1)
+                if abs_steps > 0 and abs_avoided_elsewhere > 0.0
+                else 0.0
+            )
+            inter_present = (off_steps > 0) or (abs_steps > 0)
+            inter_pool = {
+                "present": inter_present,
+                "offloaded": {
+                    "steps": off_steps,
+                    "avoided_cost_usd": round(off_avoided, 6),
+                    "avoided_credits": round(off_avoided * cpu, 4),
+                    "spent_elsewhere_usd": round(off_spent_elsewhere, 6),
+                    "spent_elsewhere_credits": round(off_spent_elsewhere * cpu, 4),
+                    "net_savings_usd": round(off_net, 6) if off_steps > 0 else 0.0,
+                    "net_savings_credits": round(off_net * cpu, 4) if off_steps > 0 else 0.0,
+                    "net_savings_pct": off_net_pct,
+                    "has_future_change": off_steps > 0 and off_fut_changed,
+                    "future_avoided_cost_usd": round(off_fut_avoided, 6),
+                    "future_spent_elsewhere_usd": round(off_fut_spent_elsewhere, 6),
+                    "future_net_savings_usd": round(off_fut_net, 6) if off_steps > 0 else 0.0,
+                    "planner_labels": off_planner_labels,
+                    "executor_labels": off_executor_labels,
+                    "target_pools": off_target_pools,
+                },
+                "absorbed": {
+                    "steps": abs_steps,
+                    "spent_cost_usd": round(abs_spent, 6),
+                    "spent_credits": round(abs_spent * cpu, 4),
+                    "avoided_elsewhere_usd": round(abs_avoided_elsewhere, 6),
+                    "avoided_elsewhere_credits": round(abs_avoided_elsewhere * cpu, 4),
+                    "net_savings_usd": round(abs_net, 6) if abs_steps > 0 else 0.0,
+                    "net_savings_credits": round(abs_net * cpu, 4) if abs_steps > 0 else 0.0,
+                    "net_savings_pct": abs_net_pct,
+                    "has_future_change": abs_steps > 0 and abs_fut_changed,
+                    "future_spent_cost_usd": round(abs_fut_spent, 6),
+                    "future_avoided_elsewhere_usd": round(abs_fut_avoided_elsewhere, 6),
+                    "future_net_savings_usd": round(abs_fut_net, 6) if abs_steps > 0 else 0.0,
+                    "planner_labels": abs_planner_labels,
+                    "executor_labels": abs_executor_labels,
+                    "source_pools": abs_source_pools,
+                },
+            }
+
+            orch_present = (
+                (orch_planner_steps > 0)
+                or (orch_executor_steps > 0)
+                or inter_present
+            )
             orch_sav_pct = (
                 round((orch_counterfactual - orch_actual) / orch_counterfactual * 100.0, 1)
-                if orch_present and orch_counterfactual > 0.0
+                if (orch_planner_steps > 0 or orch_executor_steps > 0)
+                and orch_counterfactual > 0.0
                 else 0.0
             )
             orch_fut_sav_pct = (
@@ -811,9 +1083,11 @@ class PricingCatalog:
                     * 100.0,
                     1,
                 )
-                if orch_present and orch_fut_counterfactual > 0.0
+                if (orch_planner_steps > 0 or orch_executor_steps > 0)
+                and orch_fut_counterfactual > 0.0
                 else 0.0
             )
+            executor_label = " / ".join(executor_labels) if executor_labels else None
 
             unpriced_list = sorted(
                 unpriced_by_name.values(),
@@ -846,28 +1120,33 @@ class PricingCatalog:
                     "actual_cost_usd": round(orch_actual, 6),
                     "counterfactual_cost_usd": round(orch_counterfactual, 6),
                     "savings_usd": round(orch_counterfactual - orch_actual, 6)
-                    if orch_present
+                    if (orch_planner_steps > 0 or orch_executor_steps > 0)
                     else 0.0,
                     "savings_credits": round((orch_counterfactual - orch_actual) * cpu, 4)
-                    if orch_present
+                    if (orch_planner_steps > 0 or orch_executor_steps > 0)
                     else 0.0,
                     "savings_pct": orch_sav_pct,
-                    "has_future_change": orch_present and orch_fut_changed,
+                    "has_future_change": (
+                        (orch_planner_steps > 0 or orch_executor_steps > 0)
+                        and orch_fut_changed
+                    ),
                     "future_actual_cost_usd": round(orch_fut_actual, 6),
                     "future_counterfactual_cost_usd": round(orch_fut_counterfactual, 6),
                     "future_savings_usd": round(
                         orch_fut_counterfactual - orch_fut_actual, 6
                     )
-                    if orch_present
+                    if (orch_planner_steps > 0 or orch_executor_steps > 0)
                     else 0.0,
                     "future_savings_credits": round(
                         (orch_fut_counterfactual - orch_fut_actual) * cpu, 4
                     )
-                    if orch_present
+                    if (orch_planner_steps > 0 or orch_executor_steps > 0)
                     else 0.0,
                     "future_savings_pct": orch_fut_sav_pct,
                     "planner_labels": planner_labels,
+                    "executor_labels": executor_labels,
                     "executor_label": executor_label,
+                    "inter_pool": inter_pool,
                 },
                 "coverage": {
                     "priced_steps": priced_steps,
@@ -879,20 +1158,6 @@ class PricingCatalog:
                     "unattributed_tokens": unattributed_tokens,
                 },
             }
-
-    def _rows_for_pool(
-        self, rows: list[dict[str, Any]], pool_name: str
-    ) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            res = self.resolve_model(str(row.get("model_name") or ""))
-            if (
-                res.status == "priced"
-                and res.entry is not None
-                and res.entry.pool == pool_name
-            ):
-                out.append(row)
-        return out
 
     def build_scoped_valuation(
         self,
@@ -914,18 +1179,19 @@ class PricingCatalog:
             all_pool_val = dict(base)
             by_pool: dict[str, dict[str, Any]] = {"all": all_pool_val}
             for pool_name in ("gemini", "partner"):
-                p_val = self.aggregate_valuation(self._rows_for_pool(rows, pool_name))
+                p_val = self.aggregate_valuation(rows, pool_filter=pool_name)
                 if include_split:
                     assert own_rows is not None and sub_rows is not None
                     p_val["own"] = self.aggregate_valuation(
-                        self._rows_for_pool(own_rows, pool_name)
+                        own_rows, pool_filter=pool_name
                     )
                     p_val["subagents"] = self.aggregate_valuation(
-                        self._rows_for_pool(sub_rows, pool_name)
+                        sub_rows, pool_filter=pool_name
                     )
                 by_pool[pool_name] = p_val
 
             target_model_rows = model_rows if model_rows is not None else rows
+            grouped_rows_by_model: dict[str, list[dict[str, Any]]] = {}
             grouped_model_totals: dict[str, list[int]] = {}
             for row in target_model_rows:
                 m_name = str(row.get("model_name") or "")
@@ -933,6 +1199,7 @@ class PricingCatalog:
                 i_t = int(row.get("input_tokens") or 0)
                 c_t = int(row.get("cache_read_tokens") or 0)
                 o_t = int(row.get("output_tokens") or 0)
+                grouped_rows_by_model.setdefault(m_name, []).append(row)
                 acc = grouped_model_totals.get(m_name)
                 if acc is None:
                     grouped_model_totals[m_name] = [s_n, i_t, c_t, o_t]
@@ -951,7 +1218,7 @@ class PricingCatalog:
                     "cache_read_tokens": c_t,
                     "output_tokens": o_t,
                     "total_tokens": i_t + c_t + o_t,
-                    **self.value_model_group(m_name, s_n, i_t, c_t, o_t),
+                    **self.value_model_rows(m_name, grouped_rows_by_model[m_name]),
                 }
 
             base["by_pool"] = by_pool

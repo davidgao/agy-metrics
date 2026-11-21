@@ -583,6 +583,135 @@ class TestPricing(unittest.TestCase):
             self.assertAlmostEqual(orch["savings_usd"], -3.0, places=6)
             self.assertAlmostEqual(orch["savings_pct"], -75.0, places=4)
 
+    def test_custom_pairings_multi_planner_and_cross_pool_orchestrator_savings(self) -> None:
+        """Custom Planner/Executor pairings, multi-planner Executor rows, and intra/inter-pool breakdowns."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            cat = PricingCatalog(state_dir=state, as_of_date="2026-11-15")
+
+            # 1. Custom same-pool pairing: Neon Planner + Hydrogen Executor
+            #    (1M in + 0 cache + 100k out):
+            #    Neon = $3.0 + $1.5 = $4.50; Hydrogen = $1.5 + $0.75 = $2.25 => saved $2.25
+            res_neon_exec = cat.resolve_model(
+                "Executor · Gemini 4 Hydrogen (Medium)",
+                counterfactual_model="Gemini 4 Neon (High)",
+            )
+            self.assertEqual(res_neon_exec.status, "priced")
+            self.assertEqual(res_neon_exec.orchestrator_role, "executor")
+            assert res_neon_exec.entry is not None and res_neon_exec.counterfactual_planner is not None
+            self.assertEqual(res_neon_exec.entry.catalog_id, "gemini-4-hydrogen")
+            self.assertEqual(res_neon_exec.counterfactual_planner.catalog_id, "gemini-4-neon")
+
+            # 2. Multi-planner aggregation on the same Executor · Gemini 4 Hydrogen (Medium) row
+            #    + Cross-pool pairing: Claude Opus 4.6 Planner (partner) -> Gemini 4 Hydrogen Executor (gemini)
+            #      Opus (1M in + 100k out) = $4.0 + $2.0 = $6.00; Hydrogen = $2.25 => saved $3.75
+            #    + Reverse cross-pool: Gemini 4 Neon Planner (gemini) -> Claude Sonnet 4.6 Executor (partner)
+            #      Neon = $4.50; Sonnet (1M in + 100k out) = $2.0 + $1.0 = $3.00 => saved $1.50
+            rows = [
+                {
+                    "model_name": "Planner · Gemini 4 Neon (High)",
+                    "counterfactual_model": "",
+                    "steps_count": 1,
+                    "input_tokens": 1_000_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100_000,
+                },
+                {
+                    "model_name": "Executor · Gemini 4 Hydrogen (Medium)",
+                    "counterfactual_model": "Gemini 4 Neon (High)",
+                    "steps_count": 1,
+                    "input_tokens": 1_000_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100_000,
+                },
+                {
+                    "model_name": "Executor · Gemini 4 Hydrogen (Medium)",
+                    "counterfactual_model": "Claude Opus 4.6 (Thinking)",
+                    "steps_count": 1,
+                    "input_tokens": 1_000_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100_000,
+                },
+                {
+                    "model_name": "Planner · Claude Opus 4.6 (Thinking)",
+                    "counterfactual_model": "",
+                    "steps_count": 1,
+                    "input_tokens": 1_000_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100_000,
+                },
+                {
+                    "model_name": "Executor · Claude Sonnet 4.6",
+                    "counterfactual_model": "Gemini 4 Neon (High)",
+                    "steps_count": 1,
+                    "input_tokens": 1_000_000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100_000,
+                },
+            ]
+            scoped = cat.build_scoped_valuation(rows)
+
+            # All pools total: Neon Planner $4.50 + Hydro(vs Neon) $2.25 + Hydro(vs Opus) $2.25 + Opus Planner $6.00 + Sonnet(vs Neon) $3.00 = $18.00
+            self.assertAlmostEqual(scoped["cost_usd"], 18.00, places=6)
+            all_orch = scoped["orchestrator"]
+            self.assertTrue(all_orch["present"])
+            self.assertEqual(all_orch["planner_steps"], 2)
+            self.assertEqual(all_orch["executor_steps"], 3)
+            # Counterfactual total: Neon $4.50 + Neon $4.50 + Opus $6.00 + Opus $6.00 + Neon $4.50 = $25.50
+            # Actual total = $18.00 => net saved = $7.50 ($2.25 + $3.75 + $1.50)
+            self.assertAlmostEqual(all_orch["savings_usd"], 7.50, places=6)
+            self.assertEqual(
+                all_orch["executor_labels"],
+                ["Gemini 4 Hydrogen", "Claude Sonnet"],
+            )
+
+            # Per-model combined savings for Executor · Gemini 4 Hydrogen (Medium): $2.25 + $3.75 = $6.00
+            hydro_bm = scoped["by_model"]["Executor · Gemini 4 Hydrogen (Medium)"]
+            self.assertAlmostEqual(hydro_bm["cost_usd"], 4.50, places=6)
+            self.assertAlmostEqual(hydro_bm["orchestrator_savings_usd"], 6.00, places=6)
+            self.assertEqual(
+                hydro_bm["counterfactual_label"],
+                "Gemini 4 Neon / Claude Opus",
+            )
+
+            # Google pool ("gemini"): spend = Neon $4.50 + Hydro $2.25 + Hydro $2.25 = $9.00
+            gem_val = scoped["by_pool"]["gemini"]
+            self.assertAlmostEqual(gem_val["cost_usd"], 9.00, places=6)
+            gem_orch = gem_val["orchestrator"]
+            self.assertEqual(gem_orch["planner_steps"], 1)
+            self.assertEqual(gem_orch["executor_steps"], 1)  # intra-pool only
+            self.assertAlmostEqual(gem_orch["savings_usd"], 2.25, places=6)
+            self.assertTrue(gem_orch["inter_pool"]["present"])
+            # Offloaded from Google (Neon Planner -> Sonnet Executor in partner)
+            self.assertEqual(gem_orch["inter_pool"]["offloaded"]["steps"], 1)
+            self.assertAlmostEqual(gem_orch["inter_pool"]["offloaded"]["avoided_cost_usd"], 4.50, places=6)
+            self.assertAlmostEqual(gem_orch["inter_pool"]["offloaded"]["spent_elsewhere_usd"], 3.00, places=6)
+            self.assertAlmostEqual(gem_orch["inter_pool"]["offloaded"]["net_savings_usd"], 1.50, places=6)
+            self.assertEqual(gem_orch["inter_pool"]["offloaded"]["target_pools"], ["partner"])
+            # Absorbed into Google (Hydrogen Executor running for Opus Planner in partner)
+            self.assertEqual(gem_orch["inter_pool"]["absorbed"]["steps"], 1)
+            self.assertAlmostEqual(gem_orch["inter_pool"]["absorbed"]["spent_cost_usd"], 2.25, places=6)
+            self.assertAlmostEqual(gem_orch["inter_pool"]["absorbed"]["avoided_elsewhere_usd"], 6.00, places=6)
+            self.assertAlmostEqual(gem_orch["inter_pool"]["absorbed"]["net_savings_usd"], 3.75, places=6)
+            self.assertEqual(gem_orch["inter_pool"]["absorbed"]["source_pools"], ["partner"])
+
+            # 3rd-Party pool ("partner"): spend = Opus $6.00 + Sonnet $3.00 = $9.00
+            par_val = scoped["by_pool"]["partner"]
+            self.assertAlmostEqual(par_val["cost_usd"], 9.00, places=6)
+            par_orch = par_val["orchestrator"]
+            self.assertEqual(par_orch["planner_steps"], 1)
+            self.assertEqual(par_orch["executor_steps"], 0)
+            self.assertAlmostEqual(par_orch["savings_usd"], 0.0, places=6)
+            self.assertTrue(par_orch["inter_pool"]["present"])
+            self.assertEqual(par_orch["inter_pool"]["offloaded"]["steps"], 1)
+            self.assertAlmostEqual(par_orch["inter_pool"]["offloaded"]["avoided_cost_usd"], 6.00, places=6)
+            self.assertAlmostEqual(par_orch["inter_pool"]["offloaded"]["spent_elsewhere_usd"], 2.25, places=6)
+            self.assertAlmostEqual(par_orch["inter_pool"]["offloaded"]["net_savings_usd"], 3.75, places=6)
+            self.assertEqual(par_orch["inter_pool"]["absorbed"]["steps"], 1)
+            self.assertAlmostEqual(par_orch["inter_pool"]["absorbed"]["spent_cost_usd"], 3.00, places=6)
+            self.assertAlmostEqual(par_orch["inter_pool"]["absorbed"]["avoided_elsewhere_usd"], 4.50, places=6)
+            self.assertAlmostEqual(par_orch["inter_pool"]["absorbed"]["net_savings_usd"], 1.50, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

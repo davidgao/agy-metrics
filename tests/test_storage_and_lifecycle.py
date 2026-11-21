@@ -357,8 +357,8 @@ class TestStorageAndLifecycle(unittest.TestCase):
             finally:
                 eng1.close()
 
-            # 2. Legacy v3, v4, v5, v6 & v7 SQLite schemas upgrade cleanly to current version
-            for old_ver in (3, 4, 5, 6, 7):
+            # 2. Legacy v3..v8 SQLite schemas upgrade cleanly to current version
+            for old_ver in (3, 4, 5, 6, 7, 8):
                 db_path.unlink(missing_ok=True)
                 old_conn = sqlite3.connect(str(db_path))
                 old_conn.execute(f"PRAGMA user_version = {old_ver}")
@@ -629,6 +629,79 @@ class TestStorageAndLifecycle(unittest.TestCase):
                 )
             finally:
                 eng.close()
+
+    def test_counterfactual_model_persists_across_cold_restart(self) -> None:
+        """Per-step counterfactual_model survives SQLite persistence without re-opening transcripts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            state = root / "state"
+            cid = "aaaaaaaa-eeee-0000-0000-000000000001"
+            write_jsonl(
+                brain / cid / ".system_generated" / "logs" / "transcript_full.jsonl",
+                [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-18T10:00:00Z",
+                        "content": "<USER_REQUEST>\nPlan & execute\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Neon (High). No need to comment.\n</USER_SETTINGS_CHANGE>",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-18T10:00:01Z",
+                        "model": "gemini-4-neon-high",
+                        "input_tokens": 1_000_000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 100_000,
+                        "content": "",
+                        "tool_calls": [{"name": "exit_plan_mode", "args": {"plan": '"Go"'}}],
+                    },
+                    {
+                        "step_index": 2,
+                        "type": "SYSTEM_MESSAGE",
+                        "created_at": "2026-11-18T10:00:02Z",
+                        "content": "Plan mode is off: this turn runs on the execution model.",
+                    },
+                    {
+                        "step_index": 3,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-18T10:00:03Z",
+                        "model": "gemini-4-hydrogen-medium",
+                        "input_tokens": 1_000_000,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 100_000,
+                        "content": "Done.",
+                        "tool_calls": [],
+                    },
+                ],
+            )
+
+            eng1 = MetricsEngine(brain_dir=brain, state_dir=state, as_of_date="2026-11-18")
+            try:
+                m1 = eng1.get_metrics(ALL_CONVERSATIONS_ID, window="all")
+                orch1 = m1["valuation"]["orchestrator"]
+                self.assertTrue(orch1["present"])
+                # Neon: $3 + $1.5 = $4.50; Hydrogen: $1.5 + $0.75 = $2.25 => saved $2.25
+                self.assertAlmostEqual(orch1["savings_usd"], 2.25, places=6)
+                self.assertEqual(orch1["planner_labels"], ["Gemini 4 Neon"])
+                self.assertEqual(orch1["executor_labels"], ["Gemini 4 Hydrogen"])
+            finally:
+                eng1.close()
+
+            eng2 = MetricsEngine(brain_dir=brain, state_dir=state, as_of_date="2026-11-18")
+            try:
+                m2 = eng2.get_metrics(ALL_CONVERSATIONS_ID, window="all")
+                self.assertEqual(eng2._transcript_open_count, 0)
+                orch2 = m2["valuation"]["orchestrator"]
+                self.assertAlmostEqual(orch2["savings_usd"], 2.25, places=6)
+                self.assertEqual(orch2["planner_labels"], ["Gemini 4 Neon"])
+                self.assertEqual(orch2["executor_labels"], ["Gemini 4 Hydrogen"])
+                ex_bm = m2["valuation"]["by_model"]["Executor · Gemini 4 Hydrogen (Medium)"]
+                self.assertAlmostEqual(ex_bm["orchestrator_savings_usd"], 2.25, places=6)
+                self.assertEqual(ex_bm["counterfactual_label"], "Gemini 4 Neon")
+            finally:
+                eng2.close()
 
 
 if __name__ == "__main__":

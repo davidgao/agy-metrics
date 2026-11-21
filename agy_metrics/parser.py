@@ -29,33 +29,83 @@ from .models import (
     _extract_user_title_and_text,
     _is_orchestrator_name,
     _is_unattributed_model,
-    _safe_int,
-    _unwrap_arg_str,
     _parse_iso_epoch,
+    _safe_int,
+    _strip_role_prefix,
+    _unwrap_arg_str,
+    humanize_model_name,
     normalize_step_model,
 )
 
 _CHILD_SPAWN_TOOLS = ("invoke_subagent", "swarm", "run_workflow")
 
 
-def format_step_model(conv: ConversationState) -> str:
-    """Format the attributed model/phase label for the current step."""
+def _extract_step_raw_model(step: dict[str, Any]) -> str:
+    raw = step.get("model")
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def _clean_unprefixed_model(raw: str) -> str:
+    clean = humanize_model_name(raw)
+    while True:
+        role, stripped = _strip_role_prefix(clean)
+        if not role:
+            break
+        clean = stripped
+    return clean
+
+
+def resolve_step_attribution(
+    conv: ConversationState, step_raw_model: str = ""
+) -> tuple[str, str]:
+    """Resolve `(model_name, counterfactual_model)` for the current step."""
+    raw_step_m = (step_raw_model or "").strip()
+    if raw_step_m and not _is_unattributed_model(raw_step_m):
+        clean = _clean_unprefixed_model(raw_step_m)
+        if conv.is_subagent:
+            return normalize_step_model(clean, is_subagent=True), ""
+        if conv.orchestrator_active:
+            phase = conv.orchestrator_phase or "Planner"
+            if phase == "Executor":
+                cf = conv.orchestrator_planner_model
+                if not cf and conv.transcript_model:
+                    if _is_orchestrator_name(conv.transcript_model):
+                        cf = humanize_model_name(
+                            _extract_base_model_from_orchestrator(
+                                conv.transcript_model, "Planner"
+                            )
+                        )
+                    elif not _is_unattributed_model(conv.transcript_model):
+                        cf = _clean_unprefixed_model(conv.transcript_model)
+                return f"Executor · {clean}", cf
+            return f"Planner · {clean}", ""
+        return clean, ""
+
     if conv.orchestrator_active:
-        base = (
-            conv.transcript_model
-            if (conv.transcript_model and _is_orchestrator_name(conv.transcript_model))
-            else "Orchestrator"
-        )
         phase = conv.orchestrator_phase or "Planner"
-        if not conv.is_subagent:
-            return f"{base} · {phase}"
-        if (
-            conv.hook_reported_model
-            and conv.hook_reported_model != "auto"
-            and not _is_orchestrator_name(conv.hook_reported_model)
-        ):
-            return normalize_step_model(conv.hook_reported_model, is_subagent=True)
-        return normalize_step_model(f"{base} · {phase}", is_subagent=True)
+        if conv.is_subagent:
+            if (
+                conv.hook_reported_model
+                and conv.hook_reported_model != "auto"
+                and not _is_orchestrator_name(conv.hook_reported_model)
+            ):
+                return normalize_step_model(conv.hook_reported_model, is_subagent=True), ""
+            base = (
+                conv.transcript_model
+                if (conv.transcript_model and _is_orchestrator_name(conv.transcript_model))
+                else "Orchestrator"
+            )
+            return normalize_step_model(f"{base} · {phase}", is_subagent=True), ""
+        if conv.transcript_model and _is_orchestrator_name(conv.transcript_model):
+            return f"{conv.transcript_model} · {phase}", ""
+        if phase == "Planner" and conv.orchestrator_planner_model:
+            return f"Planner · {conv.orchestrator_planner_model}", ""
+        if phase == "Executor" and conv.orchestrator_executor_model:
+            return f"Executor · {conv.orchestrator_executor_model}", conv.orchestrator_planner_model
+        return f"Orchestrator · {phase}", (
+            conv.orchestrator_planner_model if phase == "Executor" else ""
+        )
+
     candidate = (
         conv.transcript_model
         or (
@@ -67,22 +117,86 @@ def format_step_model(conv: ConversationState) -> str:
         or conv.hook_reported_model
         or "unknown"
     )
-    return normalize_step_model(candidate, is_subagent=conv.is_subagent)
+    return normalize_step_model(candidate, is_subagent=conv.is_subagent), ""
 
 
-def promote_to_orchestrator(conv: ConversationState, phase: str) -> None:
-    """Retroactively label prior unattributed steps when Orchestrator phase signals appear."""
+def format_step_model(conv: ConversationState) -> str:
+    """Format the attributed model/phase label for the current step."""
+    return resolve_step_attribution(conv)[0]
+
+
+def promote_to_orchestrator(
+    conv: ConversationState,
+    phase: str,
+    *,
+    planner_model_hint: str = "",
+    backfill_role: str = "Planner",
+) -> None:
+    """Retroactively label current-turn steps when Orchestrator phase signals appear."""
+    eff_planner = ""
+    if (
+        planner_model_hint
+        and not _is_unattributed_model(planner_model_hint)
+        and not _is_orchestrator_name(planner_model_hint)
+    ):
+        eff_planner = _clean_unprefixed_model(planner_model_hint)
+    elif conv.orchestrator_planner_model:
+        eff_planner = conv.orchestrator_planner_model
+    elif (
+        conv.transcript_model
+        and not _is_unattributed_model(conv.transcript_model)
+        and not _is_orchestrator_name(conv.transcript_model)
+    ):
+        eff_planner = _clean_unprefixed_model(conv.transcript_model)
+    else:
+        start_idx = max(0, min(conv.turn_start_step_idx, len(conv.raw_steps)))
+        for idx in range(len(conv.raw_steps) - 1, start_idx - 1, -1):
+            _, inner = _strip_role_prefix(conv.raw_steps[idx].model_name)
+            if (
+                inner
+                and not _is_unattributed_model(inner)
+                and not _is_orchestrator_name(inner)
+            ):
+                eff_planner = inner
+                break
+
+    if eff_planner:
+        conv.orchestrator_planner_model = eff_planner
+
     if not conv.orchestrator_active:
         conv.orchestrator_active = True
-        base = (
+        legacy_base = (
             conv.transcript_model
             if (conv.transcript_model and _is_orchestrator_name(conv.transcript_model))
             else "Orchestrator"
         )
-        planner_label = f"{base} · Planner"
-        for i in range(len(conv.raw_steps) - 1, -1, -1):
-            if conv.raw_steps[i].model_name in ("unknown", "auto", base):
-                conv.raw_steps[i].model_name = planner_label
+        start_idx = max(0, min(conv.turn_start_step_idx, len(conv.raw_steps)))
+        for i in range(len(conv.raw_steps) - 1, start_idx - 1, -1):
+            raw = conv.raw_steps[i]
+            if (
+                (conv.transcript_model and _is_orchestrator_name(conv.transcript_model))
+                or raw.model_name in ("unknown", "auto", legacy_base)
+            ):
+                raw.model_name = f"{legacy_base} · {backfill_role}"
+                raw.counterfactual_model = (
+                    conv.orchestrator_planner_model
+                    if backfill_role == "Executor"
+                    else ""
+                )
+            elif not conv.is_subagent:
+                role, inner = _strip_role_prefix(raw.model_name)
+                if (
+                    not role
+                    and inner
+                    and not _is_unattributed_model(inner)
+                    and not _is_orchestrator_name(inner)
+                ):
+                    if backfill_role == "Executor":
+                        raw.model_name = f"Executor · {inner}"
+                        raw.counterfactual_model = conv.orchestrator_planner_model
+                    else:
+                        raw.model_name = f"Planner · {inner}"
+                        raw.counterfactual_model = ""
             else:
                 break
         for i, raw in enumerate(conv.raw_steps):
@@ -281,16 +395,23 @@ def process_transcript_step(
         if m_model:
             new_model = m_model.group(1).strip()
             conv.transcript_model = new_model
+            conv.last_step_raw_model = ""
             if _is_orchestrator_name(new_model):
                 conv.orchestrator_active = True
                 conv.orchestrator_phase = "Planner"
+                conv.orchestrator_planner_model = ""
+                conv.orchestrator_executor_model = ""
             else:
                 conv.orchestrator_active = False
                 conv.orchestrator_phase = ""
+                conv.orchestrator_planner_model = ""
+                conv.orchestrator_executor_model = ""
 
         if step_type == "USER_INPUT":
+            conv.turn_start_step_idx = len(conv.raw_steps)
             if conv.orchestrator_active:
                 conv.orchestrator_phase = "Planner"
+                conv.last_step_raw_model = ""
             conv.pending_tools.clear()
             conv.last_planner_step = None
             conv.pending_error_steps = 0
@@ -304,9 +425,9 @@ def process_transcript_step(
             conv.user_chars += len(clean_text)
         else:
             if "Plan mode is off: this turn runs on the execution model" in content:
-                promote_to_orchestrator(conv, "Executor")
-            elif "[plan review]" in content:
-                promote_to_orchestrator(conv, "Planner")
+                promote_to_orchestrator(conv, "Executor", backfill_role="Planner")
+            elif "[plan review]" in content or "[plan review due]" in content:
+                promote_to_orchestrator(conv, "Planner", backfill_role="Executor")
 
     elif step_type == "ERROR_MESSAGE":
         conv.pending_tools.clear()
@@ -369,7 +490,10 @@ def process_transcript_step(
                 is_checkpoint=True,
             )
 
-            model_label = format_step_model(conv)
+            step_raw_model = _extract_step_raw_model(step)
+            if step_raw_model and not _is_unattributed_model(step_raw_model):
+                conv.last_step_raw_model = step_raw_model
+            model_label, cf_model = resolve_step_attribution(conv, step_raw_model)
             prev_model = conv.raw_steps[-1].model_name if conv.raw_steps else None
             model_switched = bool(prev_model is not None and prev_model != model_label)
 
@@ -398,6 +522,7 @@ def process_transcript_step(
                     step_kind="checkpoint",
                     model_switched=model_switched,
                     compaction_event=True,
+                    counterfactual_model=cf_model,
                 )
             )
             conv.pending_compaction_event = False
@@ -414,6 +539,9 @@ def process_transcript_step(
         conv.needs_system_rebaseline = True
 
     elif step_type == "PLANNER_RESPONSE":
+        step_raw_model = _extract_step_raw_model(step)
+        if step_raw_model and not _is_unattributed_model(step_raw_model):
+            conv.last_step_raw_model = step_raw_model
         input_tokens = _safe_int(step.get("input_tokens"))
         cache_read_tokens = _safe_int(step.get("cache_read_tokens"))
         output_tokens = _safe_int(step.get("output_tokens"))
@@ -446,7 +574,7 @@ def process_transcript_step(
                 is_checkpoint=False,
             )
             ordinal = len(conv.raw_steps) + 1
-            model_label = format_step_model(conv)
+            model_label, cf_model = resolve_step_attribution(conv, step_raw_model)
             prev_model = conv.raw_steps[-1].model_name if conv.raw_steps else None
             model_switched = bool(prev_model is not None and prev_model != model_label)
             conv.raw_steps.append(
@@ -475,6 +603,7 @@ def process_transcript_step(
                     model_switched=model_switched,
                     compaction_event=False,
                     step_status="CANCELED",
+                    counterfactual_model=cf_model,
                 )
             )
             return
@@ -483,12 +612,13 @@ def process_transcript_step(
             conv.pending_tools.clear()
             conv.last_planner_step = None
             conv.pending_error_steps += 1
+            model_label, cf_model = resolve_step_attribution(conv, step_raw_model)
             if total_context <= 0 and output_tokens <= 0:
                 conv.raw_error_events.append(
                     _RawErrorEvent(
                         step_index=step_index,
                         created_at_epoch=created_at_epoch,
-                        model_name=format_step_model(conv),
+                        model_name=model_label,
                     )
                 )
                 return
@@ -508,7 +638,6 @@ def process_transcript_step(
                 is_checkpoint=False,
             )
             ordinal = len(conv.raw_steps) + 1
-            model_label = format_step_model(conv)
             prev_model = conv.raw_steps[-1].model_name if conv.raw_steps else None
             model_switched = bool(prev_model is not None and prev_model != model_label)
             err_before = conv.pending_error_steps
@@ -540,6 +669,7 @@ def process_transcript_step(
                     compaction_event=False,
                     error_steps_before=err_before,
                     step_status="ERROR",
+                    counterfactual_model=cf_model,
                 )
             )
             return
@@ -638,12 +768,30 @@ def process_transcript_step(
                     role = _unwrap_arg_str(args.get("Description")) or "Workflow"
             pending_for_step.append((t_name, role, req_model))
 
-        if "exit_plan_mode" in tool_names and not conv.orchestrator_active:
-            promote_to_orchestrator(conv, "Planner")
-        elif "enter_plan_mode" in tool_names and not conv.orchestrator_active:
-            promote_to_orchestrator(conv, "Executor")
+        if "exit_plan_mode" in tool_names:
+            hint = (
+                _clean_unprefixed_model(step_raw_model)
+                if (step_raw_model and not _is_unattributed_model(step_raw_model))
+                else ""
+            )
+            promote_to_orchestrator(
+                conv, "Planner", planner_model_hint=hint, backfill_role="Planner"
+            )
+        elif "enter_plan_mode" in tool_names:
+            promote_to_orchestrator(conv, "Executor", backfill_role="Executor")
 
-        model_label = format_step_model(conv)
+        model_label, cf_model = resolve_step_attribution(conv, step_raw_model)
+        if (
+            conv.orchestrator_active
+            and not conv.is_subagent
+            and step_raw_model
+            and not _is_unattributed_model(step_raw_model)
+        ):
+            obs_model = _clean_unprefixed_model(step_raw_model)
+            if (conv.orchestrator_phase or "Planner") == "Planner":
+                conv.orchestrator_planner_model = obs_model
+            else:
+                conv.orchestrator_executor_model = obs_model
 
         conv.pending_tools.clear()
         for t_name, role, req_model in pending_for_step:
@@ -651,12 +799,20 @@ def process_transcript_step(
             if t_name in _CHILD_SPAWN_TOOLS:
                 if req_model and req_model.lower() != "inherit":
                     sub_model = normalize_step_model(req_model, is_subagent=True)
+                elif step_raw_model and not _is_unattributed_model(step_raw_model):
+                    sub_model = normalize_step_model(step_raw_model, is_subagent=True)
                 elif conv.orchestrator_active:
-                    base_m = _extract_base_model_from_orchestrator(
-                        conv.transcript_model,
-                        conv.orchestrator_phase or "Planner",
-                    )
-                    sub_model = normalize_step_model(base_m, is_subagent=True)
+                    if (
+                        not _is_orchestrator_name(model_label)
+                        and not _is_unattributed_model(model_label)
+                    ):
+                        sub_model = normalize_step_model(model_label, is_subagent=True)
+                    else:
+                        base_m = _extract_base_model_from_orchestrator(
+                            conv.transcript_model,
+                            conv.orchestrator_phase or "Planner",
+                        )
+                        sub_model = normalize_step_model(base_m, is_subagent=True)
                 elif not _is_unattributed_model(model_label):
                     sub_model = normalize_step_model(model_label, is_subagent=True)
             conv.pending_tools.append((t_name, role, sub_model))
@@ -692,6 +848,7 @@ def process_transcript_step(
             checkpoint_epoch=ckpt_epoch,
             error_steps_before=err_before,
             step_status="DONE",
+            counterfactual_model=cf_model,
         )
         conv.raw_steps.append(raw_step)
         conv.last_planner_step = raw_step
@@ -1398,6 +1555,7 @@ def recompute_conversation(
                 compaction_event=raw.compaction_event,
                 retry_wait_s=retry_wait_s,
                 retry_count=retry_count,
+                counterfactual_model=raw.counterfactual_model,
             )
         )
 
@@ -1422,8 +1580,30 @@ def recompute_conversation(
         )
     else:
         conv.current_tokens = last_ctx_step.total_context
-    if (conv.orchestrator_active and not conv.is_subagent) or conv.transcript_model:
-        conv.current_model_name = format_step_model(conv)
+    if conv.is_subagent:
+        step_sub_model = (
+            steps_out[-1].model_name
+            if (steps_out and not _is_unattributed_model(steps_out[-1].model_name))
+            else ""
+        )
+        raw_current = (
+            step_sub_model
+            or (
+                conv.hook_reported_model
+                if conv.hook_reported_model and conv.hook_reported_model != "auto"
+                else ""
+            )
+            or conv.fallback_model_hint
+            or conv.hook_reported_model
+            or "unknown"
+        )
+        conv.current_model_name = normalize_step_model(
+            raw_current, is_subagent=True
+        )
+    elif conv.orchestrator_active or conv.transcript_model or conv.last_step_raw_model:
+        conv.current_model_name = resolve_step_attribution(
+            conv, conv.last_step_raw_model
+        )[0]
     else:
         raw_current = (
             (
@@ -1437,7 +1617,7 @@ def recompute_conversation(
             or "unknown"
         )
         conv.current_model_name = normalize_step_model(
-            raw_current, is_subagent=conv.is_subagent
+            raw_current, is_subagent=False
         )
     if not conv.title:
         conv.title = conv.external_title or conv.prompt_title or conv.conversation_id[:8]

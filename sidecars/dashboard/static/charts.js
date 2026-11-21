@@ -1498,6 +1498,12 @@ function renderValBox(card) {
   return box;
 }
 
+function poolDisplayName(pool) {
+  if (pool === 'gemini') return 'Google';
+  if (pool === 'partner') return '3rd-Party';
+  return 'Custom';
+}
+
 export function renderValuationCard(m, selectedModelEntry, isAllMode) {
   const val = m.valuation || {};
   const windows = val.windows || {};
@@ -1782,12 +1788,13 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
           : '';
         const cfCost = Number(mvMeta.cost_usd || 0) + Number(mvMeta.orchestrator_savings_usd || 0);
         const exSavPct = cfCost > 0 ? Math.round((mvMeta.orchestrator_savings_usd / cfCost) * 1000) / 10 : 0;
+        const exSavLabel = mvMeta.orchestrator_savings_usd < 0 ? 'Orchestrator Delta' : 'Orchestrator Saved';
         addCalloutRow(
           calloutsEl,
           'orch',
-          'Orchestrator Saved <span class="muted">(vs running Executor on ' + esc(mvMeta.counterfactual_label || 'Planner') + ')</span>',
+          exSavLabel + ' <span class="muted">(vs running Executor on ' + esc(mvMeta.counterfactual_label || 'Planner') + ')</span>',
           esc(fmtUsd(mvMeta.orchestrator_savings_usd) + ' (' + fmtCredits(mvMeta.orchestrator_savings_usd * cpu) + (exSavPct ? (' · ' + fmtOrchSavingsPct(exSavPct)) : '') + ')' + futSavNote),
-          'Savings from delegating Executor steps to ' + (mvMeta.matched_label || 'Hydrogen')
+          'Comparison for delegating Executor steps to ' + (mvMeta.matched_label || 'Executor')
         );
       }
     }
@@ -1820,6 +1827,11 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
 
     const orch = activeEnc.orchestrator || {};
     if (orch.present) {
+      const execStr = (orch.executor_labels && orch.executor_labels.length)
+        ? orch.executor_labels.join(' / ')
+        : (orch.executor_label || 'Executor');
+      const inter = orch.inter_pool || {};
+      const hasInter = state.valPool !== 'all' && Boolean(inter.present);
       if ((orch.executor_steps || 0) > 0) {
         const plannerStr = (orch.planner_labels && orch.planner_labels.length)
           ? orch.planner_labels.join(' / ')
@@ -1827,21 +1839,55 @@ export function renderValuationCard(m, selectedModelEntry, isAllMode) {
         const orchFutNote = (orch.has_future_change && Math.abs((orch.future_savings_usd || 0) - (orch.savings_usd || 0)) > 1e-9)
           ? (' · Future: ' + fmtUsd(orch.future_savings_usd))
           : '';
+        const orchSavLabel = (orch.savings_usd || 0) < 0 ? 'Orchestrator Delta' : 'Orchestrator Saved';
+        const intraPrefix = hasInter ? 'intra-pool · ' : '';
         addCalloutRow(
           calloutsEl,
           'orch',
-          'Orchestrator Saved <span class="muted">(vs running ' + esc(orch.executor_steps) + ' Executor step' + (orch.executor_steps === 1 ? '' : 's') + ' on ' + esc(plannerStr) + ')</span>',
+          orchSavLabel + ' <span class="muted">(' + intraPrefix + 'vs running ' + esc(orch.executor_steps) + ' Executor step' + (orch.executor_steps === 1 ? '' : 's') + ' on ' + esc(plannerStr) + ')</span>',
           esc(fmtUsd(orch.savings_usd) + ' (' + fmtCredits(orch.savings_credits) + ' · ' + fmtOrchSavingsPct(orch.savings_pct) + ')' + orchFutNote),
-          'Actual Orchestrator cost ' + fmtUsd(orch.actual_cost_usd) + ' vs counterfactual ' + fmtUsd(orch.counterfactual_cost_usd)
+          'Actual Orchestrator cost (' + execStr + ') ' + fmtUsd(orch.actual_cost_usd) + ' vs counterfactual ' + fmtUsd(orch.counterfactual_cost_usd)
         );
-      } else {
+      } else if ((orch.planner_steps || 0) > 0 && !hasInter) {
         addCalloutRow(
           calloutsEl,
           'orch',
           'Orchestrator Saved <span class="muted">(' + esc(orch.planner_steps) + ' Planner step' + (orch.planner_steps === 1 ? '' : 's') + ')</span>',
           '$0.00 (no Executor steps yet)',
-          'Savings accrue when Orchestrator hands off execution steps to ' + (orch.executor_label || 'Hydrogen')
+          'Savings accrue when Orchestrator hands off execution steps to ' + (execStr !== 'Executor' ? execStr : 'an Executor model')
         );
+      }
+      if (hasInter) {
+        const off = inter.offloaded || {};
+        if ((off.steps || 0) > 0) {
+          const targetPoolsStr = (off.target_pools || []).map(poolDisplayName).join(', ') || 'other pool';
+          const offNetVerb = (off.net_savings_usd || 0) >= 0 ? 'net saved' : 'net extra';
+          const offFutNote = (off.has_future_change && Math.abs((off.future_net_savings_usd || 0) - (off.net_savings_usd || 0)) > 1e-9)
+            ? (' · Future net: ' + fmtUsd(off.future_net_savings_usd))
+            : '';
+          addCalloutRow(
+            calloutsEl,
+            'orch',
+            'Inter-Pool Offloaded <span class="muted">(' + esc(off.steps) + ' Executor step' + (off.steps === 1 ? '' : 's') + ' → ' + esc(targetPoolsStr) + ')</span>',
+            esc(fmtUsd(off.avoided_cost_usd) + ' avoided here · ' + fmtUsd(off.spent_elsewhere_usd) + ' in ' + targetPoolsStr + ' (' + offNetVerb + ': ' + fmtUsd(off.net_savings_usd) + (off.net_savings_pct ? (' · ' + fmtOrchSavingsPct(off.net_savings_pct)) : '') + ')' + offFutNote),
+            'Offloaded from ' + ((off.planner_labels || []).join(' / ') || 'Planner') + ' to ' + ((off.executor_labels || []).join(' / ') || 'Executor')
+          );
+        }
+        const abs = inter.absorbed || {};
+        if ((abs.steps || 0) > 0) {
+          const sourcePoolsStr = (abs.source_pools || []).map(poolDisplayName).join(', ') || 'other pool';
+          const absNetVerb = (abs.net_savings_usd || 0) >= 0 ? 'net saved' : 'net extra';
+          const absFutNote = (abs.has_future_change && Math.abs((abs.future_net_savings_usd || 0) - (abs.net_savings_usd || 0)) > 1e-9)
+            ? (' · Future net: ' + fmtUsd(abs.future_net_savings_usd))
+            : '';
+          addCalloutRow(
+            calloutsEl,
+            'orch',
+            'Inter-Pool Absorbed <span class="muted">(' + esc(abs.steps) + ' Executor step' + (abs.steps === 1 ? '' : 's') + ' for ' + esc(sourcePoolsStr) + ')</span>',
+            esc(fmtUsd(abs.spent_cost_usd) + ' spent here · ' + fmtUsd(abs.avoided_elsewhere_usd) + ' avoided in ' + sourcePoolsStr + ' (' + absNetVerb + ': ' + fmtUsd(abs.net_savings_usd) + (abs.net_savings_pct ? (' · ' + fmtOrchSavingsPct(abs.net_savings_pct)) : '') + ')' + absFutNote),
+            'Executed by ' + ((abs.executor_labels || []).join(' / ') || 'Executor') + ' on behalf of ' + ((abs.planner_labels || []).join(' / ') || 'Planner')
+          );
+        }
       }
     }
 

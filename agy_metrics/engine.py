@@ -1546,16 +1546,15 @@ class MetricsEngine:
         latest_step_dict = (
             self._step_lite_row_to_dict(global_last_row) if global_last_row else None
         )
-        all_val_rows = [
-            {
-                "model_name": bm["model_name"],
-                "steps_count": bm["steps_count"],
-                "input_tokens": bm["input_tokens"],
-                "cache_read_tokens": bm["cache_read_tokens"],
-                "output_tokens": bm["output_tokens"],
-            }
-            for bm in by_model
-        ]
+        all_val_rows = self._store.query_window_val_rows(
+            cutoff_epoch, conv_ids=scoped_cids
+        )
+        valuation = _build_all_valuation(all_val_rows)
+        val_by_model = valuation.get("by_model") or {}
+        for bm in by_model:
+            bm_val = val_by_model.get(bm["model_name"])
+            if bm_val is not None:
+                bm["valuation"] = bm_val
 
         return {
             "mode": mode,
@@ -1573,7 +1572,7 @@ class MetricsEngine:
             "latest_step": latest_step_dict,
             "totals": totals,
             "by_model": by_model,
-            "valuation": _build_all_valuation(all_val_rows),
+            "valuation": valuation,
             "steps": [],
         }
 
@@ -2348,7 +2347,7 @@ class MetricsEngine:
             sub_conv = self._conversations.get(sub_id)
             sub_db_rows = self._db.execute(
                 """
-                SELECT model_name, steps_count, input_tokens, cache_read_tokens,
+                SELECT model_name, counterfactual_model, steps_count, input_tokens, cache_read_tokens,
                        output_tokens, est_thinking_tokens, est_visible_tokens
                 FROM conv_model_totals
                 WHERE conv_id = ?
@@ -2388,26 +2387,30 @@ class MetricsEngine:
                 single_sub_rows = [
                     {
                         "model_name": str(r[0]),
-                        "steps_count": int(r[1]),
-                        "input_tokens": int(r[2]),
-                        "cache_read_tokens": int(r[3]),
-                        "output_tokens": int(r[4]),
+                        "counterfactual_model": str(r[1] or ""),
+                        "steps_count": int(r[2]),
+                        "input_tokens": int(r[3]),
+                        "cache_read_tokens": int(r[4]),
+                        "output_tokens": int(r[5]),
                     }
                     for r in sub_db_rows
                 ]
-                s_steps = sum(int(r[1]) for r in sub_db_rows)
-                s_in = sum(int(r[2]) for r in sub_db_rows)
-                s_cache = sum(int(r[3]) for r in sub_db_rows)
-                s_out = sum(int(r[4]) for r in sub_db_rows)
-                s_think = sum(int(r[5]) for r in sub_db_rows)
-                s_vis = sum(int(r[6]) for r in sub_db_rows)
+                s_steps = sum(int(r[2]) for r in sub_db_rows)
+                s_in = sum(int(r[3]) for r in sub_db_rows)
+                s_cache = sum(int(r[4]) for r in sub_db_rows)
+                s_out = sum(int(r[5]) for r in sub_db_rows)
+                s_think = sum(int(r[6]) for r in sub_db_rows)
+                s_vis = sum(int(r[7]) for r in sub_db_rows)
             elif sub_conv is not None and sub_conv.hydrated and sub_conv.steps:
-                grouped_sub: dict[str, list[StepMetrics]] = {}
+                grouped_sub: dict[tuple[str, str], list[StepMetrics]] = {}
                 for st in sub_conv.steps:
-                    grouped_sub.setdefault(st.model_name, []).append(st)
+                    grouped_sub.setdefault(
+                        (st.model_name, st.counterfactual_model), []
+                    ).append(st)
                 single_sub_rows = [
                     {
                         "model_name": sm_name,
+                        "counterfactual_model": sm_cf,
                         "steps_count": len(sm_steps),
                         "input_tokens": sum(st.input_tokens for st in sm_steps),
                         "cache_read_tokens": sum(
@@ -2415,7 +2418,7 @@ class MetricsEngine:
                         ),
                         "output_tokens": sum(st.output_tokens for st in sm_steps),
                     }
-                    for sm_name, sm_steps in grouped_sub.items()
+                    for (sm_name, sm_cf), sm_steps in grouped_sub.items()
                 ]
                 s_steps = len(sub_conv.steps)
                 s_in = sum(st.input_tokens for st in sub_conv.steps)
@@ -2435,6 +2438,7 @@ class MetricsEngine:
                     single_sub_rows = [
                         {
                             "model_name": sub_conv.current_model_name,
+                            "counterfactual_model": "",
                             "steps_count": s_steps,
                             "input_tokens": s_in,
                             "cache_read_tokens": s_cache,
@@ -2538,15 +2542,21 @@ class MetricsEngine:
                 )
             )
 
+        own_val_groups: dict[tuple[str, str], list[StepMetrics]] = {}
+        for s in conv.steps:
+            own_val_groups.setdefault((s.model_name, s.counterfactual_model), []).append(
+                s
+            )
         own_rows = [
             {
                 "model_name": m_name,
+                "counterfactual_model": cf_m,
                 "steps_count": len(m_steps),
                 "input_tokens": sum(s.input_tokens for s in m_steps),
                 "cache_read_tokens": sum(s.cache_read_tokens for s in m_steps),
                 "output_tokens": sum(s.output_tokens for s in m_steps),
             }
-            for m_name, m_steps in grouped_steps.items()
+            for (m_name, cf_m), m_steps in own_val_groups.items()
         ]
         now_s = time.time()
         placeholders = ",".join("?" for _ in scope_ids)
@@ -2567,6 +2577,11 @@ class MetricsEngine:
             sub_rows=all_sub_rows,
             model_rows=combined_rows,
         )
+        val_by_model = total_val.get("by_model") or {}
+        for bm in by_model:
+            bm_val = val_by_model.get(bm["model_name"])
+            if bm_val is not None:
+                bm["valuation"] = bm_val
         own_5h = self._store.query_window_val_rows(
             now_s - _WINDOW_SECONDS["5h"], [conv.conversation_id]
         )

@@ -22,7 +22,7 @@ _WINDOW_SECONDS = {
     "30d": 30.0 * 86400.0,
 }
 _MAX_HYDRATED_CONVS = 16
-_ROLLUP_SCHEMA_VERSION = 8
+_ROLLUP_SCHEMA_VERSION = 9
 
 _CHARS_PER_TOKEN = 3.8
 _FIT_MIN_WARM_STEPS = 4
@@ -72,6 +72,8 @@ _UUID_RE = re.compile(
 _SAFE_CONV_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _ORCH_PAREN_RE = re.compile(r"\(([^)]+)\)")
 _SUBAGENT_PREFIX_RE = re.compile(r"^subagent\s*·\s*(.+)$", re.IGNORECASE)
+_PLANNER_PREFIX_RE = re.compile(r"^planner\s*·\s*(.+)$", re.IGNORECASE)
+_EXECUTOR_PREFIX_RE = re.compile(r"^executor\s*·\s*(.+)$", re.IGNORECASE)
 _DATE_STAMP_TOKEN_RE = re.compile(r"^20\d{6}$")
 _PARAM_SIZE_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)?[bBmMkK]$")
 
@@ -185,6 +187,20 @@ def _is_unattributed_model(name: str) -> bool:
     return not name or name.strip().lower() in ("unknown", "auto")
 
 
+def _strip_role_prefix(name: str) -> tuple[str, str]:
+    """Strip a leading 'Subagent · ', 'Planner · ', or 'Executor · ' prefix if present."""
+    s = (name or "").strip()
+    for role, pat in (
+        ("subagent", _SUBAGENT_PREFIX_RE),
+        ("planner", _PLANNER_PREFIX_RE),
+        ("executor", _EXECUTOR_PREFIX_RE),
+    ):
+        m = pat.match(s)
+        if m:
+            return role, m.group(1).strip()
+    return "", s
+
+
 def _extract_base_model_from_orchestrator(
     transcript_model: str, phase: str
 ) -> str:
@@ -202,14 +218,19 @@ def humanize_model_name(raw: str) -> str:
     if not s or _is_unattributed_model(s):
         return s
 
-    m_sub = _SUBAGENT_PREFIX_RE.match(s)
-    if m_sub:
-        inner_clean = humanize_model_name(m_sub.group(1).strip())
-        if not inner_clean or _is_unattributed_model(inner_clean):
-            return inner_clean or "unknown"
-        if inner_clean.startswith("Subagent · "):
-            return inner_clean
-        return f"Subagent · {inner_clean}"
+    for label_prefix, pat in (
+        ("Subagent · ", _SUBAGENT_PREFIX_RE),
+        ("Planner · ", _PLANNER_PREFIX_RE),
+        ("Executor · ", _EXECUTOR_PREFIX_RE),
+    ):
+        m_pref = pat.match(s)
+        if m_pref:
+            inner_clean = humanize_model_name(m_pref.group(1).strip())
+            if not inner_clean or _is_unattributed_model(inner_clean):
+                return inner_clean or "unknown"
+            if inner_clean.startswith(label_prefix):
+                return inner_clean
+            return f"{label_prefix}{inner_clean}"
 
     if _is_orchestrator_name(s):
         return s
@@ -304,8 +325,12 @@ def normalize_step_model(raw: str, *, is_subagent: bool = False) -> str:
         return s or "unknown"
 
     if is_subagent:
-        m_sub = _SUBAGENT_PREFIX_RE.match(s)
-        inner = m_sub.group(1).strip() if m_sub else s
+        inner = s
+        while True:
+            role, stripped = _strip_role_prefix(inner)
+            if not role:
+                break
+            inner = stripped
         if not inner or _is_unattributed_model(inner):
             return inner or "unknown"
         if _is_orchestrator_name(inner):
@@ -376,6 +401,7 @@ class _RawPlannerStep:
     checkpoint_epoch: float | None = None
     error_steps_before: int = 0
     step_status: str = "DONE"
+    counterfactual_model: str = ""
     paired_generics: list[_RawGenericStep] = field(default_factory=list)
 
 
@@ -420,6 +446,7 @@ class StepMetrics:
     compaction_event: bool = False
     retry_wait_s: float = 0.0
     retry_count: int = 0
+    counterfactual_model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -463,8 +490,12 @@ class ConversationState:
     hook_reported_transcript: str = ""
     hook_reported_model: str = ""
     transcript_model: str = ""
+    last_step_raw_model: str = ""
     orchestrator_active: bool = False
     orchestrator_phase: str = ""
+    orchestrator_planner_model: str = ""
+    orchestrator_executor_model: str = ""
+    turn_start_step_idx: int = 0
     fallback_model_hint: str = ""
     status: str = "idle"
     generating_since_ms: int | None = None
@@ -524,8 +555,12 @@ class ConversationState:
         self.pending_post_compaction = False
         self.pending_compaction_event = False
         self.transcript_model = ""
+        self.last_step_raw_model = ""
         self.orchestrator_active = False
         self.orchestrator_phase = ""
+        self.orchestrator_planner_model = ""
+        self.orchestrator_executor_model = ""
+        self.turn_start_step_idx = 0
         self.steps.clear()
         self.last_checkpoint_epoch = None
         self.pending_error_steps = 0
@@ -555,8 +590,12 @@ class ConversationState:
         self.child_subagents.clear()
         self.child_subagent_models.clear()
         self.transcript_model = ""
+        self.last_step_raw_model = ""
         self.orchestrator_active = False
         self.orchestrator_phase = ""
+        self.orchestrator_planner_model = ""
+        self.orchestrator_executor_model = ""
+        self.turn_start_step_idx = 0
         self.prompt_title = ""
         self.title = self.external_title
         self.last_checkpoint_epoch = None
